@@ -1,0 +1,6 @@
+{
+    "PROD": ["PROD", "PRD", "Daily Task Hyparchive", "SEVERE", "Files from ES to GRP"],
+    "QA": ["QA"],
+    "UAT": ["UAT"],
+    "DEV": ["DEV"]
+}
