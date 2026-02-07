@@ -1,4 +1,4 @@
-def resolve_environment(text: str) -> str:
+def _resolve_from_text(text: str) -> str:
     if not text:
         return ""
     s = text.lower()
@@ -35,3 +35,14 @@ def resolve_environment(text: str) -> str:
     if "fcd" in s:
         return "DEV"
     return ""
+
+
+def resolve_environment(subject_text: str, body_text: str = "") -> str:
+    """
+    Resolve environment using subject first, then fall back to mail body/content.
+    Leave empty only if no match is found in either.
+    """
+    env = _resolve_from_text(subject_text or "")
+    if env:
+        return env
+    return _resolve_from_text(body_text or "")

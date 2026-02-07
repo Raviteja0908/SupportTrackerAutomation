@@ -32,5 +32,8 @@ ENV PYTHONUNBUFFERED=1
 COPY src ./src
 COPY main.py .
 COPY config ./config
+COPY tools ./tools
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
-CMD ["python3", "main.py"]
+ENTRYPOINT ["/app/entrypoint.sh"]

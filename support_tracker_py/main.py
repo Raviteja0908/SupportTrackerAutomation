@@ -10,7 +10,7 @@ from src.rules.environment import resolve_environment
 from src.rules.interface import resolve_interface_code
 from src.rules.service_request import resolve_service_request
 from src.rules.incident_type import resolve_incident_type
-from src.rules.time_resolver import resolve_times_with_debug
+from src.rules.time_resolver import resolve_times_with_debug, _match_requester
 from src.excel.template_filler import fill_template
 from src.output.csv_writer import write_csv
 from src.output.run_logger import MarkingReason
@@ -107,6 +107,20 @@ def main() -> int:
         m = re.match(r"^([a-z]{2,}\d{2,})", text.strip(), flags=re.IGNORECASE)
         return (m.group(1).lower() if m else "")
 
+    def _interface_tokens(text: str) -> set:
+        if not text:
+            return set()
+        # Find all interface-like tokens anywhere in the subject
+        tokens = re.findall(r"\b[a-z]{1,5}\d{2,}\b", text, flags=re.IGNORECASE)
+        return {t.lower() for t in tokens}
+
+    def _inc_tokens(text: str) -> set:
+        if not text:
+            return set()
+        # Incident tokens like INC2385330
+        tokens = re.findall(r"\binc\d{6,}\b", text, flags=re.IGNORECASE)
+        return {t.lower() for t in tokens}
+
     def _token_overlap_score(a: set, b: set) -> float:
         if not a or not b:
             return 0.0
@@ -128,6 +142,8 @@ def main() -> int:
 
         date_only = _looks_like_date_only(subject_norm)
         subj_prefix = _interface_prefix(subject_norm)
+        subj_iface_set = _interface_tokens(subject_norm)
+        subj_inc_set = _inc_tokens(subject_norm)
 
         candidates = []
         for key, thread in threads.items():
@@ -139,8 +155,26 @@ def main() -> int:
             if subj_prefix and key_prefix and subj_prefix != key_prefix:
                 continue
 
+            key_iface_set = _interface_tokens(key)
+            if subj_iface_set and key_iface_set and subj_iface_set.isdisjoint(key_iface_set):
+                continue
+
+            key_inc_set = _inc_tokens(key)
+            if subj_inc_set:
+                # Require INC match when subject has INC
+                if not key_inc_set or subj_inc_set.isdisjoint(key_inc_set):
+                    continue
+
             score = _token_overlap_score(subj_tokens, key_tokens)
             contains = (subject_norm in key or key in subject_norm)
+            boost = 0.0
+            if subj_inc_set and key_inc_set and not subj_inc_set.isdisjoint(key_inc_set):
+                boost += 0.2
+            if subj_iface_set and key_iface_set and not subj_iface_set.isdisjoint(key_iface_set):
+                boost += 0.2
+            if contains:
+                boost += 0.1
+            score = min(1.0, score + boost)
 
             if date_only:
                 # Date-only subjects are high-risk; require stronger signal
@@ -190,7 +224,23 @@ def main() -> int:
         subject_norm = normalize_subject(subject_text)
         thread, match_note = find_thread(subject_norm, requester)
 
-        env = resolve_environment(description)
+        consultant_body_text = ""
+        if thread and requester:
+            consultant_bodies = []
+            for e in thread:
+                if _match_requester(e.sender_name, e.sender_email, requester):
+                    if e.body:
+                        consultant_bodies.append(e.body)
+            consultant_body_text = "\n".join(consultant_bodies)
+
+        # Environment: subject -> consultant replies -> full thread -> description (if no thread)
+        env = resolve_environment(subject_text, consultant_body_text)
+        if not env:
+            if thread:
+                all_body_text = "\n".join((e.body or "") for e in thread)
+                env = resolve_environment(subject_text, all_body_text)
+            else:
+                env = resolve_environment(subject_text, description or "")
         interface_code = resolve_interface_code(description)
         service_request = resolve_service_request(category_type)
         incident_type = resolve_incident_type(category_type, description)
