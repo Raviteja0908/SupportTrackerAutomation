@@ -11,6 +11,7 @@ ACK_PHRASES = [
     "let you know",
     "we will do the same",
     "we will do the same",
+    "we will do the needful",
     "we have not yet received",
     "we have not received",
     "not yet received",
@@ -20,6 +21,15 @@ ACK_PHRASES = [
     "we will check and update",
     "we will get back",
     "investigating",
+]
+
+NON_ACK_PHRASES = [
+    "could you please provide us an update on the below",
+    "could you update us on the below",
+    "please provide us an update on the below",
+    "please provide us an update",
+    "please provide an update on the below",
+    "please provide an update",
 ]
 
 DIRECT_RESOLUTION_PHRASES = [
@@ -110,6 +120,27 @@ def _match_requester(sender_name: str, sender_email: str, requester_name: str) -
     return False
 
 
+def _is_thanks_info_reply(email_record) -> bool:
+    """Ignore non-resolution consultant replies like 'Thanks for the information'."""
+    body = (email_record.body or "").lower()
+    return (
+        "thanks for the information" in body
+        or "thanks for the confirmation" in body
+        or "we will ignore" in body
+        or "could you please provide us an update on the below" in body
+        or "could you update us on the below" in body
+    )
+
+
+def _is_ack_body(body: str) -> bool:
+    if not body:
+        return False
+    b = body.lower()
+    if any(p in b for p in NON_ACK_PHRASES):
+        return False
+    return any(p in b for p in ACK_PHRASES)
+
+
 IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -171,6 +202,11 @@ def resolve_times_with_debug(thread, requester_name, ess_team):
         or _match_requester(e.sender_name, e.sender_email, requester_name)
     ]
     resolved_mail = requester_emails[-1] if requester_emails else None
+    if failed_subject and requester_emails:
+        for e in reversed(requester_emails):
+            if not _is_thanks_info_reply(e):
+                resolved_mail = e
+                break
     requester_first = requester_emails[0] if requester_emails else None
     requester_is_ess = bool(requester_candidates) or any(
         _is_ess_sender(e, ess_team) for e in requester_emails
@@ -199,9 +235,16 @@ def resolve_times_with_debug(thread, requester_name, ess_team):
             TimeDebug(first.sender_email, first.sender_email, first.sender_email, "No ESS or requester replies"),
         )
 
-    # ESS-only thread with no non-ESS request (even quoted): all three same
+    # ESS-only thread: use quoted request only if it's recent; otherwise all three same
     if not non_ess_emails:
-        parsed_any = _find_latest_quoted_request_time(ordered, ess_team)
+        parsed_any = _find_latest_quoted_request_time(ordered, ess_team, max_dt=first.sent_time)
+        if parsed_any:
+            # Allow quoted request only if it's within 7 days of first ESS mail
+            if (_to_ist(first.sent_time) - _to_ist(parsed_any)) <= timedelta(days=7):
+                # Let normal flow use parsed request; do not force all-same
+                pass
+            else:
+                parsed_any = None
         if not parsed_any:
             t = _format_time(first.sent_time)
             return (
@@ -243,6 +286,36 @@ def resolve_times_with_debug(thread, requester_name, ess_team):
             return (
                 TimeResult(t, t, t),
                 TimeDebug(only.sender_email, only.sender_email, only.sender_email, "Single ESS; no request found"),
+            )
+
+    # ESS-initiated + no ack + no consultant reply after request => all three same (use first ESS time)
+    if _is_ess_sender(first, ess_team) and not has_ack_phrase:
+        latest_req, _latest_src = _latest_request_time_before(ordered, ess_team)
+        if latest_req and resolved_mail and _to_ist(resolved_mail.sent_time) < _to_ist(latest_req):
+            t = _format_time(first.sent_time)
+            return (
+                TimeResult(t, t, t),
+                TimeDebug(
+                    first.sender_email,
+                    first.sender_email,
+                    first.sender_email,
+                    "ESS initiated; no ack; no consultant reply after request",
+                ),
+            )
+
+    # Failed/skip subjects: if consultant initiated and never replied after the request, keep all three same
+    if failed_subject and _match_requester(first.sender_name, first.sender_email, requester_name):
+        latest_req, _latest_src = _latest_request_time_before(ordered, ess_team)
+        if latest_req and (resolved_mail is None or _to_ist(resolved_mail.sent_time) < _to_ist(latest_req)):
+            t = _format_time(first.sent_time)
+            return (
+                TimeResult(t, t, t),
+                TimeDebug(
+                    first.sender_email,
+                    first.sender_email,
+                    first.sender_email,
+                    "Failed subject; consultant initiated; no consultant reply after request",
+                ),
             )
 
     # Failed/skip subjects with no ack phrase: handle safely without treating late ESS replies as ack
@@ -290,7 +363,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team):
             continue
         if _is_ess_sender(e, ess_team):
             body = (e.body or "").lower()
-            if any(p in body for p in ACK_PHRASES):
+            if _is_ack_body(body):
                 ack_mail = e
                 break
             if seen_non_ess:
@@ -399,7 +472,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team):
             if not _is_ess_sender(e, ess_team):
                 continue
             body = (e.body or "").lower()
-            if not any(p in body for p in ACK_PHRASES):
+            if not _is_ack_body(body):
                 continue
             if created_time and _to_ist(e.sent_time) < _to_ist(created_time):
                 continue
@@ -502,7 +575,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team):
                 if not _is_ess_sender(e, ess_team):
                     continue
                 body = (e.body or "").lower()
-                if not any(p in body for p in ACK_PHRASES):
+                if not _is_ack_body(body):
                     continue
                 if _to_ist(e.sent_time) > ack_dt:
                     break
@@ -529,6 +602,27 @@ def resolve_times_with_debug(thread, requester_name, ess_team):
                 notes = "OK"
         else:
             notes = "Ack delayed (>17 min)"
+
+        # If created came from quoted parsing, re-parse ack body to find the
+        # closest request immediately below the ack (common Outlook chain).
+        if created_src.startswith("PARSED_FROM_BODY"):
+            parsed_from_ack = _extract_request_time_from_body(
+                effective_ack.body or "", ess_team, max_dt=effective_ack.sent_time
+            )
+            if parsed_from_ack:
+                parsed_dt = _to_ist(parsed_from_ack)
+                if parsed_dt <= ack_dt and (ack_dt - parsed_dt) <= timedelta(minutes=20):
+                    # Prefer the request under the ack if it's closer to the ack than
+                    # the current parsed request time.
+                    if parsed_dt > created_dt:
+                        created_time = parsed_from_ack
+                        created_src = "PARSED_FROM_ACK_BODY"
+                        created_dt = _to_ist(created_time)
+                        # Recompute note based on new delta
+                        if ack_dt - created_dt <= timedelta(minutes=17):
+                            notes = "OK"
+                        else:
+                            notes = "Ack delayed (>17 min)"
 
         # If created_time equals ack_time, try to parse request time from ack body
         if created_dt == ack_dt:
@@ -621,6 +715,49 @@ def resolve_times_with_debug(thread, requester_name, ess_team):
             TimeDebug(created_src, ack_src, resolved_mail.sender_email if resolved_mail else "", notes),
         )
 
+    # Final ordering guard: created must be <= response/ack and <= resolved
+    try:
+        created_dt = _to_ist(created_time)
+        # If we have an ack, ensure created is not after it
+        if effective_ack:
+            ack_dt = _to_ist(effective_ack.sent_time)
+            if created_dt > ack_dt:
+                req_time, req_src = _latest_request_time_before(ordered, ess_team, effective_ack.sent_time)
+                if req_time:
+                    created_time = req_time
+                    created_src = req_src
+                    created_dt = _to_ist(created_time)
+        # If we have a resolved mail, ensure created is not after it
+        if resolved_mail:
+            resolved_dt = _to_ist(resolved_mail.sent_time)
+            if created_dt > resolved_dt:
+                req_time, req_src = _latest_request_time_before(ordered, ess_team, resolved_mail.sent_time)
+                if req_time:
+                    created_time = req_time
+                    created_src = req_src
+                    created_dt = _to_ist(created_time)
+        # If response time is set but still earlier than created, try to realign created
+        if response_time not in ("", "NA"):
+            try:
+                resp_dt = datetime.strptime(response_time, "%d-%m-%Y %H:%M").replace(tzinfo=IST)
+                if resp_dt < created_dt:
+                    req_time, req_src = _latest_request_time_before(ordered, ess_team, resp_dt)
+                    if req_time:
+                        created_time = req_time
+                        created_src = req_src
+                        created_dt = _to_ist(created_time)
+                        notes = "Created anchored to response time"
+                    else:
+                        # Fallback: keep ordering by aligning created to response
+                        created_time = resp_dt
+                        created_src = "RESPONSE_TIME_FALLBACK"
+                        created_dt = resp_dt
+                        notes = "Created aligned to response (no request found)"
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return (
         TimeResult(
             _format_time(created_time),
@@ -640,7 +777,7 @@ def _has_ack_phrase(ordered, ess_team) -> bool:
     for e in ordered:
         if _is_ess_sender(e, ess_team):
             body = (e.body or "").lower()
-            if any(p in body for p in ACK_PHRASES):
+            if _is_ack_body(body):
                 return True
     return False
 
@@ -690,7 +827,7 @@ def _select_ack_and_request(emails, ess_team, max_time: datetime | None = None):
         if delta.total_seconds() < 0:
             continue
         body = (e.body or "").lower()
-        has_phrase = any(p in body for p in ACK_PHRASES)
+        has_phrase = _is_ack_body(body)
         candidates.append((delta, has_phrase, e, req_time, req_src))
 
     if not candidates:
@@ -713,7 +850,7 @@ def _first_ess_after(emails, ess_team, after_time: datetime, max_time: datetime 
         if max_time and _to_ist(e.sent_time) > _to_ist(max_time):
             continue
         body = (e.body or "").lower()
-        has_phrase = any(p in body for p in ACK_PHRASES)
+        has_phrase = _is_ack_body(body)
         candidates.append((has_phrase, e))
 
     if not candidates:
@@ -764,6 +901,7 @@ def _find_direct_resolution_reply(
 def _latest_request_time_before(emails, ess_team, max_dt: datetime | None = None):
     latest_time = None
     latest_src = ""
+    found_non_ess = False
 
     # Non-ESS emails
     for e in emails:
@@ -771,20 +909,23 @@ def _latest_request_time_before(emails, ess_team, max_dt: datetime | None = None
             continue
         if max_dt and _to_ist(e.sent_time) > _to_ist(max_dt):
             continue
+        found_non_ess = True
         if latest_time is None or _to_ist(e.sent_time) > _to_ist(latest_time):
             latest_time = e.sent_time
             latest_src = e.sender_email or e.sender_name
 
-    # Quoted request times in ESS emails (or any email bodies)
-    for e in emails:
-        parsed = _extract_request_time_from_body(e.body or "", ess_team, max_dt=max_dt or e.sent_time)
-        if not parsed:
-            continue
-        if max_dt and _to_ist(parsed) > _to_ist(max_dt):
-            continue
-        if latest_time is None or _to_ist(parsed) > _to_ist(latest_time):
-            latest_time = parsed
-            latest_src = "PARSED_FROM_BODY"
+    # If we already saw a real non-ESS request, do not let quoted blocks override it.
+    if not found_non_ess:
+        # Quoted request times in ESS emails (or any email bodies)
+        for e in emails:
+            parsed = _extract_request_time_from_body(e.body or "", ess_team, max_dt=max_dt or e.sent_time)
+            if not parsed:
+                continue
+            if max_dt and _to_ist(parsed) > _to_ist(max_dt):
+                continue
+            if latest_time is None or _to_ist(parsed) > _to_ist(latest_time):
+                latest_time = parsed
+                latest_src = "PARSED_FROM_BODY"
 
     return latest_time, latest_src
 
@@ -1200,7 +1341,9 @@ def _parse_datetime(value: str):
         "%A, %B %d, %Y %I:%M %p",
         "%a, %b %d, %Y %I:%M %p",
         "%A, %d %B, %Y %H:%M",
+        "%A, %d %B, %Y %I:%M %p",
         "%A, %d %B %Y %H:%M",
+        "%A, %d %B %Y %I:%M %p",
         "%d %B %Y %H:%M",
     ]
     for fmt in fmts:

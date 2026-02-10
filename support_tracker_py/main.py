@@ -10,7 +10,7 @@ from src.rules.environment import resolve_environment
 from src.rules.interface import resolve_interface_code
 from src.rules.service_request import resolve_service_request
 from src.rules.incident_type import resolve_incident_type
-from src.rules.time_resolver import resolve_times_with_debug, _match_requester
+from src.rules.time_resolver import resolve_times_with_debug, _match_requester, _is_ess_sender
 from src.excel.template_filler import fill_template
 from src.output.csv_writer import write_csv
 from src.output.run_logger import MarkingReason
@@ -72,11 +72,25 @@ def main() -> int:
         ["SubjectKey"],
     )
 
-    # Load Excel template from output folder
+    # Load Excel template from output folder (default name or a single .xlsx)
     template_path = output_dir / "Support_Tracker_DEC_25_Incident_Business_done.xlsx"
     if not template_path.exists():
-        logger.log(f"[ERROR] Template not found: {template_path}")
-        return 1
+        # Fallback: pick a single .xlsx that is not an output "_filled" file
+        candidates = [
+            p for p in output_dir.glob("*.xlsx")
+            if not p.name.lower().endswith("_filled.xlsx")
+            and "_filled_" not in p.name.lower()
+        ]
+        if len(candidates) == 1:
+            template_path = candidates[0]
+            logger.log(f"[INFO] Using template: {template_path.name}")
+        else:
+            logger.log(f"[ERROR] Template not found: {template_path}")
+            if candidates:
+                logger.log("[ERROR] Multiple .xlsx candidates found. Please keep only one template:")
+                for c in candidates:
+                    logger.log(f" - {c.name}")
+            return 1
 
     # Prepare CSV outputs for auditing
     automation_rows = []
@@ -194,6 +208,18 @@ def main() -> int:
 
         if not candidates:
             return [], "No match"
+
+        # Prefer candidates that actually contain a non-ESS request email.
+        # This avoids matching ESS-only threads when a real request exists elsewhere.
+        def _thread_has_non_ess(t):
+            for e in t:
+                if not _is_ess_sender(e, ess_team):
+                    return True
+            return False
+
+        non_ess_candidates = [c for c in candidates if _thread_has_non_ess(c[2])]
+        if non_ess_candidates:
+            candidates = non_ess_candidates
 
         # Resolve by requester if ambiguous
         req = (requester or "").strip().lower()
