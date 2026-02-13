@@ -9,3 +9,4 @@ class EmailRecord:
     sender_name: str
     sent_time: datetime
     body: str
+    body_html: str = ""

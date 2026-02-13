@@ -59,7 +59,7 @@ class FillResult:
     unknown_count: int
 
 
-def fill_template(template_path, output_path, row_resolver, logger):
+def fill_template(template_path, output_path, row_resolver, logger, post_process=None):
     template_path = Path(template_path)
     output_path = Path(output_path)
 
@@ -92,11 +92,6 @@ def fill_template(template_path, output_path, row_resolver, logger):
         row_context = _build_row_context(ws, row, col_map)
 
         desc_text = str(row_context.get("Description", "") or "")
-        if "maintenance" in desc_text.lower():
-            _mark_row(ws, row, red_fill)
-            _write_comment(ws, row, comments_col, MarkingReason.maintenance)
-            maintenance += 1
-            continue
 
         resolved = row_resolver(row_context)
         mark_blue = resolved.pop("_MarkBlue", False)
@@ -113,6 +108,9 @@ def fill_template(template_path, output_path, row_resolver, logger):
 
         _write_values(ws, row, col_map, resolved)
         filled += 1
+
+    if post_process:
+        post_process(ws, col_map, header_row)
 
     safe_path = _resolve_output_path(output_path)
     try:
@@ -174,6 +172,7 @@ def _build_row_context(ws, row, col_map):
     for key, col in col_map.items():
         value = ws.cell(row, col).value
         context[_title_case(key)] = value if value is not None else ""
+    context["RowIndex"] = row
     return context
 
 

@@ -7,6 +7,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$includeCreationTime = $true
+if ($env:EXCLUDE_CREATION_TIME) {
+    $val = $env:EXCLUDE_CREATION_TIME.ToString().ToLower()
+    if ($val -in @("1", "true", "yes", "y", "on")) { $includeCreationTime = $false }
+}
+
 Write-Host "Outlook export (PST append) - copy only, no move"
 Write-Host ("Start time: {0}" -f (Get-Date))
 Write-Host "Export script version: 2026-02-05-1"
@@ -15,6 +21,13 @@ Write-Host ""
 Write-Host "Connecting to Outlook..."
 $outlook = New-Object -ComObject Outlook.Application
 $namespace = $outlook.GetNamespace("MAPI")
+
+$fastExport = $false
+if ($env:FAST_EXPORT) {
+    $val = $env:FAST_EXPORT.ToString().ToLower()
+    if ($val -in @("1", "true", "yes", "y", "on")) { $fastExport = $true }
+}
+Write-Host ("Export mode: {0}" -f ($(if ($fastExport) { "FAST (MailItem + ReceivedTime)" } else { "COMPLETE (All items + SentOn fallback)" })))
 
 function Split-InboxCombinedPath {
     param([string]$path)
@@ -604,6 +617,22 @@ foreach ($path in $folderPaths) {
 }
 $folderPaths = $validated
 
+function Get-Item-Date {
+    param([object]$item)
+    $rt = $null
+    $st = $null
+    $ct = $null
+    try { $rt = $item.ReceivedTime } catch { $rt = $null }
+    try { $st = $item.SentOn } catch { $st = $null }
+    if ($rt -and $rt -ne [DateTime]::MinValue) { return @($rt, $true) }
+    if ($st -and $st -ne [DateTime]::MinValue) { return @($st, $false) }
+    if ($includeCreationTime) {
+        try { $ct = $item.CreationTime } catch { $ct = $null }
+        if ($ct -and $ct -ne [DateTime]::MinValue) { return @($ct, $false) }
+    }
+    return @($null, $false)
+}
+
 function Export-Folder {
     param(
         [object]$sourceFolder,
@@ -621,7 +650,18 @@ function Export-Folder {
     $items = $sourceFolder.Items
     $startSql = $dayStart.ToString("yyyy-MM-dd HH:mm")
     $endSql = $dayEnd.ToString("yyyy-MM-dd HH:mm")
-    $sql = "@SQL=""urn:schemas:httpmail:datereceived"" >= '$startSql' AND ""urn:schemas:httpmail:datereceived"" <= '$endSql'"
+    if ($fastExport) {
+        $sql = "@SQL=""urn:schemas:httpmail:datereceived"" >= '$startSql' AND ""urn:schemas:httpmail:datereceived"" <= '$endSql'"
+    } else {
+        $conds = @(
+            """urn:schemas:httpmail:datereceived"" >= '$startSql' AND ""urn:schemas:httpmail:datereceived"" <= '$endSql'",
+            """urn:schemas:httpmail:datesent"" >= '$startSql' AND ""urn:schemas:httpmail:datesent"" <= '$endSql'"
+        )
+        if ($includeCreationTime) {
+            $conds += """urn:schemas:httpmail:datecreated"" >= '$startSql' AND ""urn:schemas:httpmail:datecreated"" <= '$endSql'"
+        }
+        $sql = "@SQL=(" + ($conds -join " OR ") + ")"
+    }
 
     $filtered = $null
     try {
@@ -630,6 +670,7 @@ function Export-Folder {
         $filtered = $null
     }
 
+    $forceManual = $false
     if ($filtered -ne $null) {
         Write-Host "SQL Restrict succeeded."
         Write-Host "Using SQL Restrict filter..."
@@ -638,23 +679,37 @@ function Export-Folder {
             Write-Host ("  Filtered items count: {0}" -f $filteredCount)
             if ($filteredCount -eq 0) {
                 Write-Host "  Filtered count is 0 (no items in range)."
+                if ($includeCreationTime) {
+                    $forceManual = $true
+                    Write-Host "  Falling back to manual scan for CreationTime items..."
+                }
             }
         } catch {
             Write-Host "  Filtered items count: unknown"
         }
-        foreach ($item in @($filtered)) {
-            try {
-                if (-not $item -or $item.Class -ne 43) { continue }
-                $rt = $item.ReceivedTime
-                $copy = $item.Copy()
-                $copy.Move($destFolder) | Out-Null
-                $count++
-                $processed++
-                if (($processed % $progressEvery) -eq 0) {
-                    Write-Host ("  Processed {0} items | Exported {1} | Current Received: {2}" -f $processed, $count, $rt)
+        if (-not $forceManual) {
+            foreach ($item in @($filtered)) {
+                try {
+                    if (-not $item) { continue }
+                    if ($fastExport) {
+                        if ($item.Class -ne 43) { continue }
+                        $rt = $item.ReceivedTime
+                        if (-not $rt) { continue }
+                    } else {
+                        $dtInfo = Get-Item-Date $item
+                        $rt = $dtInfo[0]
+                        if (-not $rt) { continue }
+                    }
+                    $copy = $item.Copy()
+                    $copy.Move($destFolder) | Out-Null
+                    $count++
+                    $processed++
+                    if (($processed % $progressEvery) -eq 0) {
+                        Write-Host ("  Processed {0} items | Exported {1} | Current Time: {2}" -f $processed, $count, $rt)
+                    }
+                } catch {
+                    continue
                 }
-            } catch {
-                continue
             }
         }
     } else {
@@ -664,16 +719,27 @@ function Export-Folder {
         Write-Host "Using fast manual scan (descending, early break)..."
         foreach ($item in @($items)) {
             try {
-                if (-not $item -or $item.Class -ne 43) { continue }
-                $rt = $item.ReceivedTime
-                if ($rt -lt $dayStart) { break }
-                if ($rt -gt $dayEnd) { continue }
+                if (-not $item) { continue }
+                if ($fastExport) {
+                    if ($item.Class -ne 43) { continue }
+                    $rt = $item.ReceivedTime
+                    if (-not $rt) { continue }
+                    if ($rt -lt $dayStart) { break }
+                    if ($rt -gt $dayEnd) { continue }
+                } else {
+                    $dtInfo = Get-Item-Date $item
+                    $rt = $dtInfo[0]
+                    $usedReceived = $dtInfo[1]
+                    if (-not $rt) { continue }
+                    if ($usedReceived -and $rt -lt $dayStart) { break }
+                    if ($rt -gt $dayEnd) { continue }
+                }
                 $copy = $item.Copy()
                 $copy.Move($destFolder) | Out-Null
                 $count++
                 $processed++
                 if (($processed % $progressEvery) -eq 0) {
-                    Write-Host ("  Processed {0} items | Exported {1} | Current Received: {2}" -f $processed, $count, $rt)
+                    Write-Host ("  Processed {0} items | Exported {1} | Current Time: {2}" -f $processed, $count, $rt)
                 }
             } catch {
                 continue
