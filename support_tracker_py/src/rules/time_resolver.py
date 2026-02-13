@@ -362,7 +362,24 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 parsed_any = relaxed_latest
         if not parsed_any:
             if len(ess_emails) >= 2:
-                created_t = _format_time(ess_emails[0].sent_time)
+                created_mail_pick = ess_emails[0]
+                if requester_emails:
+                    try:
+                        requester_first = min(requester_emails, key=lambda e: e.sent_time)
+                        first_is_requester = _match_requester(
+                            created_mail_pick.sender_name,
+                            created_mail_pick.sender_email,
+                            requester_name,
+                        )
+                        gap = _to_ist(requester_first.sent_time) - _to_ist(created_mail_pick.sent_time)
+                        # Keep current behavior by default, but when the first ESS mail
+                        # is by someone else and requester starts much later, anchor created
+                        # to requester to avoid stale carry-over from older sibling chains.
+                        if first_is_requester or gap >= timedelta(hours=12):
+                            created_mail_pick = requester_first
+                    except Exception:
+                        pass
+                created_t = _format_time(created_mail_pick.sent_time)
                 non_ack_ess = [e for e in ess_emails if not _is_ack_like_reply(e)]
                 last_ess = max(non_ack_ess, key=lambda e: e.sent_time) if non_ack_ess else max(ess_emails, key=lambda e: e.sent_time)
 
@@ -382,13 +399,41 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
 
                 resolved_t = _format_time(resolved_mail_pick.sent_time) if resolved_mail_pick else created_t
 
-                # Try to use an ack phrase if it exists; otherwise keep ACK NOT FOUND.
+                # Ack selection for ESS-only span:
+                # 1) prefer earliest ack-phrase mail between created and resolved
+                # 2) fallback to earliest requester reply in that window
+                # 3) fallback to earliest ESS reply in that window
+                # 4) final fallback keeps historical behavior (ack=resolved)
                 ack_mail_pick = None
-                for e in ess_emails:
+                created_ist = _to_ist(created_mail_pick.sent_time)
+                resolved_ist = _to_ist(resolved_mail_pick.sent_time) if resolved_mail_pick else None
+
+                ack_candidates = [
+                    e for e in ess_emails
+                    if e.sent_time and _to_ist(e.sent_time) > created_ist
+                    and (resolved_ist is None or _to_ist(e.sent_time) <= resolved_ist)
+                ]
+                ack_candidates.sort(key=lambda e: e.sent_time)
+
+                for e in ack_candidates:
                     body = (e.body or "").lower()
                     if _is_ack_body(body):
                         ack_mail_pick = e
                         break
+
+                if not ack_mail_pick and requester_emails:
+                    requester_after = [
+                        e for e in requester_emails
+                        if e.sent_time and _to_ist(e.sent_time) > created_ist
+                        and (resolved_ist is None or _to_ist(e.sent_time) <= resolved_ist)
+                    ]
+                    requester_after.sort(key=lambda e: e.sent_time)
+                    if requester_after:
+                        ack_mail_pick = requester_after[0]
+
+                if not ack_mail_pick and ack_candidates:
+                    ack_mail_pick = ack_candidates[0]
+
                 if ack_mail_pick:
                     ack_t = _format_time(ack_mail_pick.sent_time)
                     ack_src = ack_mail_pick.sender_email or ack_mail_pick.sender_name
@@ -398,7 +443,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 return (
                     TimeResult(created_t, ack_t, resolved_t),
                     TimeDebug(
-                        ess_emails[0].sender_email or ess_emails[0].sender_name,
+                        created_mail_pick.sender_email or created_mail_pick.sender_name,
                         ack_src,
                         (resolved_mail_pick.sender_email or resolved_mail_pick.sender_name) if resolved_mail_pick else (ess_emails[0].sender_email or ess_emails[0].sender_name),
                         span_note,

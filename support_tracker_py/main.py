@@ -308,6 +308,21 @@ def main() -> int:
         tokens = re.findall(r"\binc\d{6,}\b", text, flags=re.IGNORECASE)
         return {t.lower() for t in tokens}
 
+    def _sig_num_tokens(text: str) -> set:
+        """Return significant numeric tokens for disambiguation (exclude years)."""
+        if not text:
+            return set()
+        out = set()
+        for n in re.findall(r"\b\d{3,5}\b", text):
+            try:
+                iv = int(n)
+            except Exception:
+                continue
+            if 1900 <= iv <= 2099:
+                continue
+            out.add(n)
+        return out
+
     def _subject_for_description(description: str) -> str:
         subject_text = extract_subject_from_description(description or "")
         if description and re.search(r"(?:--?>|â†’|âž”|âž¡|=>)", description):
@@ -1086,12 +1101,32 @@ def main() -> int:
                     return True
             return False
 
+        def _prefer_iface_pick(exact_t, iface_t):
+            if not exact_t or not iface_t:
+                return False
+            if requester:
+                exact_has_req = _thread_has_requester(exact_t, requester)
+                iface_has_req = _thread_has_requester(iface_t, requester)
+                if iface_has_req and not exact_has_req:
+                    return True
+            if date_tokens and requester:
+                exact_has_date = _thread_has_consultant_on_or_near_date(exact_t, date_tokens, requester)
+                iface_has_date = _thread_has_consultant_on_or_near_date(iface_t, date_tokens, requester)
+                if iface_has_date and not exact_has_date:
+                    return True
+            if baseline_date and requester:
+                exact_delta = _requester_min_delta_days(exact_t, requester, baseline_date)
+                iface_delta = _requester_min_delta_days(iface_t, requester, baseline_date)
+                if iface_delta is not None and (exact_delta is None or (iface_delta + 1) < exact_delta):
+                    return True
+            return False
+
         exact_thread = None
         exact_note = None
         if subject_norm in threads:
             t = threads[subject_norm]
             key_iface_set = _interface_tokens(subject_norm)
-            if iface_tokens and not key_iface_set and enable_safe_iface_hint and not _strong_exact_signal(t):
+            if iface_tokens and not key_iface_set and enable_safe_iface_hint:
                 iface_pick = _find_iface_specific_thread(
                     subject_norm,
                     requester,
@@ -1100,7 +1135,9 @@ def main() -> int:
                     baseline_date=baseline_date,
                 )
                 if iface_pick:
-                    return iface_pick
+                    iface_thread, _iface_note = iface_pick
+                    if (not _strong_exact_signal(t)) or _prefer_iface_pick(t, iface_thread):
+                        return iface_pick
             # Interface token is a hint, not a blocker for exact subject match.
             # Keep exact matches even when the subject has no interface token.
             if (not iface_tokens) or (not key_iface_set) or (not iface_tokens.isdisjoint(key_iface_set)):
@@ -1122,7 +1159,7 @@ def main() -> int:
         if alt_subject in threads:
             t = threads[alt_subject]
             key_iface_set = _interface_tokens(alt_subject)
-            if iface_tokens and not key_iface_set and enable_safe_iface_hint and not _strong_exact_signal(t):
+            if iface_tokens and not key_iface_set and enable_safe_iface_hint:
                 iface_pick = _find_iface_specific_thread(
                     subject_norm,
                     requester,
@@ -1131,7 +1168,9 @@ def main() -> int:
                     baseline_date=baseline_date,
                 )
                 if iface_pick:
-                    return iface_pick
+                    iface_thread, _iface_note = iface_pick
+                    if (not _strong_exact_signal(t)) or _prefer_iface_pick(t, iface_thread):
+                        return iface_pick
             # Interface token is a hint, not a blocker for exact alt-subject match.
             if (not iface_tokens) or (not key_iface_set) or (not iface_tokens.isdisjoint(key_iface_set)):
                 if prefer_consultant_date and date_tokens and requester and not _thread_has_requester(t, requester):
@@ -1161,6 +1200,7 @@ def main() -> int:
         if not subj_iface_set and iface_tokens:
             subj_iface_set = iface_tokens
         subj_inc_set = _inc_tokens(subject_norm)
+        subj_num_set = _sig_num_tokens(subject_norm)
 
         subj_part_set = _part_tokens(subject_norm)
         short_stop = {
@@ -1190,6 +1230,9 @@ def main() -> int:
                 # Require INC match when subject has INC
                 if not key_inc_set or subj_inc_set.isdisjoint(key_inc_set):
                     continue
+            key_num_set = _sig_num_tokens(key)
+            if subj_num_set and key_num_set and subj_num_set.isdisjoint(key_num_set):
+                continue
 
             score = _token_overlap_score(subj_tokens, key_tokens)
             contains = (subject_norm in key or key in subject_norm)
@@ -1404,6 +1447,7 @@ def main() -> int:
             if not has_consultant_date:
                 subj_tokens = _match_tokens(subject_norm)
                 subj_inc_set = _inc_tokens(subject_norm)
+                subj_num_set = _sig_num_tokens(subject_norm)
                 best = None
                 for key, thread in threads.items():
                     if not _thread_has_consultant_on_or_near_date(thread, date_tokens, requester):
@@ -1415,6 +1459,9 @@ def main() -> int:
                         key_inc_set = _inc_tokens(key)
                         if not key_inc_set or subj_inc_set.isdisjoint(key_inc_set):
                             continue
+                    key_num_set = _sig_num_tokens(key)
+                    if subj_num_set and key_num_set and subj_num_set.isdisjoint(key_num_set):
+                        continue
                     score = _token_overlap_score(subj_tokens, key_tokens)
                     contains = (subject_norm in key or key in subject_norm)
                     if score < 0.4 and not contains:
@@ -1568,6 +1615,7 @@ def main() -> int:
                 desc_prefix = parts[0].strip()
         iface_hint_tokens = _interface_tokens(desc_prefix) if desc_prefix else set()
         subject_norm = normalize_subject(subject_text)
+        raw_subject_norm = normalize_subject(description or "")
         date_tokens = _extract_date_tokens(subject_text)
         date_tokens += _extract_date_tokens_from_description(description)
         # de-dup while preserving order
@@ -1588,14 +1636,22 @@ def main() -> int:
             date_tokens = []
             explicit_marker = False
         baseline_created_date = _coerce_row_created_date(_baseline_row_created_value(row_context))
-        thread, match_note = find_thread(
-            subject_norm,
-            requester,
-            date_tokens=date_tokens,
-            prefer_consultant_date=explicit_marker,
-            iface_tokens=iface_hint_tokens,
-            baseline_date=baseline_created_date,
-        )
+        thread = None
+        match_note = ""
+        if raw_subject_norm and raw_subject_norm != subject_norm and raw_subject_norm in threads:
+            raw_thread = threads.get(raw_subject_norm) or []
+            if (not requester) or _thread_has_requester(raw_thread, requester):
+                thread = raw_thread
+                match_note = "RowExact"
+        if thread is None:
+            thread, match_note = find_thread(
+                subject_norm,
+                requester,
+                date_tokens=date_tokens,
+                prefer_consultant_date=explicit_marker,
+                iface_tokens=iface_hint_tokens,
+                baseline_date=baseline_created_date,
+            )
         # When a stale date marker existed, refine thread choice using requester-reply
         # proximity to the row's original ServiceNow baseline date.
         if thread and requester and baseline_created_date and stale_anchor:
