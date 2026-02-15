@@ -417,12 +417,21 @@ def main() -> int:
         subj_tokens = _match_tokens(subject_norm)
         if not subj_tokens:
             return None
+        subj_inc_set = _inc_tokens(subject_norm)
+        subj_num_set = _sig_num_tokens(subject_norm)
         hits = []
         for key, thread in threads.items():
             if not _thread_has_requester(thread, requester):
                 continue
             key_tokens = _match_tokens(key)
             if not key_tokens:
+                continue
+            if subj_inc_set:
+                key_inc_set = _inc_tokens(key)
+                if not key_inc_set or subj_inc_set.isdisjoint(key_inc_set):
+                    continue
+            key_num_set = _sig_num_tokens(key)
+            if subj_num_set and key_num_set and subj_num_set.isdisjoint(key_num_set):
                 continue
             if iface_tokens:
                 key_iface_set = _interface_tokens(key)
@@ -453,12 +462,21 @@ def main() -> int:
         subj_tokens = _match_tokens(subject_norm)
         if not subj_tokens:
             return None
+        subj_inc_set = _inc_tokens(subject_norm)
+        subj_num_set = _sig_num_tokens(subject_norm)
         best = None
         for key, thread in threads.items():
             if not _thread_has_requester(thread, requester):
                 continue
             key_tokens = _match_tokens(key)
             if not key_tokens:
+                continue
+            if subj_inc_set:
+                key_inc_set = _inc_tokens(key)
+                if not key_inc_set or subj_inc_set.isdisjoint(key_inc_set):
+                    continue
+            key_num_set = _sig_num_tokens(key)
+            if subj_num_set and key_num_set and subj_num_set.isdisjoint(key_num_set):
                 continue
             if iface_tokens:
                 key_iface_set = _interface_tokens(key)
@@ -2942,6 +2960,93 @@ def main() -> int:
             row_idx = state.get("row_index")
             if row_idx:
                 ws.cell(row_idx, resolved_col).value = next_str
+
+        # Cross-subject duplicate triplet guard (narrow):
+        # when same consultant has identical created/ack/resolved across
+        # different subjects, try to move only resolved to the next valid
+        # consultant non-ack reply in that row's own thread.
+        seen_by_requester_triplet = {}
+        state_by_list_index = {
+            s.get("list_index"): s
+            for s in row_states
+            if s.get("list_index") is not None
+        }
+        for state in row_states:
+            list_index = state.get("list_index")
+            if list_index is None or list_index >= len(automation_rows):
+                continue
+            if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+
+            row_vals = automation_rows[list_index]
+            c = row_vals.get("Created Date & Time")
+            a = row_vals.get("Actual Response Date & Time")
+            r = row_vals.get("Actual Resolved Date & Time")
+            if not (c and a and r):
+                continue
+
+            requester = state.get("requester") or ""
+            req_key = _requester_key(requester)
+            triplet_key = (req_key, c, a, r)
+            prev_idx = seen_by_requester_triplet.get(triplet_key)
+            if prev_idx is None:
+                seen_by_requester_triplet[triplet_key] = list_index
+                continue
+
+            prev_state = state_by_list_index.get(prev_idx)
+            prev_subject = (prev_state or {}).get("subject_norm") if prev_state else None
+            curr_subject = state.get("subject_norm")
+            if not prev_subject or not curr_subject or prev_subject == curr_subject:
+                continue
+
+            thread = state.get("thread") or []
+            if not thread:
+                continue
+
+            res_dt = _parse_time_str(r) or _parse_time_str(a)
+            if not res_dt:
+                continue
+            try:
+                res_ist = _to_ist(res_dt)
+            except Exception:
+                continue
+
+            date_tokens = state.get("date_tokens") or []
+            anchor_date = _anchor_date(date_tokens)
+            candidates = [
+                e for e in thread
+                if e.sent_time
+                and _match_requester(e.sender_name, e.sender_email, requester)
+                and not _is_ack_like_reply(e)
+            ]
+            if anchor_date and candidates:
+                on_anchor = [e for e in candidates if _to_ist(e.sent_time).date() == anchor_date]
+                if on_anchor:
+                    candidates = on_anchor
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda e: e.sent_time)
+            next_candidates = [
+                e for e in candidates
+                if _to_ist(e.sent_time) > res_ist
+                and _to_ist(e.sent_time) <= (res_ist + timedelta(hours=48))
+            ]
+            if not next_candidates:
+                continue
+
+            pick = next_candidates[0]
+            new_res = _format_time(pick.sent_time)
+            if not new_res or new_res == r:
+                continue
+
+            row_vals["Actual Resolved Date & Time"] = new_res
+            row_idx = state.get("row_index")
+            if row_idx:
+                ws.cell(row_idx, resolved_col).value = new_res
+            if list_index < len(debug_rows):
+                debug_rows[list_index]["ResolvedSource"] = pick.sender_email or pick.sender_name
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; CrossSubjectDuplicateGuard"
 
     fill_result = fill_template(
         template_path=template_path,
