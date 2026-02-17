@@ -2854,6 +2854,60 @@ def main() -> int:
             cands.sort()
             return cands[-1]
 
+        def _extract_quoted_request_before_ist(email_obj, subject_norm_value: str, upper_ist):
+            raw = f"{getattr(email_obj, 'body', '') or ''}\n{getattr(email_obj, 'body_html', '') or ''}"
+            if not raw:
+                return None
+            txt = raw
+            txt = re.sub(r"(?is)<style.*?>.*?</style>", " ", txt)
+            txt = re.sub(r"(?is)<script.*?>.*?</script>", " ", txt)
+            txt = re.sub(r"(?i)<\s*br\s*/?>", "\n", txt)
+            txt = re.sub(r"(?i)</\s*(p|div|tr|td|th|li|h[1-6])\s*>", "\n", txt)
+            txt = re.sub(r"(?is)<[^>]+>", " ", txt)
+            txt = html.unescape(txt)
+            lines = [ln.strip() for ln in txt.splitlines() if ln and ln.strip()]
+            if not lines:
+                return None
+
+            row_tokens = _match_tokens(subject_norm_value or "")
+            cands = []
+            for i, ln in enumerate(lines):
+                if not ln.lower().startswith("from:"):
+                    continue
+                sent_line = ""
+                subj_line = ""
+                for j in range(i + 1, min(i + 18, len(lines))):
+                    low = lines[j].lower()
+                    if low.startswith("from:"):
+                        break
+                    if not sent_line and low.startswith("sent:"):
+                        sent_line = lines[j]
+                    if not subj_line and (low.startswith("subject:") or low.startswith("objet")):
+                        subj_line = lines[j]
+                    if sent_line and subj_line:
+                        break
+                if not sent_line:
+                    continue
+                if subj_line and row_tokens:
+                    subj_text = re.sub(r"(?i)^(subject|objet)\s*:\s*", "", subj_line).strip()
+                    subj_norm = normalize_subject(subj_text)
+                    subj_tokens = _match_tokens(subj_norm)
+                    score = _token_overlap_score(row_tokens, subj_tokens) if subj_tokens else 0.0
+                    contains = bool(subject_norm_value and subj_norm and (subject_norm_value in subj_norm or subj_norm in subject_norm_value))
+                    if score < 0.45 and not contains:
+                        continue
+                sent_dt = _parse_quoted_sent_time(sent_line)
+                if not sent_dt:
+                    continue
+                sent_ist = _to_ist(sent_dt)
+                if upper_ist and sent_ist >= upper_ist:
+                    continue
+                cands.append(sent_ist)
+            if not cands:
+                return None
+            cands.sort()
+            return cands[-1]
+
         def _emails_for_requester(requester_name):
             k = requester_name or ""
             if k in _emails_for_requester_cache:
@@ -5150,6 +5204,91 @@ def main() -> int:
                 debug_rows[list_index]["ResolvedSource"] = pick_src
                 extra = "; ResolvedAckLikeQuotedGuard" if used_quoted else ""
                 debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; ResolvedAckLikeGuard{extra}{'; ResolvedAckLikeReanchor' if reanchored else ''}"
+
+        # Quoted request-anchor guard (isolated):
+        # If created was retained due unreliable response anchor and response exists,
+        # allow a strictly-bounded quoted request timestamp from the same chain to
+        # re-anchor Created only.
+        for state in row_states:
+            list_index = state.get("list_index")
+            if list_index is None or list_index >= len(automation_rows):
+                continue
+            if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+
+            base_thread = state.get("thread") or []
+            requester = state.get("requester") or ""
+            subject_norm = (state.get("subject_norm") or "").lower()
+            thread = _expanded_thread(subject_norm, base_thread, requester)
+            if not thread or not requester:
+                continue
+
+            notes_now = debug_rows[list_index].get("Notes", "") if list_index < len(debug_rows) else ""
+            notes_l = (notes_now or "").lower()
+            created_src_now = debug_rows[list_index].get("CreatedSource", "") if list_index < len(debug_rows) else ""
+            ack_src_now = debug_rows[list_index].get("AckSource", "") if list_index < len(debug_rows) else ""
+            row_vals = automation_rows[list_index]
+            c_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+            a_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+            if not (c_dt and a_dt):
+                continue
+            c_ist = _to_ist(c_dt)
+            a_ist = _to_ist(a_dt)
+            if a_ist <= c_ist:
+                continue
+
+            source_mismatch = (
+                bool(created_src_now)
+                and bool(requester)
+                and not _match_requester(created_src_now, created_src_now, requester)
+            )
+            ack_from_requester = bool(requester) and bool(ack_src_now) and _match_requester(ack_src_now, ack_src_now, requester)
+            span_missing_non_ess = "ess-only; no non-ess request" in notes_l
+            large_created_gap = (a_ist - c_ist) >= timedelta(hours=8)
+            needs_quoted_anchor = (
+                "created retained (response anchor unreliable)" in notes_l
+                or "created_clamped_to_first" in (created_src_now.lower() if isinstance(created_src_now, str) else "")
+                or (span_missing_non_ess and source_mismatch and large_created_gap)
+                or (source_mismatch and ack_from_requester and large_created_gap)
+            )
+            if (
+                not needs_quoted_anchor
+            ):
+                continue
+
+            quoted_candidates = []
+            for e in thread:
+                if not e.sent_time:
+                    continue
+                if not _req_match(e, requester):
+                    continue
+                q_ist = _extract_quoted_request_before_ist(e, subject_norm, a_ist)
+                if not q_ist:
+                    continue
+                quoted_candidates.append(q_ist)
+
+            if not quoted_candidates:
+                continue
+
+            q_pick = max(quoted_candidates)
+            # Safety bounds: keep within same practical episode.
+            if q_pick <= c_ist:
+                continue
+            if q_pick >= a_ist:
+                continue
+            if (a_ist - q_pick) > timedelta(hours=24):
+                continue
+
+            t = _format_time(q_pick)
+            if not t:
+                continue
+            row_vals["Created Date & Time"] = t
+            row_idx = state.get("row_index")
+            if row_idx:
+                ws.cell(row_idx, created_col).value = t
+            if list_index < len(debug_rows):
+                debug_rows[list_index]["CreatedSource"] = "PARSED_FROM_QUOTED_REQUEST"
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; QuotedRequestAnchorGuard"
 
         # Final monotonic safety:
         # ensure Created <= Ack <= Resolved after all guards.
