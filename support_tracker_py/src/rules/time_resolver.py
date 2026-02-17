@@ -36,6 +36,13 @@ NON_ACK_PHRASES = [
     "please provide us an update",
     "please provide an update on the below",
     "please provide an update",
+    "thank you for the information",
+    "thanks for the information",
+    "thank you for the update",
+    "thanks for the update",
+    "thanks for the info",
+    "noted with thanks",
+    "duly noted",
 ]
 
 DIRECT_RESOLUTION_PHRASES = [
@@ -134,24 +141,87 @@ def _match_requester(sender_name: str, sender_email: str, requester_name: str) -
 
 def _is_thanks_info_reply(email_record) -> bool:
     """Ignore non-resolution consultant replies like 'Thanks for the information'."""
-    body = (email_record.body or "").lower()
-    return (
-        "thanks for the information" in body
-        or "thanks for the confirmation" in body
-        or "we will ignore" in body
-        or "could you please provide us an update on the below" in body
-        or "could you please provide us an update regarding the below" in body
-        or "could you update us on the below" in body
+    body = _leading_body_segment(email_record.body or "").lower()
+    if not body:
+        return False
+    return _contains_any_phrase(
+        body,
+        [
+            "thanks for the information",
+            "thank you for the information",
+            "thanks for the confirmation",
+            "thank you for the confirmation",
+            "thanks for the update",
+            "thank you for the update",
+            "thanks for the info",
+            "noted with thanks",
+            "duly noted",
+            "we will ignore",
+            *NON_ACK_PHRASES,
+        ],
     )
+
+
+def _normalize_for_phrase_match(text: str) -> str:
+    if not text:
+        return ""
+    s = text.lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+
+def _contains_any_phrase(text: str, phrases: list[str]) -> bool:
+    t = _normalize_for_phrase_match(text)
+    if not t:
+        return False
+    for p in phrases:
+        pn = _normalize_for_phrase_match(p)
+        if pn and pn in t:
+            return True
+    return False
+
+
+def _leading_body_segment(body: str, max_chars: int = 4000) -> str:
+    """
+    Return only the newest/top body portion, trimming quoted history blocks.
+    This avoids false ack/non-ack hits from quoted older conversation text.
+    """
+    if not body:
+        return ""
+    lines = body.splitlines()
+    cut = len(lines)
+    quoted_markers = (
+        "-----original message-----",
+        "________________________________",
+    )
+    wrote_re = re.compile(r"^on .+wrote:\s*$", re.IGNORECASE)
+    for i, raw in enumerate(lines):
+        s = (raw or "").strip()
+        sl = s.lower()
+        if not s:
+            continue
+        if any(m in sl for m in quoted_markers):
+            cut = i
+            break
+        if wrote_re.match(s):
+            cut = i
+            break
+        if _is_from_header_line(s) or _is_sent_header_line(s):
+            cut = i
+            break
+    top = "\n".join(lines[:cut]).strip()
+    if len(top) > max_chars:
+        top = top[:max_chars]
+    return top
 
 
 def _is_ack_body(body: str) -> bool:
     if not body:
         return False
-    b = body.lower()
-    if any(p in b for p in NON_ACK_PHRASES):
+    top = _leading_body_segment(body)
+    if _contains_any_phrase(top, NON_ACK_PHRASES):
         return False
-    return any(p in b for p in ACK_PHRASES)
+    return _contains_any_phrase(top, ACK_PHRASES)
 
 
 def _is_ack_like_reply(email_record) -> bool:
@@ -159,11 +229,22 @@ def _is_ack_like_reply(email_record) -> bool:
     Ack-like replies should not be treated as resolved-time candidates.
     Keep direct-resolution mails out of this bucket.
     """
-    body = (email_record.body or "").lower()
-    if not body:
+    body = _leading_body_segment(email_record.body or "").lower()
+    raw_full = f"{email_record.body or ''}\n{getattr(email_record, 'body_html', '') or ''}"
+    # Some parsed mails can yield an almost-empty top segment. Use a small
+    # bounded fallback window to avoid classifying based on deep quoted history.
+    body_fallback = raw_full[:2000].lower() if raw_full else ""
+    if not body and not body_fallback:
         return False
-    if any(p in body for p in DIRECT_RESOLUTION_PHRASES):
+    # Update-chasing reminders are non-final and should not drive resolved-time picks.
+    if _contains_any_phrase(body, DIRECT_RESOLUTION_PHRASES):
         return False
+    if _contains_any_phrase(body, NON_ACK_PHRASES) or (
+        len(_normalize_for_phrase_match(body)) < 40
+        and _contains_any_phrase(body_fallback, NON_ACK_PHRASES)
+        and not _contains_any_phrase(body_fallback, DIRECT_RESOLUTION_PHRASES)
+    ):
+        return True
     return _is_ack_body(body)
 
 
@@ -279,17 +360,19 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
         if (e.sender_email in requester_candidates)
         or _match_requester(e.sender_name, e.sender_email, requester_name)
     ]
-    resolved_mail = requester_emails[-1] if requester_emails else None
-    if resolved_mail and _is_thanks_info_reply(resolved_mail):
-        for e in reversed(requester_emails):
-            if not _is_thanks_info_reply(e):
-                resolved_mail = e
-                break
-    if failed_subject and requester_emails:
-        for e in reversed(requester_emails):
-            if not _is_thanks_info_reply(e):
-                resolved_mail = e
-                break
+    def _latest_requester_non_ack(msgs):
+        for e in reversed(msgs):
+            if _is_ack_like_reply(e):
+                continue
+            if _is_thanks_info_reply(e):
+                continue
+            return e
+        return None
+
+    # Global resolved selector:
+    # never use ack-like / thanks-like requester replies as final resolved
+    # when a non-ack requester reply exists in the same thread.
+    resolved_mail = _latest_requester_non_ack(requester_emails) if requester_emails else None
     requester_first = requester_emails[0] if requester_emails else None
     requester_is_ess = bool(requester_candidates) or any(
         _is_ess_sender(e, ess_team) for e in requester_emails
@@ -365,18 +448,32 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 created_mail_pick = ess_emails[0]
                 if requester_emails:
                     try:
+                        requester_non_ack_initial = [
+                            e for e in requester_emails if not _is_ack_like_reply(e)
+                        ]
                         requester_first = min(requester_emails, key=lambda e: e.sent_time)
+                        requester_first_non_ack = (
+                            min(requester_non_ack_initial, key=lambda e: e.sent_time)
+                            if requester_non_ack_initial
+                            else None
+                        )
                         first_is_requester = _match_requester(
                             created_mail_pick.sender_name,
                             created_mail_pick.sender_email,
                             requester_name,
                         )
-                        gap = _to_ist(requester_first.sent_time) - _to_ist(created_mail_pick.sent_time)
+                        anchor_candidate = requester_first_non_ack or requester_first
+                        gap = _to_ist(anchor_candidate.sent_time) - _to_ist(created_mail_pick.sent_time)
                         # Keep current behavior by default, but when the first ESS mail
                         # is by someone else and requester starts much later, anchor created
                         # to requester to avoid stale carry-over from older sibling chains.
-                        if first_is_requester or gap >= timedelta(hours=12):
-                            created_mail_pick = requester_first
+                        #
+                        # Safety: do not jump across large multi-day gaps on requester
+                        # ack-like tails (common in long ESS-only chains).
+                        if first_is_requester:
+                            created_mail_pick = anchor_candidate
+                        elif requester_first_non_ack and timedelta(hours=12) <= gap <= timedelta(days=3):
+                            created_mail_pick = requester_first_non_ack
                     except Exception:
                         pass
                 created_t = _format_time(created_mail_pick.sent_time)
@@ -389,10 +486,15 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                     resolved_mail_pick = max(requester_non_ack, key=lambda e: e.sent_time)
                     span_note = "ESS-only; no non-ESS request; requester span"
                 elif requester_emails:
-                    # Keep consultant ownership stable even when requester replies
-                    # are mostly ack-like.
-                    resolved_mail_pick = max(requester_emails, key=lambda e: e.sent_time)
-                    span_note = "ESS-only; no non-ESS request; requester span(ack-like)"
+                    # All requester replies are ack-like/update-like; do not use them
+                    # as resolved. Fall back to latest non-ack ESS reply.
+                    resolved_mail_pick = last_ess
+                    # Keep legacy marker for downstream guards.
+                    span_note = "ESS-only; no non-ESS request; requester span(ack-like); requester span(all-ack->ess)"
+                    # Safety: in all-ack requester tails, never promote requester
+                    # update-chasing mails to resolved. Keep resolved on latest
+                    # non-ack ESS reply.
+
                 else:
                     resolved_mail_pick = last_ess
                     span_note = "ESS-only; no non-ESS request; span"
@@ -414,6 +516,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                     and (resolved_ist is None or _to_ist(e.sent_time) <= resolved_ist)
                 ]
                 ack_candidates.sort(key=lambda e: e.sent_time)
+                dropped_stale_ack = False
 
                 for e in ack_candidates:
                     body = (e.body or "").lower()
@@ -434,12 +537,38 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 if not ack_mail_pick and ack_candidates:
                     ack_mail_pick = ack_candidates[0]
 
+                # Safe window guard: avoid using very-late "ack" in ESS-only span rows.
+                # If selected ack is stale, try near-created fallback candidates first.
+                max_ack_delay = timedelta(hours=12)
+                if ack_mail_pick and (_to_ist(ack_mail_pick.sent_time) - created_ist) > max_ack_delay:
+                    dropped_stale_ack = True
+                    requester_near = [
+                        e for e in requester_emails
+                        if e.sent_time
+                        and _to_ist(e.sent_time) > created_ist
+                        and _to_ist(e.sent_time) <= (created_ist + max_ack_delay)
+                    ]
+                    requester_near.sort(key=lambda e: e.sent_time)
+                    if requester_near:
+                        ack_mail_pick = requester_near[0]
+                    else:
+                        ess_near = [
+                            e for e in ess_emails
+                            if e.sent_time
+                            and _to_ist(e.sent_time) > created_ist
+                            and _to_ist(e.sent_time) <= (created_ist + max_ack_delay)
+                        ]
+                        ess_near.sort(key=lambda e: e.sent_time)
+                        ack_mail_pick = ess_near[0] if ess_near else None
+
                 if ack_mail_pick:
                     ack_t = _format_time(ack_mail_pick.sent_time)
                     ack_src = ack_mail_pick.sender_email or ack_mail_pick.sender_name
                 else:
-                    ack_t = resolved_t
+                    ack_t = created_t if dropped_stale_ack else resolved_t
                     ack_src = "ACK NOT FOUND"
+                    if dropped_stale_ack:
+                        span_note = f"{span_note}; AckWindowGuard"
                 return (
                     TimeResult(created_t, ack_t, resolved_t),
                     TimeDebug(
@@ -1217,6 +1346,91 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                     notes = (notes + "; FailedCreatedFromRequesterFirst") if notes else "FailedCreatedFromRequesterFirst"
         except Exception:
             pass
+
+    # Narrow episode re-anchor guard:
+    # In long chains, if we already picked an older request/ack pair but there is a
+    # clearly newer requester ack-like reply with a nearby request before it, re-anchor
+    # created/ack to that newer episode (keep resolved unchanged).
+    try:
+        if created_time and response_time not in ("", "NA") and resolved_mail and requester_emails:
+            created_dt = _to_ist(created_time)
+            response_dt = datetime.strptime(response_time, "%d-%m-%Y %H:%M").replace(tzinfo=IST)
+            resolved_dt = _to_ist(resolved_mail.sent_time)
+            # Keep this strict to avoid disturbing already-correct rows.
+            min_episode_gap = timedelta(hours=6)
+            max_ack_after_request = timedelta(minutes=30)
+
+            episode_candidates = []
+            for e in requester_emails:
+                if not e.sent_time:
+                    continue
+                e_dt = _to_ist(e.sent_time)
+                if e_dt <= response_dt + min_episode_gap:
+                    continue
+                if e_dt > resolved_dt:
+                    continue
+                if not _is_ack_body((e.body or "").lower()):
+                    continue
+
+                req_time, req_src = _latest_request_time_before(
+                    ordered,
+                    ess_team,
+                    e.sent_time,
+                    subject_norm=subject_norm,
+                )
+                req_dt = _to_ist(req_time) if req_time else None
+
+                # If live-chain request anchor is missing or too old for this newer ack-like
+                # requester mail, try to extract request time from this same mail body.
+                # This keeps scope tight and avoids disturbing unrelated rows.
+                req_from_ack_body = _extract_request_time_from_body(
+                    e.body or "",
+                    ess_team,
+                    max_dt=e.sent_time,
+                    subject_norm=subject_norm,
+                )
+                req_from_ack_body_dt = _to_ist(req_from_ack_body) if req_from_ack_body else None
+
+                use_body_req = False
+                if req_from_ack_body_dt:
+                    if (
+                        req_from_ack_body_dt > created_dt + min_episode_gap
+                        and req_from_ack_body_dt <= e_dt
+                        and (e_dt - req_from_ack_body_dt) <= max_ack_after_request
+                        and req_from_ack_body_dt <= resolved_dt
+                    ):
+                        if (not req_dt) or (req_dt <= created_dt + min_episode_gap) or ((e_dt - req_dt) > max_ack_after_request):
+                            use_body_req = True
+
+                if use_body_req:
+                    req_time = req_from_ack_body
+                    req_src = "PARSED_FROM_ACK_BODY_EPISODE"
+                    req_dt = req_from_ack_body_dt
+                elif not req_dt:
+                    continue
+
+                if req_dt <= created_dt + min_episode_gap:
+                    continue
+                if req_dt > e_dt:
+                    continue
+                if (e_dt - req_dt) > max_ack_after_request:
+                    continue
+                if req_dt > resolved_dt:
+                    continue
+
+                episode_candidates.append((e_dt, e, req_time, req_src))
+
+            if episode_candidates:
+                # Prefer the latest valid re-anchoring episode before resolved.
+                episode_candidates.sort(key=lambda x: x[0], reverse=True)
+                _ack_dt, ack_mail_new, req_time_new, req_src_new = episode_candidates[0]
+                created_time = req_time_new
+                created_src = req_src_new
+                response_time = _format_time(ack_mail_new.sent_time)
+                ack_src = ack_mail_new.sender_email or ack_mail_new.sender_name
+                notes = (notes + "; ReAnchoredNewerRequestAckEpisode") if notes else "ReAnchoredNewerRequestAckEpisode"
+    except Exception:
+        pass
 
     return (
         TimeResult(
