@@ -7550,6 +7550,93 @@ def main() -> int:
         # If multiple rows for the same requester ended up with identical
         # created/response/resolved, move only secondary rows to another valid
         # requester episode without touching non-duplicate rows.
+        # Requester ack-like quoted episode guard (global, targeted):
+        # For ESS-only rows where requester-span fallback landed on an old ESS
+        # episode and latest requester mail is an update/ack-like, recover the
+        # latest quoted requester reply under that mail and use it as the true
+        # episode anchor.
+        for state in row_states:
+            list_index = state.get("list_index")
+            row_idx = state.get("row_index")
+            if list_index is None or list_index >= len(automation_rows) or not row_idx:
+                continue
+            if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+            notes = debug_rows[list_index].get("Notes", "") if list_index < len(debug_rows) else ""
+            notes_l = (notes or "").lower()
+            if "requester span(all-ack->ess)" not in notes_l:
+                continue
+
+            row_vals = automation_rows[list_index]
+            requester = state.get("requester") or ""
+            if not requester:
+                continue
+            c_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+            a_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+            if not (c_dt and a_dt):
+                continue
+            c_ist = _to_ist(c_dt)
+            a_ist = _to_ist(a_dt)
+
+            subject_norm = (state.get("subject_norm") or "").lower()
+            base_thread = state.get("thread") or []
+            thread = _expanded_thread(
+                subject_norm,
+                base_thread,
+                requester,
+                include_non_ess=True,
+                reference_ist=a_ist,
+            )
+            if not thread:
+                continue
+            requester_live = [e for e in thread if _req_match(e, requester) and _email_ist(e)]
+            if not requester_live:
+                continue
+            requester_live.sort(key=lambda e: e.sent_time)
+            latest_top = requester_live[-1]
+            latest_top_ist = _email_ist(latest_top)
+            if not latest_top_ist:
+                continue
+            if not (_ack_like(latest_top) or _ack_like_text_fallback(latest_top)):
+                continue
+
+            q_ist = _extract_quoted_requester_reply_ist(
+                latest_top,
+                requester,
+                subject_norm,
+                latest_top_ist - timedelta(days=14),
+                latest_top_ist + timedelta(minutes=1),
+            )
+            if not q_ist:
+                continue
+            if q_ist >= latest_top_ist:
+                continue
+            if (latest_top_ist - q_ist) > timedelta(days=14):
+                continue
+            # Apply only when this meaningfully improves stale old picks.
+            if q_ist <= (a_ist + timedelta(minutes=5)):
+                continue
+
+            t = _format_time(q_ist)
+            if not t:
+                continue
+            row_vals["Created Date & Time"] = t
+            row_vals["Actual Response Date & Time"] = t
+            row_vals["Actual Resolved Date & Time"] = t
+            ws.cell(row_idx, created_col).value = t
+            ws.cell(row_idx, response_col).value = t
+            ws.cell(row_idx, resolved_col).value = t
+            if list_index < len(debug_rows):
+                debug_rows[list_index]["CreatedSource"] = "PARSED_FROM_QUOTED_REPLY"
+                debug_rows[list_index]["AckSource"] = "PARSED_FROM_QUOTED_REPLY"
+                debug_rows[list_index]["ResolvedSource"] = "PARSED_FROM_QUOTED_REPLY"
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; RequesterAckLikeQuotedEpisodeGuard"
+
+            if _row_has_blue_fill(row_idx):
+                _set_row_fill(row_idx, clear_fill)
+                if list_index < len(debug_rows):
+                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+
         duplicate_groups = {}
         for state in row_states:
             list_index = state.get("list_index")
