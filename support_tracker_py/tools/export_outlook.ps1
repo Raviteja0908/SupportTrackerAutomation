@@ -22,10 +22,14 @@ Write-Host "Connecting to Outlook..."
 $outlook = New-Object -ComObject Outlook.Application
 $namespace = $outlook.GetNamespace("MAPI")
 
-$fastExport = $false
+$fastExport = $true
 if ($env:FAST_EXPORT) {
     $val = $env:FAST_EXPORT.ToString().ToLower()
-    if ($val -in @("1", "true", "yes", "y", "on")) { $fastExport = $true }
+    if ($val -in @("0", "false", "no", "n", "off")) {
+        $fastExport = $false
+    } elseif ($val -in @("1", "true", "yes", "y", "on")) {
+        $fastExport = $true
+    }
 }
 Write-Host ("Export mode: {0}" -f ($(if ($fastExport) { "FAST (MailItem + ReceivedTime)" } else { "COMPLETE (All items + SentOn fallback)" })))
 
