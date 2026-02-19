@@ -3056,6 +3056,14 @@ def main() -> int:
 
         _expanded_thread_cache = {}
         _requester_pool_cache = {}
+        # Blue-only post resolver mode:
+        # run strict post adjustments only in blue-marked section and keep
+        # normal rows untouched in post-pass logic.
+        # Default ON:
+        # keep normal rows untouched in post-pass and run strict resolver only
+        # on blue-marked rows.
+        blue_only_post_resolver = os.getenv("BLUE_ONLY_POST_RESOLVER", "1") == "1"
+        nonblue_row_states = [] if blue_only_post_resolver else row_states
 
         def _expanded_thread(subject_norm_value, base_thread, requester_name, include_non_ess=False, reference_ist=None):
             if not base_thread:
@@ -3162,7 +3170,7 @@ def main() -> int:
 
         # Build created-time list in row order.
         created_list = []
-        for state in row_states:
+        for state in nonblue_row_states:
             idx = state["list_index"]
             created_str = automation_rows[idx].get("Created Date & Time")
             created_dt = _parse_time_str(created_str)
@@ -3183,7 +3191,7 @@ def main() -> int:
         grace = timedelta(hours=6)
         max_forward = timedelta(days=1)
 
-        for i, state in enumerate(row_states):
+        for i, state in enumerate(nonblue_row_states):
             thread = state.get("thread")
             requester = state.get("requester")
             if not thread or not requester:
@@ -3336,7 +3344,7 @@ def main() -> int:
         # After sequence adjustments, re-apply "resolved-after-ack" using the full thread.
         # This protects cases where the ordering slice stopped before the true resolution reply
         # (e.g., ack just before midnight and resolution shortly after).
-        for state in row_states:
+        for state in nonblue_row_states:
             thread = state.get("thread")
             requester = state.get("requester")
             if not thread or not requester:
@@ -3507,7 +3515,7 @@ def main() -> int:
             for s in row_states
             if s.get("list_index") is not None
         }
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -3591,7 +3599,7 @@ def main() -> int:
         # Episode consistency guard (conservative):
         # If resolved is far after ack, re-anchor Created/Ack to a newer strong
         # request->ack episode in the same matched thread.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -3723,7 +3731,7 @@ def main() -> int:
         # Episode ack-refresh guard (strict):
         # Re-anchor Created/Ack only when there is a clearly newer request->ack
         # pair in the same thread and it materially improves Ack->Resolved gap.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -3863,7 +3871,7 @@ def main() -> int:
         # ESS-only span rebase guard (strict):
         # For ESS-only span rows with very old Ack, allow rebasing Created/Ack to
         # a clearly later requester episode when no non-ESS request exists.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -3964,7 +3972,7 @@ def main() -> int:
         # For stale rows where resolved is already from requester but created/ack
         # stayed on an older non-requester episode, rebase Created/Ack to the
         # first requester non-ack episode in the same thread.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4065,7 +4073,7 @@ def main() -> int:
         # Final ack-delay guard (narrow):
         # In ESS-only rows, prevent very-late ack timestamps from stale carry-over.
         # Do not run this on mixed/requester rows.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4151,7 +4159,7 @@ def main() -> int:
         # Quoted request rebase guard (safe):
         # When Created is stale vs Ack/Resolved, mine requester mails in the same
         # episode for quoted non-ESS request times and re-anchor Created.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4251,7 +4259,7 @@ def main() -> int:
         # Final non-ack resolved guard (global, safe):
         # If resolved lands on an ack-like requester reminder, rebase resolved
         # to latest requester non-ack reply in the same thread.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4336,7 +4344,7 @@ def main() -> int:
         # Late-episode rebase guard (narrow):
         # If resolved is much later than ack and resolved belongs to requester,
         # re-anchor Created/Ack to the latest requester episode near resolved.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4441,7 +4449,7 @@ def main() -> int:
         # Requester-ack ownership guard (narrow):
         # If resolved is from requester but ack is not, align ack to first
         # requester reply after created within the row thread.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4524,7 +4532,7 @@ def main() -> int:
         # Generic stale-created guard for ESS-only rows:
         # if Created stayed on an older non-requester episode while Ack/Resolved
         # are requester-owned, rebase Created to the requester episode near Ack.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4618,7 +4626,7 @@ def main() -> int:
         # Generic requester subject-episode ownership guard:
         # when resolved belongs to requester but ack source does not, re-anchor
         # Created/Ack to the first requester episode that matches this row subject.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4727,7 +4735,7 @@ def main() -> int:
         # Mixed requester-ownership guard (global):
         # If Created/Ack were taken from the same non-requester source but Resolved
         # belongs to requester, re-anchor Created/Ack to requester episode near Resolved.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4856,7 +4864,7 @@ def main() -> int:
         # Resolved-window reanchor guard (global):
         # If Created/Ack are from same non-requester source but Resolved is requester,
         # anchor Created/Ack from requester activity close to Resolved timestamp.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -4966,7 +4974,7 @@ def main() -> int:
         # Requester-span ack-like guard (global):
         # For ACK NOT FOUND + requester span(ack-like), prefer latest requester
         # non-ack in thread so reminder mails do not anchor old timestamps.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -5069,7 +5077,7 @@ def main() -> int:
         # Episode consistency guard (global):
         # For mixed-source/problem rows, pick one requester episode and derive all
         # three timestamps from that episode to avoid cross-episode mixing.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -5292,7 +5300,7 @@ def main() -> int:
         # Final requester-span(ack-like) fallback (global):
         # If a row still sits on an old timestamp with ACK NOT FOUND, move it to
         # latest requester mail in the same expanded thread.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -5435,7 +5443,7 @@ def main() -> int:
         # If resolved currently points to an ack-like/update-like requester reply
         # (e.g., "thank you for the update/information"), move resolved to the latest
         # prior non-ack requester reply in the same subject episode.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -5562,7 +5570,7 @@ def main() -> int:
         # If created was retained due unreliable response anchor and response exists,
         # allow a strictly-bounded quoted request timestamp from the same chain to
         # re-anchor Created only.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -5652,7 +5660,7 @@ def main() -> int:
             # If a row drifted into ESS-only/parsed anchoring, but a live non-ESS
             # requester mail exists in the same subject episode before ack/resolved,
             # re-anchor Created to that live request.
-            for state in row_states:
+            for state in nonblue_row_states:
                 list_index = state.get("list_index")
                 if list_index is None or list_index >= len(automation_rows):
                     continue
@@ -5936,7 +5944,7 @@ def main() -> int:
             # ESS continuation guard (global):
             # If the row is ESS-initiated/span-like and the same consultant keeps
             # replying with no external request in-between, align to consultant tail.
-            for state in row_states:
+            for state in nonblue_row_states:
                 list_index = state.get("list_index")
                 if list_index is None or list_index >= len(automation_rows):
                     continue
@@ -6095,7 +6103,7 @@ def main() -> int:
                 r"\b(prod|prd|production|fcp|bip|uat|fct|biu|qa|fcq|biq|dev|development|fcd|bid)\b",
                 flags=re.IGNORECASE,
             )
-            for state in row_states:
+            for state in nonblue_row_states:
                 list_index = state.get("list_index")
                 if list_index is None or list_index >= len(automation_rows):
                     continue
@@ -6164,7 +6172,7 @@ def main() -> int:
         # For ESS-only continuation/requester-span rows, if created is already chosen
         # correctly but response/resolved were later moved by post-ack passes, keep all
         # three equal to created.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -6270,7 +6278,7 @@ def main() -> int:
         # Parsed-gap reanchor guard:
         # If Created came from parsed quote and response/resolved are much later,
         # re-anchor Created to the latest real non-ESS request before response.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -6367,7 +6375,7 @@ def main() -> int:
         # Baseline stale-created guard (safe + narrow):
         # When Created drifts >1 day away from ServiceNow baseline on risky/ambiguous
         # rows, re-anchor Created to the nearest valid request episode around baseline.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -6504,7 +6512,7 @@ def main() -> int:
         locked_list_indexes = set()
         enable_risk_episode_lock = os.getenv("ENABLE_RISK_EPISODE_LOCK", "0") == "1"
         if enable_risk_episode_lock:
-            for state in row_states:
+            for state in nonblue_row_states:
                 list_index = state.get("list_index")
                 if list_index is None or list_index >= len(automation_rows):
                     continue
@@ -6702,7 +6710,7 @@ def main() -> int:
 
         # Final monotonic safety:
         # ensure Created <= Ack <= Resolved after all guards.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -6843,7 +6851,7 @@ def main() -> int:
         # When Created is early, Response/Resolved are very late, and ownership is
         # split (Ack non-requester, Resolved requester), clamp to requester's local
         # episode near Created instead of a later drifted episode.
-        for state in row_states:
+        for state in nonblue_row_states:
             list_index = state.get("list_index")
             if list_index is None or list_index >= len(automation_rows):
                 continue
@@ -7101,33 +7109,392 @@ def main() -> int:
 
             row_tokens = _match_tokens(subject_norm)
             baseline_date = state.get("baseline_created_date")
-            win_start = c_ist - timedelta(minutes=5)
-            win_end = c_ist + timedelta(hours=96)
-            strict_candidates = []
-            for e in thread:
-                e_ist = _email_ist(e)
-                if not e_ist:
+            owner_hint = ""
+            if list_index < len(debug_rows):
+                owner_hint = (
+                    debug_rows[list_index].get("ResolvedSource")
+                    or debug_rows[list_index].get("AckSource")
+                    or ""
+                )
+
+            # Blue pre-fix: quoted pair re-anchor.
+            # Recover (created, response) from quoted history when current created
+            # is stale and causes a large blue gap.
+            quoted_sources = []
+            for e in (thread or []):
+                quoted_sources.append(e)
+            requester_pool_any_q = _requester_pool(subject_norm, "", c_ist, day_window=30)
+            for e in requester_pool_any_q:
+                quoted_sources.append(e)
+
+            quoted_pairs = []
+            seen_pairs = set()
+            for e in quoted_sources:
+                if not getattr(e, "sent_time", None):
                     continue
-                if e_ist < win_start or e_ist > win_end:
+                q_ack_ist = _extract_quoted_requester_reply_ist(
+                    e,
+                    requester,
+                    subject_norm,
+                    c_ist - timedelta(days=5),
+                    c_ist + timedelta(minutes=1),
+                )
+                if not q_ack_ist:
                     continue
-                if not _req_match(e, requester):
+                q_req_ist = _extract_quoted_request_before_ist(
+                    e,
+                    subject_norm,
+                    q_ack_ist,
+                )
+                if not q_req_ist or q_req_ist >= q_ack_ist:
                     continue
-                if _ack_like(e) or _ack_like_text_fallback(e):
+                if q_req_ist <= (c_ist - timedelta(days=5)):
                     continue
-                if baseline_date and abs((e_ist.date() - baseline_date).days) > 2:
+                if q_ack_ist >= a_ist:
                     continue
-                if row_tokens:
-                    s_norm = normalize_subject(getattr(e, "subject", "") or "")
-                    s_tokens = _match_tokens(s_norm)
-                    score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
-                    contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
-                    if score < 0.45 and not contains:
+                pair_key = (
+                    q_req_ist.replace(second=0, microsecond=0),
+                    q_ack_ist.replace(second=0, microsecond=0),
+                )
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                quoted_pairs.append((q_req_ist, q_ack_ist))
+
+            if quoted_pairs:
+                # Prefer the pair with latest ack before current created/response.
+                quoted_pairs.sort(key=lambda p: p[1])
+                q_req_ist, q_ack_ist = quoted_pairs[-1]
+                q_gap = q_ack_ist - q_req_ist
+                if (
+                    q_gap > timedelta(seconds=0)
+                    and q_gap <= timedelta(minutes=16)
+                    and q_gap < old_gap
+                ):
+                    t_c = _format_time(q_req_ist)
+                    t_a = _format_time(q_ack_ist)
+                    t_r = row_vals.get("Actual Resolved Date & Time") or t_a
+                    r_dt_now = _parse_time_str(t_r)
+                    r_ist_now = _to_ist(r_dt_now) if r_dt_now else None
+                    if not r_ist_now or r_ist_now < q_ack_ist:
+                        t_r = t_a
+                    if t_c and t_a and t_r:
+                        row_vals["Created Date & Time"] = t_c
+                        row_vals["Actual Response Date & Time"] = t_a
+                        row_vals["Actual Resolved Date & Time"] = t_r
+                        ws.cell(row_idx, created_col).value = t_c
+                        ws.cell(row_idx, response_col).value = t_a
+                        ws.cell(row_idx, resolved_col).value = t_r
+                        c_ist = q_req_ist
+                        a_ist = q_ack_ist
+                        old_gap = a_ist - c_ist
+                        if list_index < len(debug_rows):
+                            debug_rows[list_index]["CreatedSource"] = "PARSED_FROM_QUOTED_REQUEST"
+                            debug_rows[list_index]["AckSource"] = "PARSED_FROM_QUOTED_REPLY"
+                            if t_r == t_a:
+                                debug_rows[list_index]["ResolvedSource"] = "PARSED_FROM_QUOTED_REPLY"
+                            debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueQuotedPairReanchor"
+                        if old_gap <= timedelta(minutes=16):
+                            _set_row_fill(row_idx, clear_fill)
+                            if list_index < len(debug_rows):
+                                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+                            continue
+
+            def _owner_hint_match(e):
+                if not owner_hint:
+                    return False
+                hint = str(owner_hint).strip().lower()
+                sender_email = (getattr(e, "sender_email", "") or "").strip().lower()
+                sender_name = (getattr(e, "sender_name", "") or "").strip().lower()
+                sender_blob = f"{sender_name} {sender_email}".strip()
+                if not sender_blob:
+                    return False
+                if "@" in hint:
+                    return hint in sender_blob
+                return hint in sender_blob
+
+            def _same_sender(a, b):
+                a_email = (getattr(a, "sender_email", "") or "").strip().lower()
+                b_email = (getattr(b, "sender_email", "") or "").strip().lower()
+                if a_email and b_email:
+                    return a_email == b_email
+                a_name = (getattr(a, "sender_name", "") or "").strip().lower()
+                b_name = (getattr(b, "sender_name", "") or "").strip().lower()
+                return bool(a_name and b_name and a_name == b_name)
+
+            def _collect_ack_candidates(messages, win_start_ist, win_end_ist, baseline_days):
+                out = []
+                for e in messages:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
                         continue
-                strict_candidates.append(e)
+                    if e_ist < win_start_ist or e_ist > win_end_ist:
+                        continue
+                    if not (_req_match(e, requester) or _owner_hint_match(e)):
+                        continue
+                    if not (_ack_like(e) or _ack_like_text_fallback(e)):
+                        continue
+                    if (
+                        baseline_days is not None
+                        and baseline_date
+                        and abs((e_ist.date() - baseline_date).days) > baseline_days
+                    ):
+                        continue
+                    if row_tokens:
+                        s_norm = normalize_subject(getattr(e, "subject", "") or "")
+                        s_tokens = _match_tokens(s_norm)
+                        score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                        contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
+                        if score < 0.45 and not contains:
+                            continue
+                    out.append(e)
+                out.sort(key=lambda e: e.sent_time)
+                return out
+
+            def _collect_ess_nonack_candidates(messages, win_start_ist, win_end_ist, baseline_days):
+                out = []
+                for e in messages:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
+                        continue
+                    if e_ist < win_start_ist or e_ist > win_end_ist:
+                        continue
+                    if not _ess_sender(e):
+                        continue
+                    if _system_like_sender(e):
+                        continue
+                    if _ack_like(e) or _ack_like_text_fallback(e):
+                        continue
+                    if (
+                        baseline_days is not None
+                        and baseline_date
+                        and abs((e_ist.date() - baseline_date).days) > baseline_days
+                    ):
+                        continue
+                    if row_tokens:
+                        s_norm = normalize_subject(getattr(e, "subject", "") or "")
+                        s_tokens = _match_tokens(s_norm)
+                        score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                        contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
+                        if score < 0.45 and not contains:
+                            continue
+                    out.append(e)
+                out.sort(key=lambda e: e.sent_time)
+                return out
+
+            def _collect_blue_candidates(messages, win_start_ist, win_end_ist, baseline_days):
+                out = []
+                for e in messages:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
+                        continue
+                    if e_ist < win_start_ist or e_ist > win_end_ist:
+                        continue
+                    if not (_req_match(e, requester) or _owner_hint_match(e)):
+                        continue
+                    if _ack_like(e) or _ack_like_text_fallback(e):
+                        continue
+                    if (
+                        baseline_days is not None
+                        and baseline_date
+                        and abs((e_ist.date() - baseline_date).days) > baseline_days
+                    ):
+                        continue
+                    if row_tokens:
+                        s_norm = normalize_subject(getattr(e, "subject", "") or "")
+                        s_tokens = _match_tokens(s_norm)
+                        score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                        contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
+                        if score < 0.45 and not contains:
+                            continue
+                    out.append(e)
+                out.sort(key=lambda e: e.sent_time)
+                return out
+
+            # Blue fix #1: recover true ack (first response) when it exists but
+            # row drifted due to multi-thread same-subject matching.
+            ack_pool_used = False
+            ack_candidates = _collect_ack_candidates(
+                thread,
+                c_ist - timedelta(minutes=5),
+                c_ist + timedelta(hours=48),
+                baseline_days=7,
+            )
+            if not ack_candidates:
+                requester_pool_for_ack = _requester_pool(subject_norm, requester, c_ist, day_window=30)
+                ack_candidates = _collect_ack_candidates(
+                    requester_pool_for_ack,
+                    c_ist - timedelta(minutes=5),
+                    c_ist + timedelta(hours=48),
+                    baseline_days=None,
+                )
+                ack_pool_used = bool(ack_candidates)
+            if not ack_candidates and owner_hint:
+                requester_pool_for_ack_any = _requester_pool(subject_norm, "", c_ist, day_window=30)
+                ack_candidates = _collect_ack_candidates(
+                    requester_pool_for_ack_any,
+                    c_ist - timedelta(minutes=5),
+                    c_ist + timedelta(hours=48),
+                    baseline_days=None,
+                )
+                ack_pool_used = bool(ack_candidates)
+            if ack_candidates:
+                ack_pick = None
+                for e in ack_candidates:
+                    if _email_ist(e) >= c_ist:
+                        ack_pick = e
+                        break
+                if not ack_pick:
+                    ack_pick = ack_candidates[0]
+                ack_pick_ist = _email_ist(ack_pick)
+                if ack_pick_ist and (ack_pick_ist - c_ist) < old_gap:
+                    requester_pool_for_resolved = _requester_pool(subject_norm, requester, ack_pick_ist, day_window=30)
+                    resolved_non_ack = _collect_blue_candidates(
+                        thread,
+                        ack_pick_ist,
+                        ack_pick_ist + timedelta(hours=72),
+                        baseline_days=7,
+                    )
+                    if not resolved_non_ack:
+                        resolved_non_ack = _collect_blue_candidates(
+                            requester_pool_for_resolved,
+                            ack_pick_ist,
+                            ack_pick_ist + timedelta(hours=72),
+                            baseline_days=None,
+                        )
+                    resolved_same_sender = [e for e in resolved_non_ack if _same_sender(e, ack_pick)]
+                    resolved_pick = resolved_same_sender[-1] if resolved_same_sender else (resolved_non_ack[-1] if resolved_non_ack else ack_pick)
+                    t_a = _format_time(ack_pick.sent_time)
+                    t_r = _format_time(resolved_pick.sent_time)
+                    if t_a and t_r:
+                        row_vals["Actual Response Date & Time"] = t_a
+                        row_vals["Actual Resolved Date & Time"] = t_r
+                        ws.cell(row_idx, response_col).value = t_a
+                        ws.cell(row_idx, resolved_col).value = t_r
+                        if list_index < len(debug_rows):
+                            debug_rows[list_index]["AckSource"] = ack_pick.sender_email or ack_pick.sender_name
+                            debug_rows[list_index]["ResolvedSource"] = resolved_pick.sender_email or resolved_pick.sender_name
+                            ack_note = "; BlueStrictAckReanchorPool" if ack_pool_used else "; BlueStrictAckReanchor"
+                            debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}{ack_note}"
+                        old_gap = ack_pick_ist - c_ist
+                        if old_gap <= timedelta(minutes=16):
+                            _set_row_fill(row_idx, clear_fill)
+                            if list_index < len(debug_rows):
+                                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+                            continue
+
+            used_requester_pool = False
+            strict_candidates = _collect_blue_candidates(
+                thread,
+                c_ist - timedelta(minutes=5),
+                c_ist + timedelta(hours=96),
+                baseline_days=2,
+            )
+            if not strict_candidates:
+                strict_candidates = _collect_blue_candidates(
+                    thread,
+                    c_ist - timedelta(minutes=5),
+                    c_ist + timedelta(hours=240),
+                    baseline_days=7,
+                )
+            if not strict_candidates:
+                requester_pool = _requester_pool(subject_norm, requester, c_ist, day_window=30)
+                strict_candidates = _collect_blue_candidates(
+                    requester_pool,
+                    c_ist - timedelta(minutes=5),
+                    c_ist + timedelta(days=30),
+                    baseline_days=None,
+                )
+                used_requester_pool = bool(strict_candidates)
+            if not strict_candidates and owner_hint:
+                requester_pool_any = _requester_pool(subject_norm, "", c_ist, day_window=30)
+                strict_candidates = _collect_blue_candidates(
+                    requester_pool_any,
+                    c_ist - timedelta(minutes=5),
+                    c_ist + timedelta(days=30),
+                    baseline_days=None,
+                )
+                used_requester_pool = bool(strict_candidates)
+            if not strict_candidates:
+                strict_candidates = _collect_ess_nonack_candidates(
+                    thread,
+                    c_ist - timedelta(minutes=5),
+                    c_ist + timedelta(hours=240),
+                    baseline_days=7,
+                )
+            if not strict_candidates:
+                requester_pool_ess_any = _requester_pool(subject_norm, "", c_ist, day_window=30)
+                strict_candidates = _collect_ess_nonack_candidates(
+                    requester_pool_ess_any,
+                    c_ist - timedelta(minutes=5),
+                    c_ist + timedelta(days=30),
+                    baseline_days=None,
+                )
+                used_requester_pool = bool(strict_candidates)
+            if not strict_candidates:
+                # Blue fallback: quoted-history re-anchor (response only) when
+                # no reliable live candidate is available.
+                quoted_sources = []
+                for e in (thread or []):
+                    quoted_sources.append(e)
+                requester_pool_any_for_quoted = _requester_pool(subject_norm, "", a_ist, day_window=30)
+                for e in requester_pool_any_for_quoted:
+                    quoted_sources.append(e)
+                quoted_candidates = []
+                seen_q = set()
+                for e in quoted_sources:
+                    if not getattr(e, "sent_time", None):
+                        continue
+                    q_ist = _extract_quoted_request_before_ist(
+                        e,
+                        subject_norm,
+                        a_ist + timedelta(minutes=5),
+                    )
+                    if not q_ist:
+                        continue
+                    if q_ist <= c_ist:
+                        continue
+                    if q_ist >= a_ist:
+                        continue
+                    if (q_ist - c_ist) > timedelta(hours=72):
+                        continue
+                    if baseline_date and abs((q_ist.date() - baseline_date).days) > 7:
+                        continue
+                    k = q_ist.replace(second=0, microsecond=0)
+                    if k in seen_q:
+                        continue
+                    seen_q.add(k)
+                    quoted_candidates.append(q_ist)
+                if quoted_candidates:
+                    quoted_candidates.sort()
+                    # Prefer earliest valid post-created quote as response anchor.
+                    q_pick = quoted_candidates[0]
+                    new_gap_q = q_pick - c_ist
+                    if new_gap_q < old_gap:
+                        t_a = _format_time(q_pick)
+                        t_r = row_vals.get("Actual Resolved Date & Time") or t_a
+                        r_dt_now = _parse_time_str(t_r)
+                        r_ist_now = _to_ist(r_dt_now) if r_dt_now else None
+                        if not r_ist_now or r_ist_now < q_pick:
+                            t_r = t_a
+                        if t_a and t_r:
+                            row_vals["Actual Response Date & Time"] = t_a
+                            row_vals["Actual Resolved Date & Time"] = t_r
+                            ws.cell(row_idx, response_col).value = t_a
+                            ws.cell(row_idx, resolved_col).value = t_r
+                            if list_index < len(debug_rows):
+                                debug_rows[list_index]["AckSource"] = "PARSED_FROM_QUOTED_REPLY"
+                                if t_r == t_a:
+                                    debug_rows[list_index]["ResolvedSource"] = "PARSED_FROM_QUOTED_REPLY"
+                                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueStrictQuotedReanchor"
+                            if new_gap_q <= timedelta(minutes=16):
+                                _set_row_fill(row_idx, clear_fill)
+                                if list_index < len(debug_rows):
+                                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+                                continue
             if not strict_candidates:
                 continue
 
-            strict_candidates.sort(key=lambda e: e.sent_time)
             response_pick = None
             for e in strict_candidates:
                 if _email_ist(e) >= c_ist:
@@ -7144,7 +7511,8 @@ def main() -> int:
                 if _email_ist(e) >= response_pick_ist
                 and _email_ist(e) <= (response_pick_ist + timedelta(hours=72))
             ]
-            resolved_pick = resolved_pool[-1] if resolved_pool else response_pick
+            resolved_same_sender = [e for e in resolved_pool if _same_sender(e, response_pick)]
+            resolved_pick = resolved_same_sender[-1] if resolved_same_sender else (resolved_pool[-1] if resolved_pool else response_pick)
             resolved_pick_ist = _email_ist(resolved_pick)
             if not resolved_pick_ist:
                 continue
@@ -7165,7 +7533,8 @@ def main() -> int:
             if list_index < len(debug_rows):
                 debug_rows[list_index]["AckSource"] = response_pick.sender_email or response_pick.sender_name
                 debug_rows[list_index]["ResolvedSource"] = resolved_pick.sender_email or resolved_pick.sender_name
-                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueStrictEpisodeAlign"
+                note_suffix = "; BlueStrictEpisodeAlignPool" if used_requester_pool else "; BlueStrictEpisodeAlign"
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}{note_suffix}"
 
             # Re-evaluate blue after strict align.
             a_dt2 = _parse_time_str(row_vals.get("Actual Response Date & Time"))
@@ -7188,6 +7557,8 @@ def main() -> int:
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+            if blue_only_post_resolver and not _row_has_blue_fill(row_idx):
                 continue
             row_vals = automation_rows[list_index]
             req = _requester_key(state.get("requester") or "")
