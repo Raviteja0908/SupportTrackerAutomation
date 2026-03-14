@@ -49,7 +49,14 @@ EXPECTED_HEADERS = [
 def _normalize_header(text: str) -> str:
     if text is None:
         return ""
-    return " ".join(str(text).replace("\n", " ").split()).strip().lower()
+    norm = " ".join(str(text).replace("\n", " ").split()).strip().lower()
+    aliases = {
+        "service request / incident": "servicerequest/incident?",
+        "service request/incident": "servicerequest/incident?",
+        "service request / incident type": "servicerequest/incident type?",
+        "service request/incident type": "servicerequest/incident type?",
+    }
+    return aliases.get(norm, norm)
 
 
 @dataclass

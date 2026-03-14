@@ -16,6 +16,7 @@ class TimeResolverTests(unittest.TestCase):
         t2 = datetime(2025, 12, 31, 17, 40)
         thread = [
             EmailRecord(
+                path="",
                 subject="BBG093 Error",
                 sender_email="biswajeet.mishra@invenio-solutions.com",
                 sender_name="Biswajeet Mishra",
@@ -23,6 +24,7 @@ class TimeResolverTests(unittest.TestCase):
                 body="",
             ),
             EmailRecord(
+                path="",
                 subject="BBG093 Error",
                 sender_email="system-notification@x.com",
                 sender_name="system-notification",
@@ -41,6 +43,7 @@ class TimeResolverTests(unittest.TestCase):
         t1 = datetime(2025, 12, 1, 9, 0)
         thread = [
             EmailRecord(
+                path="",
                 subject="SF005 IDoc Failed at ES PROD",
                 sender_email="requester@outside.com",
                 sender_name="Outside User",
@@ -61,6 +64,7 @@ class TimeResolverTests(unittest.TestCase):
         t_res = t_req + timedelta(hours=2)
         thread = [
             EmailRecord(
+                path="",
                 subject="Some request",
                 sender_email="user@outside.com",
                 sender_name="Outside User",
@@ -68,6 +72,7 @@ class TimeResolverTests(unittest.TestCase):
                 body="",
             ),
             EmailRecord(
+                path="",
                 subject="Some request",
                 sender_email="ess@invenio-solutions.com",
                 sender_name="ESS Member",
@@ -75,6 +80,7 @@ class TimeResolverTests(unittest.TestCase):
                 body="We will check and update you.",
             ),
             EmailRecord(
+                path="",
                 subject="Some request",
                 sender_email="user@outside.com",
                 sender_name="Outside User",

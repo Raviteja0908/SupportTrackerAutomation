@@ -2,7 +2,10 @@ param(
     [string]$FolderPaths = "",
     [string]$StartDate = "",
     [string]$EndDate = "",
-    [string]$OutputPstPath = ""
+    [string]$OutputPstPath = "",
+    [switch]$NoVolume,
+    [switch]$KeepVolumeData,
+    [switch]$CleanVolume
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,6 +112,62 @@ Write-Host ("Using PST folder: {0}" -f $pstDir)
 Write-Host ("Using output folder: {0}" -f $outputDir)
 
 Write-Host "Running Docker..."
-& docker run --rm -v "${pstDir}:/app/input" -v "${outputDir}:/app/output" support-tracker
+$useVolume = -not $NoVolume
+if ($useVolume) {
+    $volumeName = "support_tracker_output"
+    $template = Get-ChildItem $outputDir -Filter "*.xlsx" |
+        Where-Object { $_.Name -notmatch "filled|done|automation_output" -and $_.Length -gt 0 } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if (-not $template) {
+        $zeroes = Get-ChildItem $outputDir -Filter "*.xlsx" |
+            Where-Object { $_.Length -eq 0 } |
+            Select-Object -ExpandProperty Name
+        if ($zeroes) {
+            Write-Host ("Found zero-byte .xlsx files: {0}" -f ($zeroes -join ", "))
+        }
+        throw "No valid (non-empty) template .xlsx found in output folder. Please place a real template in: $outputDir"
+    }
+    try {
+        $header = Get-Content -Path $template.FullName -Encoding Byte -TotalCount 2
+        if ($header.Length -lt 2 -or $header[0] -ne 0x50 -or $header[1] -ne 0x4B) {
+            throw "Template does not look like a valid .xlsx (missing PK header). Close Excel or choose the correct file."
+        }
+    } catch {
+        throw "Unable to read template file. Close Excel if it is open, then retry. Details: $($_.Exception.Message)"
+    }
+    Write-Host ("Using Docker volume for output: {0}" -f $volumeName)
+    & docker volume create $volumeName | Out-Null
+    Write-Host ("Copying template into volume: {0}" -f $template.Name)
+    & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "$($template.FullName):/host/template.xlsx:ro" support-tracker -c "cp /host/template.xlsx /app/output/"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    & docker run --rm -v "${pstDir}:/app/input" -v "${volumeName}:/app/output" support-tracker
+    $sw.Stop()
+    Write-Host ("Sheet fill time: {0}" -f $sw.Elapsed)
+    Write-Host "Copying output files to host folder..."
+    & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "${outputDir}:/host" support-tracker -c "cp /app/output/*_filled*.xlsx /host/ 2>/dev/null || true; cp /app/output/automation_output.csv /host/ 2>/dev/null || true; cp /app/output/debug_subjects.csv /host/ 2>/dev/null || true; cp /app/output/processing.log /host/ 2>/dev/null || true"
+    if (-not $KeepVolumeData) {
+        Write-Host "Clearing volume data..."
+        & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" support-tracker -c "find /app/output -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
+    } else {
+        Write-Host "Keeping volume data (EMLs retained)."
+    }
+    if ($CleanVolume) {
+        if ($KeepVolumeData) {
+            Write-Host "NOTE: -CleanVolume will remove the volume (data will be lost)."
+        }
+        Write-Host ("Removing Docker volume: {0}" -f $volumeName)
+        try {
+            & docker volume rm $volumeName | Out-Null
+        } catch {
+            Write-Host "WARNING: unable to remove Docker volume."
+        }
+    }
+} else {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    & docker run --rm -v "${pstDir}:/app/input" -v "${outputDir}:/app/output" support-tracker
+    $sw.Stop()
+    Write-Host ("Sheet fill time: {0}" -f $sw.Elapsed)
+}
 
 Write-Host "=== Done ==="

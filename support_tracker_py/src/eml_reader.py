@@ -41,17 +41,19 @@ def read_eml_directory(root: Path, logger):
                         sent_time = received_time
                 except Exception:
                     pass
-        body, body_html = _extract_body_parts(msg)
+        body, body_html, body_html_raw = _extract_body_parts(msg)
         body = _select_body(body, body_html)
 
         emails.append(
             EmailRecord(
+                path=str(path),
                 subject=subject,
                 sender_email=sender_email,
                 sender_name=sender_name or sender_email,
                 sent_time=sent_time,
                 body=body,
                 body_html=body_html,
+                body_html_raw=body_html_raw,
             )
         )
 
@@ -114,16 +116,17 @@ def _extract_body_parts(msg):
 
             if plain_parts or html_parts:
                 plain_text = "\n".join(plain_parts).strip()
+                html_raw = "\n".join(h for h in html_parts if isinstance(h, str)).strip()
                 html_text = "\n".join(_html_to_text(h) for h in html_parts).strip()
-                return plain_text, html_text
+                return plain_text, html_text, html_raw
         else:
             content = msg.get_content()
             if isinstance(content, str):
-                return content.strip(), ""
-            return "", ""
+                return content.strip(), "", ""
+            return "", "", ""
     except Exception:
-        return "", ""
-    return "", ""
+        return "", "", ""
+    return "", "", ""
 
 
 def _select_body(plain_text: str, html_text: str) -> str:
@@ -151,8 +154,10 @@ def _html_to_text(value: str) -> str:
     if not value:
         return ""
     text = _html.unescape(value)
+    # Preserve structure for quoted headers by inserting line breaks.
     text = _re.sub(r"(?i)<br\\s*/?>", "\n", text)
     text = _re.sub(r"(?i)</p>", "\n", text)
+    text = _re.sub(r"(?i)</\\s*(div|tr|td|th|li|h[1-6])\\s*>", "\n", text)
     text = _re.sub(r"<[^>]+>", "", text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
