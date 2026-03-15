@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import html
+import os
 import re
 from zoneinfo import ZoneInfo
 import unicodedata
@@ -65,6 +66,13 @@ DIRECT_RESOLUTION_PHRASES = [
     "successfully sent",
     "processed and uploaded",
     "processed and sent",
+]
+
+FILE_ACTION_PHRASES = [
+    "adding one more idoc",
+    "adding more idoc",
+    "adding one more file",
+    "adding more files",
 ]
 
 FORCE_PROD_SAME_TIME_PHRASES = [
@@ -239,6 +247,26 @@ def _is_ack_like_reply(email_record) -> bool:
     # Update-chasing reminders are non-final and should not drive resolved-time picks.
     if _contains_any_phrase(body, DIRECT_RESOLUTION_PHRASES):
         return False
+    # Treat file-add/resend/received updates as non-ack to avoid suppressing
+    # ESS-only update replies (e.g., "Adding one more IDOC").
+    file_action_hit = _contains_any_phrase(body, FILE_ACTION_PHRASES) or (
+        ("received" in body)
+        and ("idoc" in body or "file" in body or "files" in body)
+    )
+    if not file_action_hit and body_fallback:
+        file_action_hit = _contains_any_phrase(body_fallback, FILE_ACTION_PHRASES) or (
+            ("received" in body_fallback)
+            and ("idoc" in body_fallback or "file" in body_fallback or "files" in body_fallback)
+        )
+    if file_action_hit:
+        return False
+    # Size-based override: long, multi-line replies are more likely to be real updates.
+    # Only keep them ack-like if they explicitly contain reminder/non-ack phrases.
+    size_text = body if body else body_fallback
+    body_lines = [ln for ln in size_text.splitlines() if ln.strip()]
+    if (len(body_lines) >= 3 or len(_normalize_for_phrase_match(size_text)) >= 160):
+        if not _contains_any_phrase(size_text, NON_ACK_PHRASES):
+            return False
     if _contains_any_phrase(body, NON_ACK_PHRASES) or (
         len(_normalize_for_phrase_match(body)) < 40
         and _contains_any_phrase(body_fallback, NON_ACK_PHRASES)
@@ -360,6 +388,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
         if (e.sender_email in requester_candidates)
         or _match_requester(e.sender_name, e.sender_email, requester_name)
     ]
+    # TRACE_ACKLIKE debug removed after issue isolation.
     def _latest_requester_non_ack(msgs):
         for e in reversed(msgs):
             if _is_ack_like_reply(e):

@@ -140,27 +140,31 @@ if ($useVolume) {
     & docker volume create $volumeName | Out-Null
     Write-Host ("Copying template into volume: {0}" -f $template.Name)
     & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "$($template.FullName):/host/template.xlsx:ro" support-tracker -c "cp /host/template.xlsx /app/output/"
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    & docker run --rm -v "${pstDir}:/app/input" -v "${volumeName}:/app/output" support-tracker
-    $sw.Stop()
-    Write-Host ("Sheet fill time: {0}" -f $sw.Elapsed)
-    Write-Host "Copying output files to host folder..."
-    & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "${outputDir}:/host" support-tracker -c "cp /app/output/*_filled*.xlsx /host/ 2>/dev/null || true; cp /app/output/automation_output.csv /host/ 2>/dev/null || true; cp /app/output/debug_subjects.csv /host/ 2>/dev/null || true; cp /app/output/processing.log /host/ 2>/dev/null || true"
-    if (-not $KeepVolumeData) {
-        Write-Host "Clearing volume data..."
-        & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" support-tracker -c "find /app/output -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
-    } else {
-        Write-Host "Keeping volume data (EMLs retained)."
-    }
-    if ($CleanVolume) {
-        if ($KeepVolumeData) {
-            Write-Host "NOTE: -CleanVolume will remove the volume (data will be lost)."
+    try {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        & docker run --rm -v "${pstDir}:/app/input" -v "${volumeName}:/app/output" support-tracker
+        $sw.Stop()
+        Write-Host ("Sheet fill time: {0}" -f $sw.Elapsed)
+        Write-Host "Copying output files to host folder..."
+        & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "${outputDir}:/host" support-tracker -c "cp /app/output/*_filled*.xlsx /host/ 2>/dev/null || true; cp /app/output/automation_output.csv /host/ 2>/dev/null || true; cp /app/output/debug_subjects.csv /host/ 2>/dev/null || true; cp /app/output/processing.log /host/ 2>/dev/null || true"
+    } finally {
+        if (-not $KeepVolumeData) {
+            Write-Host "Clearing volume data..."
+            & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" support-tracker -c "find /app/output -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
+            Write-Host "Cleanup complete (volume cleared)."
+        } else {
+            Write-Host "Keeping volume data (EMLs retained)."
         }
-        Write-Host ("Removing Docker volume: {0}" -f $volumeName)
-        try {
-            & docker volume rm $volumeName | Out-Null
-        } catch {
-            Write-Host "WARNING: unable to remove Docker volume."
+        if ($CleanVolume) {
+            if ($KeepVolumeData) {
+                Write-Host "NOTE: -CleanVolume will remove the volume (data will be lost)."
+            }
+            Write-Host ("Removing Docker volume: {0}" -f $volumeName)
+            try {
+                & docker volume rm $volumeName | Out-Null
+            } catch {
+                Write-Host "WARNING: unable to remove Docker volume."
+            }
         }
     }
 } else {

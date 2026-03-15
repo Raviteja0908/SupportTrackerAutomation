@@ -7188,9 +7188,19 @@ def main() -> int:
             else:
                 notes_now = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
                 if "quotedpairgap>16m" in notes_now:
-                    # Keep blue marking for invalid quoted-pair gaps.
-                    if not has_blue:
-                        _set_row_fill(row_idx, blue_fill)
+                    # Keep blue marking for invalid quoted-pair gaps unless we
+                    # already collapsed to an ESS-only all-three-same row.
+                    c_dt2 = _parse_time_str(row_vals.get("Created Date & Time"))
+                    r_dt2 = _parse_time_str(row_vals.get("Actual Resolved Date & Time"))
+                    all_same = bool(c_dt2 and a_dt2 and r_dt2 and c_dt2 == a_dt2 == r_dt2)
+                    if all_same and ("ess-only; no non-ess request" in notes_now):
+                        if has_blue:
+                            _set_row_fill(row_idx, clear_fill)
+                        if list_index < len(debug_rows):
+                            debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedEssOnly"
+                    else:
+                        if not has_blue:
+                            _set_row_fill(row_idx, blue_fill)
                     continue
                 if has_blue:
                     _set_row_fill(row_idx, clear_fill)
@@ -7816,6 +7826,7 @@ def main() -> int:
         # Run for ESS-only rows regardless of blue, but only if times are not already equal.
         used_ess_continuation_ess_only = set()
         ess_only_reply_index = {}
+        ess_only_reply_month_gate = {}
 
         def _ess_only_short_ack(e) -> bool:
             # Heuristic: very short consultant replies are likely acknowledgements.
@@ -7851,6 +7862,14 @@ def main() -> int:
                 # If there are attachments/snippets/images, treat as non-ack.
                 if any(k in content for k in ("attachment", "attached", "snippet", "snippet:", "snippets", "see attached")):
                     return False
+                # If message is about adding/resending files, treat as non-ack.
+                file_words = ("file", "files")
+                file_actions = ("add", "added", "adding", "attach", "attached", "attachment", "resend", "re-sent", "resent", "reupload", "re-upload", "please find")
+                explicit_file_phrases = ("adding more files", "adding one more file")
+                if any(p in content for p in explicit_file_phrases):
+                    return False
+                if any(w in content for w in file_words) and any(a in content for a in file_actions):
+                    return False
                 if ("cid:" in raw.lower()) or ("<img" in raw.lower()):
                     return False
                 return True
@@ -7864,7 +7883,7 @@ def main() -> int:
                 continue
             notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
             quoted_only = (list_index in quoted_request_only) or ("quotedrequestonly" in notes_l)
-            if "quotedpairgap>16m" in notes_l:
+            if "quotedpairgap>16m" in notes_l and ("ess-only; no non-ess request" not in notes_l):
                 # Invalid quoted pair gap should remain blue; skip ESS-only handling.
                 continue
             if (not quoted_only) and ("ess-only; no non-ess request" not in notes_l):
@@ -7925,6 +7944,47 @@ def main() -> int:
                 if not desc_text:
                     desc_text = state.get("description") or ""
                 row_id_tokens = _id_like_tokens(desc_text)
+            parent_ess_cache = {}
+            def _parent_sender_info(msg):
+                key = id(msg)
+                if key in parent_ess_cache:
+                    return parent_ess_cache[key]
+                blocks = _get_quoted_blocks_with_subject_cached(msg)
+                parent_is_ess = None
+                has_non_ess = False
+                for from_line, _sent_ist, q_subj in blocks:
+                    if row_id_tokens:
+                        if q_subj:
+                            q_norm = normalize_subject(q_subj or "")
+                            q_ids = _id_like_tokens(q_norm)
+                            if (not q_ids) or row_id_tokens.isdisjoint(q_ids):
+                                continue
+                        else:
+                            continue
+                    elif row_tokens:
+                        if not q_subj:
+                            continue
+                        q_norm = normalize_subject(q_subj or "")
+                        q_tokens = _match_tokens(q_norm)
+                        score = _token_overlap_score(row_tokens, q_tokens) if q_tokens else 0.0
+                        contains = bool(subject_norm and q_norm and (subject_norm in q_norm or q_norm in subject_norm))
+                        if score < 0.45 and not contains:
+                            continue
+                    addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", from_line, flags=re.I)
+                    if not addr_hits:
+                        is_ess = _ess_name_only(from_line)
+                        if is_ess is False:
+                            has_non_ess = True
+                    else:
+                        emails_l = [em.lower() for em in addr_hits]
+                        domains_l = [em.split("@", 1)[-1] for em in emails_l if "@" in em]
+                        is_ess = any(em in ess_email_set for em in emails_l) or any(d in ess_domain_set for d in domains_l)
+                        if not is_ess:
+                            has_non_ess = True
+                    if parent_is_ess is None:
+                        parent_is_ess = is_ess
+                parent_ess_cache[key] = (parent_is_ess, has_non_ess)
+                return parent_ess_cache[key]
             occ_key = (subject_norm, requester.strip().lower())
             idx = ess_only_reply_index.get(occ_key, 0)
             consultant_msgs = []
@@ -8240,11 +8300,22 @@ def main() -> int:
                             if score < 0.45 and not contains:
                                 continue
                         reply_pool.append(e)
-                    reply_pool.sort(key=lambda e: e.sent_time)
+                # Only treat real replies as valid for quoted pairs. If the direct
+                # parent is ESS, allow it only when the quoted chain also contains
+                # a non-ESS request for this subject/ID.
+                reply_pool_real = []
+                for e in reply_pool:
+                    if _ack_like(e) or _ack_like_text_fallback(e) or _ess_only_short_ack(e):
+                        continue
+                    parent_ess, has_non_ess = _parent_sender_info(e)
+                    if (parent_ess is True) and (not has_non_ess):
+                        continue
+                    reply_pool_real.append(e)
+                reply_pool_real.sort(key=lambda e: e.sent_time)
                 reply_window_hours = 48
                 for req_ist, ack_ist in candidate_pairs:
                     reply_pick = None
-                    for e in reply_pool:
+                    for e in reply_pool_real:
                         e_ist = _email_ist(e)
                         if not e_ist:
                             continue
@@ -8278,13 +8349,6 @@ def main() -> int:
                         else:
                             candidate_pairs_with_reply.sort(key=lambda p: _email_ist(p[2]))
                         pair_req, pair_ack, pair_reply = candidate_pairs_with_reply[0]
-                elif quoted_only and candidate_pairs:
-                    # For quoted-only rows, allow reanchor with a valid pair
-                    # even if no reply candidate survived filtering.
-                    candidate_pairs.sort(key=lambda p: p[1])
-                    pick_idx = idx if idx < len(candidate_pairs) else 0
-                    pair_req, pair_ack = candidate_pairs[pick_idx]
-                    pair_reply = None
                 else:
                     # No usable pair for this occurrence; do not reanchor.
                     pair_req, pair_ack, pair_reply = None, None, None
@@ -8304,6 +8368,11 @@ def main() -> int:
                     for e in consultant_msgs:
                         e_ist = _email_ist(e)
                         if not e_ist:
+                            continue
+                        if _ack_like(e) or _ack_like_text_fallback(e) or _ess_only_short_ack(e):
+                            continue
+                        parent_ess, has_non_ess = _parent_sender_info(e)
+                        if (parent_ess is True) and (not has_non_ess):
                             continue
                         if e_ist < pair_ack:
                             continue
@@ -8352,11 +8421,9 @@ def main() -> int:
                     continue
             if quoted_only:
                 # If this is a quoted-request-only row and no valid pair was found,
-                # keep it blue and do not fall back to ESS continuation.
-                _set_row_fill(row_idx, blue_fill)
+                # allow ESS-only fallback instead of forcing blue.
                 if list_index < len(debug_rows):
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; QuotedRequestOnlyNoPair"
-                continue
 
             # Fallback: collapse to consultant reply by occurrence (ESS-only)
             if merged_msgs:
@@ -8364,12 +8431,40 @@ def main() -> int:
                     # Pick reply by occurrence for this subject+requester.
                     key_count = (subject_norm, _requester_key(requester))
                     total_rows = group_counts.get(key_count, 0)
+                    trace_month_gate = os.environ.get("TRACE_MONTH_GATE") == "1"
                     if total_rows <= 1:
                         pick = consultant_msgs[-1]
                     else:
-                        pick = consultant_msgs[min(idx, len(consultant_msgs) - 1)]
-                    # Validator only: if this looks like ack, do not collapse.
-                    if not pick or _ess_only_short_ack(pick):
+                        # Occurrence-based pick, but keep replies within the same month
+                        # as the first valid reply for this subject/requester.
+                        month_gate_used = False
+                        month_key = ess_only_reply_month_gate.get(occ_key)
+                        if month_key is None:
+                            base_pick = consultant_msgs[min(idx, len(consultant_msgs) - 1)]
+                            base_ist = _email_ist(base_pick)
+                            if base_ist:
+                                month_key = (base_ist.year, base_ist.month)
+                                ess_only_reply_month_gate[occ_key] = month_key
+                        if month_key:
+                            same_month = []
+                            for e in consultant_msgs:
+                                e_ist = _email_ist(e)
+                                if not e_ist:
+                                    continue
+                                if (e_ist.year, e_ist.month) == month_key:
+                                    same_month.append(e)
+                            if same_month:
+                                pick = same_month[min(idx, len(same_month) - 1)]
+                                month_gate_used = True
+                            else:
+                                pick = consultant_msgs[min(idx, len(consultant_msgs) - 1)]
+                        else:
+                            pick = consultant_msgs[min(idx, len(consultant_msgs) - 1)]
+                    notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
+                    allow_acky = "requester span(all-ack->ess)" in notes_l
+                    # Validator only: if this looks like ack, do not collapse
+                    # unless all requester spans were ack-like.
+                    if not pick or (_ess_only_short_ack(pick) and not allow_acky):
                         continue
                     cand_ist = _email_ist(pick)
                     if not cand_ist:
@@ -8397,6 +8492,8 @@ def main() -> int:
                                 debug_rows[list_index]["AckSource"] = who
                                 debug_rows[list_index]["ResolvedSource"] = who
                                 debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; ESSContinuationGuard[AllThreeStrictEssOnly]"
+                                if trace_month_gate and month_gate_used:
+                                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; ESSMonthGateApplied"
                             # Advance occurrence index only when we collapse
                             ess_only_reply_index[occ_key] = idx + 1
                             used_ess_continuation_ess_only.add(key)
@@ -8483,6 +8580,12 @@ def main() -> int:
                     quoted_sources.append(e)
             if not quoted_sources:
                 continue
+            row_id_tokens = _id_like_tokens(subject_norm)
+            if not row_id_tokens:
+                desc_text = row_vals.get("Description") or ""
+                if not desc_text:
+                    desc_text = state.get("description") or ""
+                row_id_tokens = _id_like_tokens(desc_text)
 
             quoted_pairs = []
             quoted_pair_applied = False
@@ -8587,7 +8690,78 @@ def main() -> int:
             # non-ESS request + ESS ack pair to re-anchor (safe, blue-only).
             # Additionally, for ESS-only blue rows, allow same-day quoted
             # non-ESS pair even when requester-match path failed.
-            if not quoted_pair_applied:
+            notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
+            if (not quoted_pair_applied) and ("ess-only; no non-ess request" not in notes_l):
+                def _parent_sender_is_ess_msg(msg):
+                    blocks = _get_quoted_blocks_with_subject_cached(msg)
+                    for from_line, _sent_ist, q_subj in blocks:
+                        if row_id_tokens:
+                            if q_subj:
+                                q_norm = normalize_subject(q_subj or "")
+                                q_ids = _id_like_tokens(q_norm)
+                                if (not q_ids) or row_id_tokens.isdisjoint(q_ids):
+                                    continue
+                            else:
+                                continue
+                        elif row_tokens:
+                            if not q_subj:
+                                continue
+                            q_norm = normalize_subject(q_subj or "")
+                            q_tokens = _match_tokens(q_norm)
+                            score = _token_overlap_score(row_tokens, q_tokens) if q_tokens else 0.0
+                            contains = bool(subject_norm and q_norm and (subject_norm in q_norm or q_norm in subject_norm))
+                            if score < 0.45 and not contains:
+                                continue
+                        addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", from_line, flags=re.I)
+                        if not addr_hits:
+                            return _ess_name_only(from_line)
+                        emails_l = [em.lower() for em in addr_hits]
+                        domains_l = [em.split("@", 1)[-1] for em in emails_l if "@" in em]
+                        return any(em in ess_email_set for em in emails_l) or any(d in ess_domain_set for d in domains_l)
+                    return None
+                def _has_real_reply_after_ack(ack_ist):
+                    seen = set()
+                    reply_sources = []
+                    for e in (thread or []):
+                        if id(e) in seen:
+                            continue
+                        seen.add(id(e))
+                        reply_sources.append(e)
+                    for e in requester_pool_any_q or []:
+                        if id(e) in seen:
+                            continue
+                        seen.add(id(e))
+                        reply_sources.append(e)
+                    for e in reply_sources:
+                        if not _ess_sender(e):
+                            continue
+                        if not _req_match(e, requester):
+                            continue
+                        if _ack_like(e) or _ack_like_text_fallback(e) or _ess_only_short_ack(e):
+                            continue
+                        s_norm = _subject_norm_cached(getattr(e, "subject", "") or "")
+                        if row_id_tokens:
+                            s_ids = _id_like_tokens(s_norm)
+                            if (not s_ids) or row_id_tokens.isdisjoint(s_ids):
+                                continue
+                        elif row_tokens:
+                            s_tokens = _match_tokens(s_norm)
+                            score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                            contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
+                            if score < 0.45 and not contains:
+                                continue
+                        parent_ess = _parent_sender_is_ess_msg(e)
+                        if parent_ess is True:
+                            continue
+                        e_ist = _email_ist(e)
+                        if not e_ist:
+                            continue
+                        if e_ist < ack_ist:
+                            continue
+                        if (e_ist - ack_ist) > timedelta(hours=48):
+                            continue
+                        return True
+                    return False
                 def _collect_non_ess_pairs(subject_filter: str, sources, win_start=None, win_end=None, center_ist=None, require_improve: bool = True):
                     ess_email_set = {e.strip().lower() for e in ess_team or []}
                     ess_name_tokens = set()
@@ -8708,6 +8882,11 @@ def main() -> int:
 
                 if pick_pair:
                     q_req_ist, q_ack_ist = pick_pair
+                    if not _has_real_reply_after_ack(q_ack_ist):
+                        if list_index < len(debug_rows):
+                            debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; QuotedPairNoReplyAfterAck"
+                        pick_pair = None
+                if pick_pair:
                     pair_key = (
                         subject_norm,
                         requester.strip().lower(),
@@ -9174,172 +9353,174 @@ def main() -> int:
                                 debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
                             continue
 
+            notes_l_now = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
+            strict_candidates = []
             used_requester_pool = False
-            strict_candidates = _collect_blue_candidates(
-                thread,
-                c_ist - timedelta(minutes=5),
-                c_ist + timedelta(hours=96),
-                baseline_days=2,
-            )
-            if not strict_candidates:
+            if "ess-only; no non-ess request" not in notes_l_now:
                 strict_candidates = _collect_blue_candidates(
                     thread,
                     c_ist - timedelta(minutes=5),
-                    c_ist + timedelta(hours=240),
-                    baseline_days=7,
+                    c_ist + timedelta(hours=96),
+                    baseline_days=2,
                 )
-            if not strict_candidates:
-                requester_pool = _requester_pool(subject_norm, requester, c_ist, day_window=30)
-                strict_candidates = _collect_blue_candidates(
-                    requester_pool,
-                    c_ist - timedelta(minutes=5),
-                    c_ist + timedelta(days=30),
-                    baseline_days=None,
-                )
-                used_requester_pool = bool(strict_candidates)
-            if not strict_candidates and owner_hint:
-                requester_pool_any = _requester_pool(subject_norm, "", c_ist, day_window=30)
-                strict_candidates = _collect_blue_candidates(
-                    requester_pool_any,
-                    c_ist - timedelta(minutes=5),
-                    c_ist + timedelta(days=30),
-                    baseline_days=None,
-                )
-                used_requester_pool = bool(strict_candidates)
-            if not strict_candidates:
-                strict_candidates = _collect_ess_nonack_candidates(
-                    thread,
-                    c_ist - timedelta(minutes=5),
-                    c_ist + timedelta(hours=240),
-                    baseline_days=7,
-                )
-            if not strict_candidates:
-                requester_pool_ess_any = _requester_pool(subject_norm, "", c_ist, day_window=30)
-                strict_candidates = _collect_ess_nonack_candidates(
-                    requester_pool_ess_any,
-                    c_ist - timedelta(minutes=5),
-                    c_ist + timedelta(days=30),
-                    baseline_days=None,
-                )
-                used_requester_pool = bool(strict_candidates)
-            if not strict_candidates:
-                # Blue fallback: quoted-history re-anchor (response only) when
-                # no reliable live candidate is available.
-                quoted_sources = []
-                for e in (thread or []):
-                    quoted_sources.append(e)
-                requester_pool_any_for_quoted = _requester_pool(subject_norm, "", a_ist, day_window=30)
-                for e in requester_pool_any_for_quoted:
-                    quoted_sources.append(e)
-                quoted_candidates = []
-                seen_q = set()
-                for e in quoted_sources:
-                    if not getattr(e, "sent_time", None):
-                        continue
-                    q_ist = _extract_quoted_request_before_ist(
-                        e,
-                        subject_norm,
-                        a_ist + timedelta(minutes=5),
+                if not strict_candidates:
+                    strict_candidates = _collect_blue_candidates(
+                        thread,
+                        c_ist - timedelta(minutes=5),
+                        c_ist + timedelta(hours=240),
+                        baseline_days=7,
                     )
-                    if not q_ist:
-                        continue
-                    if q_ist <= c_ist:
-                        continue
-                    if q_ist >= a_ist:
-                        continue
-                    if (q_ist - c_ist) > timedelta(hours=72):
-                        continue
-                    if baseline_date and abs((q_ist.date() - baseline_date).days) > 7:
-                        continue
-                    k = q_ist.replace(second=0, microsecond=0)
-                    if k in seen_q:
-                        continue
-                    seen_q.add(k)
-                    quoted_candidates.append(q_ist)
-                if quoted_candidates:
-                    quoted_candidates.sort()
-                    # Prefer earliest valid post-created quote as response anchor.
-                    q_pick = quoted_candidates[0]
-                    new_gap_q = q_pick - c_ist
-                    if new_gap_q < old_gap:
-                        t_a = _format_time(q_pick)
-                        t_r = row_vals.get("Actual Resolved Date & Time") or t_a
-                        r_dt_now = _parse_time_str(t_r)
-                        r_ist_now = _to_ist(r_dt_now) if r_dt_now else None
-                        if not r_ist_now or r_ist_now < q_pick:
-                            t_r = t_a
-                        if t_a and t_r:
-                            row_vals["Actual Response Date & Time"] = t_a
-                            row_vals["Actual Resolved Date & Time"] = t_r
-                            ws.cell(row_idx, response_col).value = t_a
-                            ws.cell(row_idx, resolved_col).value = t_r
-                            if list_index < len(debug_rows):
-                                debug_rows[list_index]["AckSource"] = "PARSED_FROM_QUOTED_REPLY"
-                                if t_r == t_a:
-                                    debug_rows[list_index]["ResolvedSource"] = "PARSED_FROM_QUOTED_REPLY"
-                                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueStrictQuotedReanchor"
-                            if new_gap_q <= timedelta(minutes=16):
-                                _set_row_fill(row_idx, clear_fill)
+                if not strict_candidates:
+                    requester_pool = _requester_pool(subject_norm, requester, c_ist, day_window=30)
+                    strict_candidates = _collect_blue_candidates(
+                        requester_pool,
+                        c_ist - timedelta(minutes=5),
+                        c_ist + timedelta(days=30),
+                        baseline_days=None,
+                    )
+                    used_requester_pool = bool(strict_candidates)
+                if not strict_candidates and owner_hint:
+                    requester_pool_any = _requester_pool(subject_norm, "", c_ist, day_window=30)
+                    strict_candidates = _collect_blue_candidates(
+                        requester_pool_any,
+                        c_ist - timedelta(minutes=5),
+                        c_ist + timedelta(days=30),
+                        baseline_days=None,
+                    )
+                    used_requester_pool = bool(strict_candidates)
+                if not strict_candidates:
+                    strict_candidates = _collect_ess_nonack_candidates(
+                        thread,
+                        c_ist - timedelta(minutes=5),
+                        c_ist + timedelta(hours=240),
+                        baseline_days=7,
+                    )
+                if not strict_candidates:
+                    requester_pool_ess_any = _requester_pool(subject_norm, "", c_ist, day_window=30)
+                    strict_candidates = _collect_ess_nonack_candidates(
+                        requester_pool_ess_any,
+                        c_ist - timedelta(minutes=5),
+                        c_ist + timedelta(days=30),
+                        baseline_days=None,
+                    )
+                    used_requester_pool = bool(strict_candidates)
+                if not strict_candidates:
+                    # Blue fallback: quoted-history re-anchor (response only) when
+                    # no reliable live candidate is available.
+                    quoted_sources = []
+                    for e in (thread or []):
+                        quoted_sources.append(e)
+                    requester_pool_any_for_quoted = _requester_pool(subject_norm, "", a_ist, day_window=30)
+                    for e in requester_pool_any_for_quoted:
+                        quoted_sources.append(e)
+                    quoted_candidates = []
+                    seen_q = set()
+                    for e in quoted_sources:
+                        if not getattr(e, "sent_time", None):
+                            continue
+                        q_ist = _extract_quoted_request_before_ist(
+                            e,
+                            subject_norm,
+                            a_ist + timedelta(minutes=5),
+                        )
+                        if not q_ist:
+                            continue
+                        if q_ist <= c_ist:
+                            continue
+                        if q_ist >= a_ist:
+                            continue
+                        if (q_ist - c_ist) > timedelta(hours=72):
+                            continue
+                        if baseline_date and abs((q_ist.date() - baseline_date).days) > 7:
+                            continue
+                        k = q_ist.replace(second=0, microsecond=0)
+                        if k in seen_q:
+                            continue
+                        seen_q.add(k)
+                        quoted_candidates.append(q_ist)
+                    if quoted_candidates:
+                        quoted_candidates.sort()
+                        # Prefer earliest valid post-created quote as response anchor.
+                        q_pick = quoted_candidates[0]
+                        new_gap_q = q_pick - c_ist
+                        if new_gap_q < old_gap:
+                            t_a = _format_time(q_pick)
+                            t_r = row_vals.get("Actual Resolved Date & Time") or t_a
+                            r_dt_now = _parse_time_str(t_r)
+                            r_ist_now = _to_ist(r_dt_now) if r_dt_now else None
+                            if not r_ist_now or r_ist_now < q_pick:
+                                t_r = t_a
+                            if t_a and t_r:
+                                row_vals["Actual Response Date & Time"] = t_a
+                                row_vals["Actual Resolved Date & Time"] = t_r
+                                ws.cell(row_idx, response_col).value = t_a
+                                ws.cell(row_idx, resolved_col).value = t_r
                                 if list_index < len(debug_rows):
-                                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
-                                continue
-            if not strict_candidates:
-                continue
-            if list_index < len(debug_rows):
+                                    debug_rows[list_index]["AckSource"] = "PARSED_FROM_QUOTED_REPLY"
+                                    if t_r == t_a:
+                                        debug_rows[list_index]["ResolvedSource"] = "PARSED_FROM_QUOTED_REPLY"
+                                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueStrictQuotedReanchor"
+                                if new_gap_q <= timedelta(minutes=16):
+                                    _set_row_fill(row_idx, clear_fill)
+                                    if list_index < len(debug_rows):
+                                        debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+                                    continue
+            if strict_candidates and list_index < len(debug_rows):
                 notes_l_now = (debug_rows[list_index].get("Notes") or "").lower()
                 if "bluequotedpairdupskipped" in notes_l_now:
+                    strict_candidates = []
+
+            if strict_candidates:
+                response_pick = None
+                for e in strict_candidates:
+                    if _email_ist(e) >= c_ist:
+                        response_pick = e
+                        break
+                if not response_pick:
+                    response_pick = strict_candidates[0]
+                response_pick_ist = _email_ist(response_pick)
+                if not response_pick_ist:
                     continue
 
-            response_pick = None
-            for e in strict_candidates:
-                if _email_ist(e) >= c_ist:
-                    response_pick = e
-                    break
-            if not response_pick:
-                response_pick = strict_candidates[0]
-            response_pick_ist = _email_ist(response_pick)
-            if not response_pick_ist:
-                continue
+                resolved_pool = [
+                    e for e in strict_candidates
+                    if _email_ist(e) >= response_pick_ist
+                    and _email_ist(e) <= (response_pick_ist + timedelta(hours=72))
+                ]
+                resolved_same_sender = [e for e in resolved_pool if _same_sender(e, response_pick)]
+                resolved_pick = resolved_same_sender[-1] if resolved_same_sender else (resolved_pool[-1] if resolved_pool else response_pick)
+                resolved_pick_ist = _email_ist(resolved_pick)
+                if not resolved_pick_ist:
+                    continue
 
-            resolved_pool = [
-                e for e in strict_candidates
-                if _email_ist(e) >= response_pick_ist
-                and _email_ist(e) <= (response_pick_ist + timedelta(hours=72))
-            ]
-            resolved_same_sender = [e for e in resolved_pool if _same_sender(e, response_pick)]
-            resolved_pick = resolved_same_sender[-1] if resolved_same_sender else (resolved_pool[-1] if resolved_pool else response_pick)
-            resolved_pick_ist = _email_ist(resolved_pick)
-            if not resolved_pick_ist:
-                continue
+                new_gap = response_pick_ist - c_ist
+                # Apply only if strictly improves (or fully resolves) the blue gap.
+                if new_gap >= old_gap:
+                    continue
 
-            new_gap = response_pick_ist - c_ist
-            # Apply only if strictly improves (or fully resolves) the blue gap.
-            if new_gap >= old_gap:
-                continue
-
-            t_a = _format_time(response_pick.sent_time)
-            t_r = _format_time(resolved_pick.sent_time)
-            if not (t_a and t_r):
-                continue
-            row_vals["Actual Response Date & Time"] = t_a
-            row_vals["Actual Resolved Date & Time"] = t_r
-            ws.cell(row_idx, response_col).value = t_a
-            ws.cell(row_idx, resolved_col).value = t_r
-            if list_index < len(debug_rows):
-                debug_rows[list_index]["AckSource"] = response_pick.sender_email or response_pick.sender_name
-                debug_rows[list_index]["ResolvedSource"] = resolved_pick.sender_email or resolved_pick.sender_name
-                note_suffix = "; BlueStrictEpisodeAlignPool" if used_requester_pool else "; BlueStrictEpisodeAlign"
-                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}{note_suffix}"
-
-            # Re-evaluate blue after strict align.
-            a_dt2 = _parse_time_str(row_vals.get("Actual Response Date & Time"))
-            if not a_dt2:
-                continue
-            a_ist2 = _to_ist(a_dt2)
-            if (a_ist2 - c_ist) <= timedelta(minutes=16):
-                _set_row_fill(row_idx, clear_fill)
+                t_a = _format_time(response_pick.sent_time)
+                t_r = _format_time(resolved_pick.sent_time)
+                if not (t_a and t_r):
+                    continue
+                row_vals["Actual Response Date & Time"] = t_a
+                row_vals["Actual Resolved Date & Time"] = t_r
+                ws.cell(row_idx, response_col).value = t_a
+                ws.cell(row_idx, resolved_col).value = t_r
                 if list_index < len(debug_rows):
-                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+                    debug_rows[list_index]["AckSource"] = response_pick.sender_email or response_pick.sender_name
+                    debug_rows[list_index]["ResolvedSource"] = resolved_pick.sender_email or resolved_pick.sender_name
+                    note_suffix = "; BlueStrictEpisodeAlignPool" if used_requester_pool else "; BlueStrictEpisodeAlign"
+                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}{note_suffix}"
+
+                # Re-evaluate blue after strict align.
+                a_dt2 = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+                if not a_dt2:
+                    continue
+                a_ist2 = _to_ist(a_dt2)
+                if (a_ist2 - c_ist) <= timedelta(minutes=16):
+                    _set_row_fill(row_idx, clear_fill)
+                    if list_index < len(debug_rows):
+                        debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
 
         # Duplicate same-time de-collision (isolated):
         # If multiple rows for the same requester ended up with identical
@@ -9458,6 +9639,99 @@ def main() -> int:
         for dkey, group in duplicate_groups.items():
             if len(group) < 2:
                 continue
+
+            # ESS-only distinct occurrence mapping:
+            # If all rows in the duplicate group are ESS-only/requester follow-up
+            # and we have enough distinct requester replies, map each row to a
+            # unique reply by occurrence (chronological).
+            ess_like_group = True
+            for s in group:
+                li = s.get("list_index")
+                notes = debug_rows[li].get("Notes", "") if li is not None and li < len(debug_rows) else ""
+                notes_l = (notes or "").lower()
+                if not (
+                    "ess-only; no non-ess request" in notes_l
+                    or "requester follow-up" in notes_l
+                    or "esscontinuationguard[allthree]" in notes_l
+                ):
+                    ess_like_group = False
+                    break
+            if ess_like_group:
+                group_sorted = sorted(group, key=lambda x: x.get("row_index") or 10**9)
+                anchor_state = group_sorted[0]
+                anchor_li = anchor_state.get("list_index")
+                requester = anchor_state.get("requester") or ""
+                subject_norm = (anchor_state.get("subject_norm") or "").lower()
+                base_thread = anchor_state.get("thread") or []
+                if requester and subject_norm and base_thread and anchor_li is not None and anchor_li < len(automation_rows):
+                    row_tokens = _match_tokens(subject_norm)
+                    reply_pool = []
+                    for e in base_thread:
+                        if not _req_match(e, requester):
+                            continue
+                        if _ack_like(e) or _ack_like_text_fallback(e):
+                            continue
+                        e_ist = _email_ist(e)
+                        if not e_ist:
+                            continue
+                        if row_tokens:
+                            s_norm = normalize_subject(getattr(e, "subject", "") or "")
+                            s_tokens = _match_tokens(s_norm)
+                            score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                            contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
+                            if score < 0.45 and not contains:
+                                continue
+                        reply_pool.append(e)
+                    reply_pool.sort(key=lambda e: e.sent_time)
+
+                    # De-duplicate by minute to avoid mapping to identical timestamps.
+                    unique_pool = []
+                    seen_ts = set()
+                    for e in reply_pool:
+                        e_ist = _email_ist(e)
+                        if not e_ist:
+                            continue
+                        key = e_ist.replace(second=0, microsecond=0)
+                        if key in seen_ts:
+                            continue
+                        seen_ts.add(key)
+                        unique_pool.append(e)
+
+                    # Prefer replies in the same month as the anchor row.
+                    a_dt = _parse_time_str(automation_rows[anchor_li].get("Actual Response Date & Time"))
+                    a_ist = _to_ist(a_dt) if a_dt else None
+                    month_pool = []
+                    if a_ist:
+                        for e in unique_pool:
+                            e_ist = _email_ist(e)
+                            if e_ist and e_ist.year == a_ist.year and e_ist.month == a_ist.month:
+                                month_pool.append(e)
+
+                    pool = month_pool if len(month_pool) >= len(group_sorted) else unique_pool
+                    if len(pool) >= len(group_sorted):
+                        for idx, s in enumerate(group_sorted):
+                            li = s.get("list_index")
+                            ri = s.get("row_index")
+                            if li is None or li >= len(automation_rows) or not ri:
+                                continue
+                            pick = pool[min(idx, len(pool) - 1)]
+                            t = _format_time(pick.sent_time)
+                            if not t:
+                                continue
+                            row_vals = automation_rows[li]
+                            row_vals["Created Date & Time"] = t
+                            row_vals["Actual Response Date & Time"] = t
+                            row_vals["Actual Resolved Date & Time"] = t
+                            ws.cell(ri, created_col).value = t
+                            ws.cell(ri, response_col).value = t
+                            ws.cell(ri, resolved_col).value = t
+                            if li < len(debug_rows):
+                                who = pick.sender_email or pick.sender_name
+                                debug_rows[li]["CreatedSource"] = who
+                                debug_rows[li]["AckSource"] = who
+                                debug_rows[li]["ResolvedSource"] = who
+                                debug_rows[li]["Notes"] = f"{debug_rows[li].get('Notes','')}; DistinctOccurrenceMap"
+                        continue
 
             # Keep one stable anchor row untouched:
             # prefer non-ambiguous match; otherwise earliest row index.

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -72,6 +73,8 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
 
     wb = load_workbook(template_path)
     ws = wb.active
+    filter_subject = (os.environ.get("FILTER_SUBJECT") or "").strip().lower()
+    filter_no_save = os.environ.get("FILTER_NO_SAVE") == "1"
 
     header_row = _find_header_row(ws, logger)
     col_map = _build_col_map(ws, header_row)
@@ -99,6 +102,8 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
         row_context = _build_row_context(ws, row, col_map)
 
         desc_text = str(row_context.get("Description", "") or "")
+        if filter_subject and filter_subject not in desc_text.lower():
+            continue
 
         resolved = row_resolver(row_context)
         mark_blue = resolved.pop("_MarkBlue", False)
@@ -119,14 +124,17 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
     if post_process:
         post_process(ws, col_map, header_row)
 
-    safe_path = _resolve_output_path(output_path)
-    try:
-        wb.save(safe_path)
-        logger.log(f"[INFO] Excel saved: {safe_path}")
-    except PermissionError:
-        alt_path = _resolve_output_path(output_path, force_suffix=True)
-        wb.save(alt_path)
-        logger.log(f"[WARNING] Output locked, saved to: {alt_path}")
+    if filter_no_save:
+        logger.log("[INFO] FILTER_NO_SAVE=1; skipping Excel save.")
+    else:
+        safe_path = _resolve_output_path(output_path)
+        try:
+            wb.save(safe_path)
+            logger.log(f"[INFO] Excel saved: {safe_path}")
+        except PermissionError:
+            alt_path = _resolve_output_path(output_path, force_suffix=True)
+            wb.save(alt_path)
+            logger.log(f"[WARNING] Output locked, saved to: {alt_path}")
 
     return FillResult(filled, maintenance, unknown)
 
