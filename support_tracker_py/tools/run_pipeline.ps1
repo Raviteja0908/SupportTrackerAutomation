@@ -145,8 +145,8 @@ if ($useVolume) {
         & docker run --rm -v "${pstDir}:/app/input" -v "${volumeName}:/app/output" support-tracker
         $sw.Stop()
         Write-Host ("Sheet fill time: {0}" -f $sw.Elapsed)
-        Write-Host "Copying output files to host folder..."
-        & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "${outputDir}:/host" support-tracker -c "cp /app/output/*_filled*.xlsx /host/ 2>/dev/null || true; cp /app/output/automation_output.csv /host/ 2>/dev/null || true; cp /app/output/debug_subjects.csv /host/ 2>/dev/null || true; cp /app/output/processing.log /host/ 2>/dev/null || true"
+        Write-Host "Copying filled workbook to host folder..."
+        & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "${outputDir}:/host" support-tracker -c "cp /app/output/*_filled*.xlsx /host/ 2>/dev/null || true"
     } finally {
         if (-not $KeepVolumeData) {
             Write-Host "Clearing volume data..."

@@ -124,6 +124,8 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
     if post_process:
         post_process(ws, col_map, header_row)
 
+    _normalize_datetime_cells(ws, col_map, header_row)
+
     if filter_no_save:
         logger.log("[INFO] FILTER_NO_SAVE=1; skipping Excel save.")
     else:
@@ -209,6 +211,47 @@ def _write_values(ws, row, col_map, values):
         if not col:
             continue
         ws.cell(row, col).value = value
+
+
+def _normalize_datetime_cells(ws, col_map, header_row):
+    datetime_keys = [
+        "created date & time",
+        "actual response date & time",
+        "actual resolved date & time",
+    ]
+    target_cols = [col_map.get(key) for key in datetime_keys if col_map.get(key)]
+    if not target_cols:
+        return
+
+    for row in range(header_row + 1, ws.max_row + 1):
+        for col in target_cols:
+            cell = ws.cell(row, col)
+            value = cell.value
+            parsed = _parse_datetime_cell(value)
+            if not parsed:
+                continue
+            current_format = str(cell.number_format or "").strip()
+            cell.value = parsed
+            if not current_format or current_format.lower() == "general":
+                cell.number_format = "DD-MM-YYYY HH:MM"
+
+
+def _parse_datetime_cell(value):
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    for fmt in ("%d-%m-%Y %H:%M", "%d-%m-%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _write_comment(ws, row, comments_col, text):
