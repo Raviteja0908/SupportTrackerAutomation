@@ -146,6 +146,8 @@ if ($useVolume) {
         $sw.Stop()
         Write-Host ("Sheet fill time: {0}" -f $sw.Elapsed)
         Write-Host "Copying filled workbook to host folder..."
+        Get-ChildItem -Path $outputDir -Filter "*_filled*.xlsx" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
         & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "${outputDir}:/host" support-tracker -c "cp /app/output/*_filled*.xlsx /host/ 2>/dev/null || true"
     } finally {
         if (-not $KeepVolumeData) {

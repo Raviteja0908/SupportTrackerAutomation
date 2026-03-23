@@ -11,11 +11,11 @@ from src.rules.subject_normalizer import normalize_subject, normalize_subject_fo
 
 ACK_PHRASES = [
     "sure, we will process the file to",
+    "sure we will process the file to",
     "we will check",
     "update you",
     "let you know",
     "we will process the file to",
-    "we will do the same",
     "we will do the same",
     "we will do the needful",
     "we have not yet received",
@@ -42,8 +42,43 @@ NON_ACK_PHRASES = [
     "thank you for the update",
     "thanks for the update",
     "thanks for the info",
+    "thank you for the confirmation",
+    "thanks for the confirmation",
     "noted with thanks",
     "duly noted",
+    "please ignore",
+    "kindly ignore",
+    "ignore the below",
+    "please ignore the below",
+    "kindly ignore the below",
+    "we will ignore",
+]
+
+PROMISE_ACK_PHRASES = [
+    "we will process",
+    "we will proceed",
+    "we will proceed to process",
+    "we will deploy",
+    "we will work on this",
+    "we will look into this",
+    "we will investigate",
+    "we will verify",
+    "we will fix",
+    "we will reprocess",
+    "we will resend",
+    "we will share",
+    "we will provide",
+    "we will revert",
+    "we will take this up",
+]
+
+ACK_COURTESY_PREFIXES = [
+    "sure",
+    "ok",
+    "okay",
+    "thanks",
+    "thank you",
+    "noted",
 ]
 
 DIRECT_RESOLUTION_PHRASES = [
@@ -189,6 +224,17 @@ def _contains_any_phrase(text: str, phrases: list[str]) -> bool:
     return False
 
 
+def _is_explicit_ack_signal(text: str) -> bool:
+    t = _normalize_for_phrase_match(text)
+    if not t:
+        return False
+    if _contains_any_phrase(t, ACK_PHRASES) or _contains_any_phrase(t, PROMISE_ACK_PHRASES):
+        return True
+    has_courtesy = any(t.startswith(prefix) or f"{prefix} " in t for prefix in ACK_COURTESY_PREFIXES)
+    has_future_action = _contains_any_phrase(t, ACK_PHRASES) or _contains_any_phrase(t, PROMISE_ACK_PHRASES)
+    return has_courtesy and has_future_action
+
+
 def _leading_body_segment(body: str, max_chars: int = 4000) -> str:
     """
     Return only the newest/top body portion, trimming quoted history blocks.
@@ -229,7 +275,7 @@ def _is_ack_body(body: str) -> bool:
     top = _leading_body_segment(body)
     if _contains_any_phrase(top, NON_ACK_PHRASES):
         return False
-    return _contains_any_phrase(top, ACK_PHRASES)
+    return _is_explicit_ack_signal(top)
 
 
 def _is_ack_like_reply(email_record) -> bool:
@@ -260,6 +306,12 @@ def _is_ack_like_reply(email_record) -> bool:
         )
     if file_action_hit:
         return False
+    if _is_explicit_ack_signal(body) or (
+        len(_normalize_for_phrase_match(body)) < 80
+        and _is_explicit_ack_signal(body_fallback)
+        and not _contains_any_phrase(body_fallback, DIRECT_RESOLUTION_PHRASES)
+    ):
+        return True
     # Size-based override: long, multi-line replies are more likely to be real updates.
     # Only keep them ack-like if they explicitly contain reminder/non-ack phrases.
     size_text = body if body else body_fallback
@@ -388,7 +440,6 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
         if (e.sender_email in requester_candidates)
         or _match_requester(e.sender_name, e.sender_email, requester_name)
     ]
-    # TRACE_ACKLIKE debug removed after issue isolation.
     def _latest_requester_non_ack(msgs):
         for e in reversed(msgs):
             if _is_ack_like_reply(e):
