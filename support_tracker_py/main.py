@@ -3,8 +3,10 @@ from types import SimpleNamespace
 import sys
 import re
 import html
+import time
 from email import policy
 from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 from pathlib import Path
 from openpyxl.styles import PatternFill
@@ -12,7 +14,7 @@ from openpyxl.styles import PatternFill
 from src.output.run_logger import RunLogger
 from src.pst_reader import read_pst_emails
 from src.rules.subject_normalizer import normalize_subject, extract_subject_from_description, normalize_subject_for_match
-from src.rules.environment import resolve_environment
+from src.rules.environment import resolve_environment, resolve_environment_thread_fallback
 from src.rules.interface import resolve_interface_code
 from src.rules.service_request import resolve_service_request
 from src.rules.incident_type import resolve_incident_type
@@ -27,7 +29,7 @@ from src.rules.time_resolver import (
     TimeResult,
     TimeDebug,
 )
-from src.excel.template_filler import fill_template, EXPECTED_HEADERS
+from src.excel.template_filler import fill_template, EXPECTED_HEADERS, select_target_sheet
 from src.output.csv_writer import write_csv
 from src.output.run_logger import MarkingReason
 from src.utils import (
@@ -35,6 +37,57 @@ from src.utils import (
     load_aspose_license,
     load_subject_exclusions,
 )
+
+
+def _normalize_template_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+
+
+def _detect_workbook_kind(template_name: str) -> str:
+    norm = _normalize_template_name(template_name)
+    if "incident" in norm and "self" in norm and "service" in norm:
+        return "incident_self_service"
+    if "task" in norm and "business" in norm:
+        return "task_business"
+    if "incident" in norm and "business" in norm and "self" not in norm:
+        return "incident_business"
+    return "unknown"
+
+
+def _workbook_label(kind: str) -> str:
+    return {
+        "incident_business": "Incident Business",
+        "task_business": "Task Business",
+        "incident_self_service": "Incident Self Service",
+    }.get(kind, "Unknown")
+
+
+def _resolve_self_service_category_type(category_type: str, subject: str) -> str:
+    cat = (category_type or "").strip()
+    if cat:
+        return cat
+
+    subj = (subject or "").lower()
+    deployment_tokens = [
+        "deployment",
+        "deployed",
+        "property config",
+        "property configuration",
+        "account rotation",
+        "new us admin",
+        "new admin",
+        "wikis pending",
+        "access",
+    ]
+    if any(tok in subj for tok in deployment_tokens):
+        return "ES - Deployment/Property config"
+
+    if "exception external" in subj:
+        return "ES - exception external"
+    if "exception internal" in subj:
+        return "ES - exception internal"
+
+    return "ES - exception internal"
 
 
 def main() -> int:
@@ -123,6 +176,12 @@ def main() -> int:
         template_path = max(candidates, key=lambda p: p.stat().st_mtime)
         logger.log(f"[INFO] Using template: {template_path.name}")
 
+    workbook_kind = _detect_workbook_kind(template_path.name)
+    if workbook_kind == "unknown":
+        logger.log(f"[ERROR] Unrecognized workbook type from filename: {template_path.name}")
+        return 1
+    logger.log(f"[INFO] Workbook type: {_workbook_label(workbook_kind)}")
+
     def _normalize_header(text: str) -> str:
         if text is None:
             return ""
@@ -165,6 +224,41 @@ def main() -> int:
             return set()
         t = re.sub(r"[^a-z0-9]+", " ", text.lower())
         return {p for p in t.split() if p}
+
+    def _id_like_tokens(text: str) -> set:
+        if not text:
+            return set()
+        text = re.sub(r"[Ã¢â‚¬ÂÃ¢â‚¬â€˜Ã¢â‚¬â€™Ã¢â‚¬â€œÃ¢â‚¬â€Ã¢â‚¬â€¢Ã¢Ë†â€™Ã¯Â¹Â£Ã¯Â¼Â\u00ad]", "-", text)
+        text = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff]", "", text)
+        tokens = {
+            m.group(0).lower()
+            for m in re.finditer(r"(?<![a-z0-9])[a-z]{2,}[a-z0-9\\-]*\\d[a-z0-9\\-]*(?![a-z0-9])", text.lower())
+        }
+        if not tokens:
+            for part in re.split(r"[^a-z0-9\\-]+", text.lower()):
+                if not part:
+                    continue
+                if any(c.isalpha() for c in part) and any(c.isdigit() for c in part):
+                    tokens.add(part)
+        return tokens
+
+    def _task_subject_core(text: str) -> str:
+        norm = normalize_subject(text or "")
+        if not norm:
+            return ""
+        core = norm
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("ess - ", "re: ", "fw: ", "fwd: "):
+                if core.startswith(prefix):
+                    core = core[len(prefix):].strip()
+                    changed = True
+        core = re.sub(r"\s*-\s*task\d+\b", "", core, flags=re.IGNORECASE).strip()
+        core = re.sub(r"\s*(?:--?>|=>)\s*\d{1,2}[-/.]\d{1,2}(?:[-/.]\d{2,4})?\s*$", "", core, flags=re.IGNORECASE).strip()
+        core = re.sub(r"\s*(?:--?>|=>)\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$", "", core, flags=re.IGNORECASE).strip()
+        core = re.sub(r"\s+", " ", core).strip(" -:")
+        return core.lower()
 
     def _part_tokens(text: str):
         if not text:
@@ -1030,7 +1124,7 @@ def main() -> int:
     try:
         from openpyxl import load_workbook
         wb = load_workbook(template_path)
-        ws = wb.active
+        ws = select_target_sheet(wb, logger, preferred_sheet_name="LOG")
         header_row = _find_header_row(ws)
         col_map = _build_col_map(ws, header_row)
         desc_col = col_map.get("description")
@@ -1059,6 +1153,8 @@ def main() -> int:
     duplicate_group_state = {}
     created_history = []
     env_cache = {}
+    _env_consultant_text_cache = {}
+    _env_thread_text_cache = {}
 
     # Build deployment request/success index by DR ID (safe override case only)
     deployment_index = {}
@@ -1651,7 +1747,8 @@ def main() -> int:
         skip_history_update = False
         description = row_context.get("Description", "")
         requester = row_context.get("Consultant", "") or row_context.get("Requester", "")
-        category_type = row_context.get("Category Type", "")
+        category_type_raw = row_context.get("Category Type", "")
+        category_type = category_type_raw
         row_index = row_context.get("RowIndex")
         # Defaults used in row_states even when deployment override fires
         date_anchor_missing = False
@@ -1844,30 +1941,57 @@ def main() -> int:
         )
         env = env_cache.get(env_cache_key)
         if env is None:
-            consultant_body_text = ""
-            if thread and requester:
-                consultant_bodies = []
-                for e in thread:
-                    if not _match_requester(e.sender_name, e.sender_email, requester):
-                        continue
-                    # Read full consultant content for env detection:
-                    # include selected plain body and raw html payload when present.
-                    if e.body:
-                        consultant_bodies.append(e.body)
-                    if getattr(e, "body_html", None):
-                        consultant_bodies.append(e.body_html)
-                consultant_body_text = "\n".join(consultant_bodies)
-
-            # Environment: subject -> consultant replies -> description.
-            # Do not use whole thread as fallback to avoid cross-topic leakage
-            # inside long email chains.
-            env = resolve_environment(subject_text, consultant_body_text)
+            # Environment: subject -> consultant replies -> description ->
+            # broader selected thread -> final default PROD.
+            env = resolve_environment(subject_text, "")
+            if (not env) and thread and requester:
+                consultant_text_key = (thread_key, _requester_key(requester))
+                consultant_text = _env_consultant_text_cache.get(consultant_text_key)
+                if consultant_text is None:
+                    consultant_bodies = []
+                    for e in thread:
+                        if not _match_requester(e.sender_name, e.sender_email, requester):
+                            continue
+                        # Read consultant content only when subject alone did not resolve env.
+                        if e.body:
+                            consultant_bodies.append(e.body)
+                        if getattr(e, "body_html", None):
+                            consultant_bodies.append(e.body_html)
+                    consultant_text = "\n".join(consultant_bodies)
+                    _env_consultant_text_cache[consultant_text_key] = consultant_text
+                if consultant_text:
+                    env = resolve_environment(subject_text, consultant_text)
             if not env:
                 env = resolve_environment(subject_text, description or "")
+            if (not env) and thread:
+                thread_text = _env_thread_text_cache.get(thread_key)
+                if thread_text is None:
+                    thread_parts = []
+                    for e in thread:
+                        subj = getattr(e, "subject", "") or ""
+                        if subj:
+                            thread_parts.append(subj)
+                        if e.body:
+                            thread_parts.append(e.body)
+                        if getattr(e, "body_html", None):
+                            thread_parts.append(e.body_html)
+                    thread_text = "\n".join(thread_parts)
+                    _env_thread_text_cache[thread_key] = thread_text
+                if thread_text:
+                    env = resolve_environment_thread_fallback(thread_text)
+            if not env:
+                env = "PROD"
             env_cache[env_cache_key] = env
         interface_code = resolve_interface_code(description)
-        incident_type = resolve_incident_type(category_type, description)
-        service_request = resolve_service_request(category_type)
+        if workbook_kind == "task_business":
+            category_type = "Business"
+            service_request = "ServiceRequest"
+            incident_type = "SR-File process"
+        else:
+            if workbook_kind == "incident_self_service":
+                category_type = _resolve_self_service_category_type(category_type_raw, subject_text or description)
+            incident_type = resolve_incident_type(category_type, description)
+            service_request = resolve_service_request(category_type)
 
         # Honor explicit sheet hint first when present. This protects rows where
         # category type is wrong in source data, without hardcoding any subject.
@@ -2724,6 +2848,17 @@ def main() -> int:
                 is_dep_succ=is_dep_succ,
             )
 
+        if workbook_kind == "incident_self_service":
+            same_time = times.response or times.resolved or times.created
+            if same_time:
+                times = TimeResult(same_time, same_time, same_time)
+                debug = TimeDebug(
+                    debug.ack_src or debug.resolved_src or debug.created_src,
+                    debug.ack_src or debug.resolved_src or debug.created_src,
+                    debug.ack_src or debug.resolved_src or debug.created_src,
+                    f"{debug.notes}; SelfServiceAllThreeSame",
+                )
+
         final_created_dt = _parse_time_str(times.created)
         final_created_dt_ist = _to_ist(final_created_dt) if final_created_dt else None
         if final_created_dt_ist and not skip_history_update:
@@ -2740,12 +2875,16 @@ def main() -> int:
                 f"Resolved={times.resolved} ({debug.resolved_src}) | "
                 f"Notes={debug.notes}"
             )
-
         automation_rows.append(
             {
                 "Description": description,
                 "Requester": requester,
                 "Environment": env,
+                "Module": "Mule",
+                "Issue Type": "Module",
+                "Issue occurred in": "ESS",
+                "Location/ Branch": "Hyderabad",
+                "Category Type": category_type,
                 "Created Date & Time": times.created,
                 "Actual Response Date & Time": times.response,
                 "Actual Resolved Date & Time": times.resolved,
@@ -2825,6 +2964,11 @@ def main() -> int:
 
         resolved_values = {
             "Environment": env,
+            "Module": "Mule",
+            "Issue Type": "Module",
+            "Issue occurred in": "ESS",
+            "Location/ Branch": "Hyderabad",
+            "Category Type": category_type,
             "Created Date & Time": times.created,
             "Actual Response Date & Time": times.response,
             "Actual Resolved Date & Time": times.resolved,
@@ -6379,7 +6523,8 @@ def main() -> int:
             # If a row drifted into ESS-only/parsed anchoring, but a live non-ESS
             # requester mail exists in the same subject episode before ack/resolved,
             # re-anchor Created to that live request.
-            for state in nonblue_row_states:
+            live_request_states = nonblue_row_states
+            for state in live_request_states:
                 list_index = state.get("list_index")
                 if list_index is None or list_index >= len(automation_rows):
                     continue
@@ -8014,27 +8159,10 @@ def main() -> int:
                     subj_text = re.sub(r"(?i)^(subject|objet)\b\s*:?\s*", "", subj_line).strip()
                 blocks.append((from_line, _to_ist(sent_dt), subj_text))
             return blocks
-        def _id_like_tokens(text: str) -> set:
-            if not text:
-                return set()
-            # Normalize unicode dashes to ASCII hyphen for stable ID matching.
-            text = re.sub(r"[â€â€‘â€’â€“â€”â€•âˆ’ï¹£ï¼\u00ad]", "-", text)
-            text = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff]", "", text)
-            tokens = {
-                m.group(0).lower()
-                for m in re.finditer(r"(?<![a-z0-9])[a-z]{2,}[a-z0-9\\-]*\\d[a-z0-9\\-]*(?![a-z0-9])", text.lower())
-            }
-            if not tokens:
-                for part in re.split(r"[^a-z0-9\\-]+", text.lower()):
-                    if not part:
-                        continue
-                    if any(c.isalpha() for c in part) and any(c.isdigit() for c in part):
-                        tokens.add(part)
-            return tokens
-
         quoted_block_cache = {}
         raw_eml_quoted_cache = {}
         raw_eml_quoted_summary_cache = {}
+        raw_eml_header_summary_cache = {}
         raw_id_path_cache = {}
         eml_id_index = None
         def _get_quoted_blocks_with_subject_cached(msg):
@@ -8132,6 +8260,47 @@ def main() -> int:
                 summaries.append((sent_ist, q_norm, q_ids, q_tokens, is_ess))
             raw_eml_quoted_summary_cache[path] = summaries
             return summaries
+
+        def _get_eml_header_summary(path: str):
+            if not path:
+                return None
+            if path in raw_eml_header_summary_cache:
+                return raw_eml_header_summary_cache[path]
+            try:
+                with open(path, "rb") as f:
+                    msg = BytesParser(policy=policy.default).parse(f)
+            except Exception:
+                raw_eml_header_summary_cache[path] = None
+                return None
+            try:
+                sent_dt = parsedate_to_datetime(msg.get("Date")) if msg.get("Date") else None
+            except Exception:
+                sent_dt = None
+            subject_raw = str(msg.get("Subject") or "")
+            subject_norm = normalize_subject(subject_raw)
+            subject_ids = _id_like_tokens(subject_norm)
+            sender_email = ""
+            sender_name = ""
+            try:
+                from_header = msg.get("From")
+                if getattr(from_header, "addresses", None):
+                    sender_email = (from_header.addresses[0].addr_spec or "").lower()
+                    sender_name = from_header.addresses[0].display_name or ""
+                else:
+                    sender_name = str(from_header or "")
+            except Exception:
+                sender_name = str(msg.get("From") or "")
+            summary = {
+                "sent_dt": sent_dt,
+                "subject_raw": subject_raw,
+                "subject_norm": subject_norm,
+                "subject_ids": subject_ids,
+                "sender_email": sender_email,
+                "sender_name": sender_name,
+            }
+            raw_eml_header_summary_cache[path] = summary
+            return summary
+
         def _build_eml_id_index():
             nonlocal eml_id_index
             if eml_id_index is not None:
@@ -8155,10 +8324,14 @@ def main() -> int:
             try:
                 for p in eml_root.rglob("*.eml"):
                     path = str(p)
+                    header_summary = _get_eml_header_summary(path)
+                    path_tokens = set()
+                    if header_summary:
+                        path_tokens.update((header_summary.get("subject_ids") or set()) & all_row_id_tokens)
                     summaries = _get_quoted_summaries_from_eml_path(path)
                     if not summaries:
-                        continue
-                    path_tokens = set()
+                        if not path_tokens:
+                            continue
                     for _sent_ist, _q_norm, q_ids, _q_tokens, _is_ess in summaries:
                         path_tokens.update(q_ids & all_row_id_tokens)
                     if not path_tokens:
@@ -8188,6 +8361,7 @@ def main() -> int:
                             hits.append(path)
             raw_id_path_cache[key] = hits
             return hits
+
         subject_norm_cache = {}
         def _subject_norm_cached(subject: str) -> str:
             key = subject or ""
@@ -9271,6 +9445,34 @@ def main() -> int:
                         direct_reply_gap_blue = True
 
             if pair_req and pair_ack:
+                if quoted_only:
+                    cur_c_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+                    cur_a_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+                    cur_r_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time"))
+                    cur_c_ist = _to_ist(cur_c_dt) if cur_c_dt else None
+                    cur_a_ist = _to_ist(cur_a_dt) if cur_a_dt else None
+                    cur_r_ist = _to_ist(cur_r_dt) if cur_r_dt else None
+                    if cur_c_ist and cur_a_ist:
+                        cur_c_min = cur_c_ist.replace(second=0, microsecond=0)
+                        cur_a_min = cur_a_ist.replace(second=0, microsecond=0)
+                        pair_req_min = pair_req.replace(second=0, microsecond=0)
+                        pair_ack_min = pair_ack.replace(second=0, microsecond=0)
+                        if (
+                            cur_a_min >= cur_c_min
+                            and (cur_a_min - cur_c_min) <= timedelta(minutes=16)
+                            and cur_c_min >= pair_req_min
+                            and cur_a_min <= pair_ack_min
+                            and (cur_r_ist is None or cur_r_ist >= cur_a_ist)
+                        ):
+                            _set_row_fill(row_idx, clear_fill)
+                            if list_index < len(debug_rows):
+                                notes_now = debug_rows[list_index].get("Notes", "")
+                                if "QuotedRequestOnlyPreservedLiveAck" not in notes_now:
+                                    debug_rows[list_index]["Notes"] = (
+                                        f"{notes_now}; QuotedRequestOnlyPreservedLiveAck; BlueClearedStrict"
+                                    )
+                            continue
+
                 t_c = _format_time(pair_req)
                 t_a = _format_time(pair_ack)
 
@@ -9483,6 +9685,7 @@ def main() -> int:
                     or debug_rows[list_index].get("AckSource")
                     or ""
                 )
+
             # Blue pre-fix: quoted pair re-anchor.
             # Recover (created, response) from quoted history when current created
             # is stale and causes a large blue gap.
@@ -10544,6 +10747,167 @@ def main() -> int:
                 if list_index < len(debug_rows):
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
 
+        # ESS hybrid ack episode guard (global, targeted):
+        # For continuation/requester-follow-up rows that collapsed to one timestamp,
+        # recover the actual episode when the thread shows:
+        # quoted non-ESS request -> in-between ESS ack/update -> later final reply.
+        # Keep this thread-local and cache-backed to avoid slowing the workbook fill.
+        def _quoted_line_is_ess_local(from_line: str):
+            addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", from_line or "", flags=re.I)
+            if not addr_hits:
+                return _ess_name_only(from_line)
+            emails_l = [em.lower() for em in addr_hits]
+            domains_l = [em.split("@", 1)[-1] for em in emails_l if "@" in em]
+            return any(em in ess_email_set for em in emails_l) or any(d in ess_domain_set for d in domains_l)
+
+        for state in row_states:
+            list_index = state.get("list_index")
+            row_idx = state.get("row_index")
+            if list_index is None or list_index >= len(automation_rows) or not row_idx:
+                continue
+            if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+
+            notes_now = debug_rows[list_index].get("Notes", "") if list_index < len(debug_rows) else ""
+            notes_l = (notes_now or "").lower()
+            if not (
+                "requester follow-up (no in-between request)" in notes_l
+                or "requester follow-up(top-only)" in notes_l
+                or "ess-only continuation(top requester)" in notes_l
+            ):
+                continue
+
+            row_vals = automation_rows[list_index]
+            c_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+            a_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+            r_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time"))
+            if not (c_dt and a_dt and r_dt):
+                continue
+            c_ist = _to_ist(c_dt)
+            a_ist = _to_ist(a_dt)
+            r_ist = _to_ist(r_dt)
+            if not (c_ist and a_ist and r_ist):
+                continue
+
+            c_min = c_ist.replace(second=0, microsecond=0)
+            a_min = a_ist.replace(second=0, microsecond=0)
+            r_min = r_ist.replace(second=0, microsecond=0)
+            if not (c_min == a_min == r_min):
+                continue
+
+            requester = state.get("requester") or ""
+            subject_norm = (state.get("subject_norm") or "").lower()
+            if not requester or not subject_norm:
+                continue
+
+            row_tokens = _match_tokens(subject_norm)
+            row_id_tokens = _id_like_tokens(subject_norm)
+            if not row_id_tokens:
+                row_id_tokens = _id_like_tokens(row_vals.get("Description") or state.get("description") or "")
+
+            base_thread = state.get("thread") or []
+            thread = _expanded_thread(
+                subject_norm,
+                base_thread,
+                requester,
+                include_non_ess=True,
+                reference_ist=r_ist,
+            )
+            if not thread:
+                continue
+
+            thread_msgs = []
+            for e in thread:
+                e_ist = _email_ist(e)
+                if not e_ist or _system_like_sender(e):
+                    continue
+                if not _row_subject_match_email(e, subject_norm, row_tokens, row_id_tokens):
+                    continue
+                thread_msgs.append((e_ist, e))
+            if len(thread_msgs) < 2:
+                continue
+            thread_msgs.sort(key=lambda item: item[0])
+
+            final_reply_ist, final_reply = thread_msgs[-1]
+
+            req_pick = None
+            for _msg_ist, msg in thread_msgs:
+                quoted_blocks = _get_quoted_blocks_with_subject_cached(msg)
+                if not quoted_blocks:
+                    quoted_blocks = _get_quoted_blocks_from_eml_path(getattr(msg, "path", ""))
+                for from_line, sent_ist, q_subj in quoted_blocks:
+                    if not sent_ist or sent_ist >= final_reply_ist:
+                        continue
+                    if _quoted_line_is_ess_local(from_line) is not False:
+                        continue
+                    q_norm = normalize_subject(q_subj or "")
+                    q_ids = _id_like_tokens(q_norm)
+                    q_tokens = _match_tokens(q_norm)
+                    if not _quoted_subject_confirms_row(
+                        q_norm,
+                        q_ids,
+                        q_tokens,
+                        subject_norm,
+                        row_tokens,
+                        row_id_tokens,
+                    ):
+                        continue
+                    if req_pick is None or sent_ist > req_pick:
+                        req_pick = sent_ist
+
+            if not req_pick:
+                continue
+
+            ack_candidates = []
+            for msg_ist, msg in thread_msgs:
+                if msg_ist <= req_pick or msg_ist > final_reply_ist:
+                    continue
+                if not _ess_sender(msg):
+                    continue
+                if not (_ack_like(msg) or _ack_like_text_fallback(msg) or _ess_only_short_ack(msg)):
+                    continue
+                if (msg_ist - req_pick) > timedelta(minutes=60):
+                    continue
+                ack_candidates.append((msg_ist, msg))
+            if not ack_candidates:
+                continue
+
+            ack_candidates.sort(key=lambda item: item[0])
+            ack_ist, ack_msg = ack_candidates[0]
+
+            resolved_candidates = [
+                (msg_ist, msg)
+                for msg_ist, msg in thread_msgs
+                if msg_ist >= ack_ist and (msg_ist - ack_ist) <= timedelta(hours=48)
+            ]
+            if not resolved_candidates:
+                continue
+            resolved_ist, resolved_msg = resolved_candidates[-1]
+            if resolved_ist < ack_ist:
+                continue
+
+            t_c = _format_time(req_pick)
+            t_a = _format_time(ack_ist)
+            t_r = _format_time(resolved_ist)
+            if not (t_c and t_a and t_r):
+                continue
+
+            row_vals["Created Date & Time"] = t_c
+            row_vals["Actual Response Date & Time"] = t_a
+            row_vals["Actual Resolved Date & Time"] = t_r
+            ws.cell(row_idx, created_col).value = t_c
+            ws.cell(row_idx, response_col).value = t_a
+            ws.cell(row_idx, resolved_col).value = t_r
+            if list_index < len(debug_rows):
+                debug_rows[list_index]["CreatedSource"] = "PARSED_FROM_QUOTED_REQUEST"
+                debug_rows[list_index]["AckSource"] = ack_msg.sender_email or ack_msg.sender_name or "ESS_HYBRID_ACK"
+                debug_rows[list_index]["ResolvedSource"] = resolved_msg.sender_email or resolved_msg.sender_name or "ESS_HYBRID_ACK"
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; EssHybridAckEpisodeGuard"
+            if (ack_ist.replace(second=0, microsecond=0) - req_pick.replace(second=0, microsecond=0)) <= timedelta(minutes=16):
+                _set_row_fill(row_idx, clear_fill)
+                if list_index < len(debug_rows):
+                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+
         # Risky fallback collapse guard (narrow):
         # Inspect only risky fallback rows that collapsed all three timestamps to
         # one point, and only re-anchor when a clearly better episode is found.
@@ -10989,21 +11353,405 @@ def main() -> int:
                     debug_rows[li]["ResolvedSource"] = who
                     debug_rows[li]["Notes"] = f"{debug_rows[li].get('Notes','')}; DuplicateDecollision"
 
+        if workbook_kind == "task_business":
+            raw_task_candidate_cache = {}
+            task_msgs_by_core = {}
+            task_msgs_by_core_day = {}
+            task_non_ess_msgs_by_core = {}
+            task_non_ess_msgs_by_core_day = {}
+
+            def _raw_task_candidates_for_ids(row_id_tokens_set: set):
+                key = tuple(sorted(row_id_tokens_set))
+                if key in raw_task_candidate_cache:
+                    return raw_task_candidate_cache[key]
+                out = []
+                for path in _find_eml_paths_by_id(row_id_tokens_set):
+                    header_summary = _get_eml_header_summary(path)
+                    if not header_summary or not header_summary.get("sent_dt"):
+                        continue
+                    out.append((
+                        header_summary.get("subject_raw") or "",
+                        header_summary.get("sent_dt"),
+                        header_summary.get("sender_email") or "",
+                        header_summary.get("sender_name") or "",
+                    ))
+                raw_task_candidate_cache[key] = out
+                return out
+
+            for e in emails:
+                e_ist = _email_ist(e)
+                if not e_ist:
+                    continue
+                s_core = _task_subject_core(_subject_norm_cached(getattr(e, "subject", "") or ""))
+                if not s_core:
+                    continue
+                key_day = (s_core, e_ist.date())
+                task_msgs_by_core.setdefault(s_core, []).append(e)
+                task_msgs_by_core_day.setdefault(key_day, []).append(e)
+                if not _ess_sender(e) and not _system_like_sender(e):
+                    task_non_ess_msgs_by_core.setdefault(s_core, []).append(e)
+                    task_non_ess_msgs_by_core_day.setdefault(key_day, []).append(e)
+
+            for bucket in (task_msgs_by_core, task_msgs_by_core_day, task_non_ess_msgs_by_core, task_non_ess_msgs_by_core_day):
+                for key in list(bucket.keys()):
+                    bucket[key].sort(key=lambda e: _email_ist(e) or datetime.min)
+
+            for state in row_states:
+                list_index = state.get("list_index")
+                row_idx = state.get("row_index")
+                if list_index is None or list_index >= len(automation_rows) or not row_idx:
+                    continue
+                if state.get("is_dep_req") or state.get("is_dep_succ"):
+                    continue
+
+                row_vals = automation_rows[list_index]
+                created_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+                ack_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+                resolved_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time"))
+                if not (created_dt and ack_dt):
+                    continue
+                created_ist = _to_ist(created_dt)
+                ack_ist = _to_ist(ack_dt)
+                if not created_ist or not ack_ist or ack_ist <= created_ist:
+                    if not (created_ist and ack_ist):
+                        continue
+                created_minute = created_ist.replace(second=0, microsecond=0)
+                ack_minute = ack_ist.replace(second=0, microsecond=0)
+                resolved_ist = _to_ist(resolved_dt) if resolved_dt else None
+                resolved_minute = resolved_ist.replace(second=0, microsecond=0) if resolved_ist else None
+                is_blue_row = _row_has_blue_fill(row_idx)
+                task_same_all = bool(resolved_minute and created_minute == ack_minute == resolved_minute)
+                if not is_blue_row and not task_same_all:
+                    continue
+
+                created_src_now = debug_rows[list_index].get("CreatedSource", "") if list_index < len(debug_rows) else ""
+                subject_norm = (state.get("subject_norm") or "").lower()
+                parsed_created = isinstance(created_src_now, str) and created_src_now.startswith("PARSED_FROM_")
+                if not parsed_created and not task_same_all:
+                    continue
+                if (ack_minute - created_minute) <= timedelta(minutes=16) and not task_same_all:
+                    continue
+
+                subject_core = _task_subject_core(subject_norm)
+                if not subject_core:
+                    continue
+                row_id_tokens = _id_like_tokens(subject_norm)
+                if not row_id_tokens:
+                    row_id_tokens = _id_like_tokens(row_vals.get("Description") or state.get("description") or "")
+                if not row_id_tokens:
+                    continue
+                same_all_lower_bound = ack_ist - timedelta(hours=24) if task_same_all else None
+
+                def _task_pick_in_window(sent_ist, sent_minute):
+                    if not sent_ist or not sent_minute:
+                        return False
+                    if sent_minute > ack_minute:
+                        return False
+                    if task_same_all:
+                        return sent_ist >= same_all_lower_bound
+                    return sent_ist.date() == ack_ist.date()
+
+                best_pick_ist = None
+                best_pick_src = ""
+                best_pick_note = ""
+
+                live_pick_pool = (
+                    task_non_ess_msgs_by_core.get(subject_core, [])
+                    if task_same_all
+                    else task_non_ess_msgs_by_core_day.get((subject_core, ack_ist.date()), [])
+                )
+                for e in live_pick_pool:
+                    e_ist = _email_ist(e)
+                    e_minute = e_ist.replace(second=0, microsecond=0) if e_ist else None
+                    if not _task_pick_in_window(e_ist, e_minute):
+                        continue
+                    if best_pick_ist is None or e_ist > best_pick_ist:
+                        best_pick_ist = e_ist
+                        best_pick_src = e.sender_email or e.sender_name or ""
+                        best_pick_note = "TaskNearestPreAckRequest"
+
+                if best_pick_ist is None and row_id_tokens:
+                    for subject_raw, sent_dt, sender_email, sender_name in _raw_task_candidates_for_ids(row_id_tokens):
+                        sent_ist = _to_ist(sent_dt)
+                        sent_minute = sent_ist.replace(second=0, microsecond=0) if sent_ist else None
+                        if not _task_pick_in_window(sent_ist, sent_minute):
+                            continue
+                        if sender_email and (
+                            sender_email in ess_email_set
+                            or ("@" in sender_email and sender_email.split("@", 1)[-1] in ess_domain_set)
+                        ):
+                            continue
+                        s_core = _task_subject_core(subject_raw)
+                        if not s_core or s_core != subject_core:
+                            continue
+                        if best_pick_ist is None or sent_ist > best_pick_ist:
+                            best_pick_ist = sent_ist
+                            best_pick_src = sender_email or sender_name or "RAW_EML_SUBJECT_MATCH"
+                            best_pick_note = "TaskNearestPreAckRequestRaw"
+
+                def _quoted_from_line_is_ess(from_line: str):
+                    addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", from_line or "", flags=re.I)
+                    if not addr_hits:
+                        return _ess_name_only(from_line)
+                    emails_l = [em.lower() for em in addr_hits]
+                    domains_l = [em.split("@", 1)[-1] for em in emails_l if "@" in em]
+                    return any(em in ess_email_set for em in emails_l) or any(d in ess_domain_set for d in domains_l)
+
+                if best_pick_ist is None:
+                    quoted_pick = None
+                    quoted_live_pool = (
+                        task_msgs_by_core.get(subject_core, [])
+                        if task_same_all
+                        else task_msgs_by_core_day.get((subject_core, ack_ist.date()), [])
+                    )
+                    for e in quoted_live_pool:
+                        e_ist = _email_ist(e)
+                        e_minute = e_ist.replace(second=0, microsecond=0) if e_ist else None
+                        if not _task_pick_in_window(e_ist, e_minute):
+                            continue
+                        for from_line, sent_ist, q_subj in _get_quoted_blocks_with_subject_cached(e):
+                            sent_minute = sent_ist.replace(second=0, microsecond=0) if sent_ist else None
+                            if not _task_pick_in_window(sent_ist, sent_minute):
+                                continue
+                            if (not task_same_all) and sent_minute <= created_minute:
+                                continue
+                            q_core = _task_subject_core(q_subj or "")
+                            if not q_core or q_core != subject_core:
+                                continue
+                            is_ess = _quoted_from_line_is_ess(from_line)
+                            if is_ess is not False:
+                                continue
+                            if quoted_pick is None or sent_ist > quoted_pick[0]:
+                                quoted_pick = (sent_ist, from_line)
+                    if quoted_pick:
+                        best_pick_ist = quoted_pick[0]
+                        best_pick_src = "PARSED_FROM_QUOTED_REQUEST"
+                        best_pick_note = "TaskQuotedPreAckRequest"
+
+                if best_pick_ist is None and subject_core:
+                    quoted_pick = None
+                    raw_paths = _find_eml_paths_by_id(row_id_tokens)
+                    for path in raw_paths:
+                        header_summary = _get_eml_header_summary(path)
+                        if not header_summary:
+                            continue
+                        s_core = _task_subject_core(header_summary.get("subject_raw") or "")
+                        if not s_core or s_core != subject_core:
+                            continue
+                        for from_line, sent_ist, q_subj in _get_quoted_blocks_from_eml_path(path):
+                            sent_minute = sent_ist.replace(second=0, microsecond=0) if sent_ist else None
+                            if not _task_pick_in_window(sent_ist, sent_minute):
+                                continue
+                            if (not task_same_all) and sent_minute <= created_minute:
+                                continue
+                            q_core = _task_subject_core(q_subj or "")
+                            if not q_core or q_core != subject_core:
+                                continue
+                            is_ess = _quoted_from_line_is_ess(from_line)
+                            if is_ess is not False:
+                                continue
+                            if quoted_pick is None or sent_ist > quoted_pick[0]:
+                                quoted_pick = (sent_ist, path)
+                    if quoted_pick:
+                        best_pick_ist = quoted_pick[0]
+                        best_pick_src = "PARSED_FROM_RAW_QUOTED_TASK"
+                        best_pick_note = "TaskQuotedPreAckRequestRaw"
+
+                best_pick_minute = best_pick_ist.replace(second=0, microsecond=0) if best_pick_ist else None
+                if not best_pick_ist:
+                    continue
+                if task_same_all:
+                    if best_pick_minute >= ack_minute:
+                        continue
+                else:
+                    if best_pick_minute <= created_minute or best_pick_minute > ack_minute:
+                        continue
+
+                t_c = _format_time(best_pick_ist)
+                if not t_c:
+                    continue
+                row_vals["Created Date & Time"] = t_c
+                ws.cell(row_idx, created_col).value = t_c
+                if list_index < len(debug_rows):
+                    debug_rows[list_index]["CreatedSource"] = best_pick_src
+                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {best_pick_note}"
+                if (ack_minute - best_pick_minute) <= timedelta(minutes=16):
+                    _set_row_fill(row_idx, clear_fill)
+                    if list_index < len(debug_rows):
+                        debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+
+            # Task rows should not finish with all three timestamps equal when we
+            # can see a later same-episode reply. Recover response/resolved from
+            # the first later non-requester message and the latest later thread
+            # activity within a narrow window.
+            for state in row_states:
+                list_index = state.get("list_index")
+                row_idx = state.get("row_index")
+                if list_index is None or list_index >= len(automation_rows) or not row_idx:
+                    continue
+                if state.get("is_dep_req") or state.get("is_dep_succ"):
+                    continue
+
+                row_vals = automation_rows[list_index]
+                requester = state.get("requester") or ""
+                subject_norm = (state.get("subject_norm") or "").lower()
+                created_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+                ack_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+                resolved_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time"))
+                created_ist = _to_ist(created_dt) if created_dt else None
+                ack_ist = _to_ist(ack_dt) if ack_dt else None
+                resolved_ist = _to_ist(resolved_dt) if resolved_dt else None
+                if not (created_ist and ack_ist and resolved_ist):
+                    continue
+                created_minute = created_ist.replace(second=0, microsecond=0)
+                ack_minute = ack_ist.replace(second=0, microsecond=0)
+                resolved_minute = resolved_ist.replace(second=0, microsecond=0)
+                if not (created_minute == ack_minute == resolved_minute):
+                    continue
+
+                subject_core = _task_subject_core(subject_norm)
+                if not subject_core:
+                    continue
+                row_id_tokens = _id_like_tokens(subject_norm)
+                if not row_id_tokens:
+                    row_id_tokens = _id_like_tokens(row_vals.get("Description") or state.get("description") or "")
+                if not row_id_tokens:
+                    continue
+
+                upper_bound = created_ist + timedelta(hours=48)
+                later_msgs = []
+                for e in task_msgs_by_core.get(subject_core, []):
+                    e_ist = _email_ist(e)
+                    if not e_ist or e_ist <= created_ist or e_ist > upper_bound:
+                        continue
+                    if _system_like_sender(e):
+                        continue
+                    later_msgs.append(e)
+
+                if not later_msgs and row_id_tokens:
+                    for subject_raw, sent_dt, sender_email, sender_name in _raw_task_candidates_for_ids(row_id_tokens):
+                        sent_ist = _to_ist(sent_dt)
+                        if not sent_ist or sent_ist <= created_ist or sent_ist > upper_bound:
+                            continue
+                        s_core = _task_subject_core(subject_raw)
+                        if not s_core or s_core != subject_core:
+                            continue
+                        later_msgs.append(SimpleNamespace(
+                            sent_time=sent_dt,
+                            subject=subject_raw,
+                            sender_email=sender_email,
+                            sender_name=sender_name,
+                            body="",
+                            body_html="",
+                        ))
+
+                if not later_msgs:
+                    continue
+
+                later_msgs.sort(key=lambda e: _email_ist(e))
+                response_pick = None
+                for e in later_msgs:
+                    if requester and _req_match(e, requester):
+                        continue
+                    response_pick = e
+                    break
+                if not response_pick:
+                    continue
+
+                response_pick_ist = _email_ist(response_pick)
+                if not response_pick_ist:
+                    continue
+
+                resolved_pool = [
+                    e for e in later_msgs
+                    if _email_ist(e) and _email_ist(e) >= response_pick_ist
+                ]
+                resolved_pick = resolved_pool[-1] if resolved_pool else response_pick
+                resolved_pick_ist = _email_ist(resolved_pick)
+                if not resolved_pick_ist:
+                    resolved_pick = response_pick
+                    resolved_pick_ist = response_pick_ist
+
+                t_a = _format_time(response_pick_ist)
+                t_r = _format_time(resolved_pick_ist)
+                if not t_a or not t_r:
+                    continue
+
+                row_vals["Actual Response Date & Time"] = t_a
+                row_vals["Actual Resolved Date & Time"] = t_r
+                ws.cell(row_idx, response_col).value = t_a
+                ws.cell(row_idx, resolved_col).value = t_r
+                if list_index < len(debug_rows):
+                    debug_rows[list_index]["AckSource"] = response_pick.sender_email or response_pick.sender_name or "TASK_SAME_ALL_RECOVERY"
+                    debug_rows[list_index]["ResolvedSource"] = resolved_pick.sender_email or resolved_pick.sender_name or "TASK_SAME_ALL_RECOVERY"
+                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; TaskSameAllRecovered"
+                if (response_pick_ist.replace(second=0, microsecond=0) - created_minute) <= timedelta(minutes=16):
+                    _set_row_fill(row_idx, clear_fill)
+                    if list_index < len(debug_rows):
+                        debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+
+        # Final blue cleanup validator:
+        # If a row still has blue fill but its current Created->Response gap is no
+        # longer blue-worthy, clear blue at the end so earlier stale markers do not
+        # linger after later repairs.
+        for state in row_states:
+            list_index = state.get("list_index")
+            row_idx = state.get("row_index")
+            if list_index is None or list_index >= len(automation_rows) or not row_idx:
+                continue
+            if not _row_has_blue_fill(row_idx):
+                continue
+            row_vals = automation_rows[list_index]
+            c_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+            a_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+            r_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time"))
+            if not (c_dt and a_dt):
+                continue
+            c_ist = _to_ist(c_dt)
+            a_ist = _to_ist(a_dt)
+            r_ist = _to_ist(r_dt) if r_dt else a_ist
+            if not (c_ist and a_ist and r_ist):
+                continue
+            c_min = c_ist.replace(second=0, microsecond=0)
+            a_min = a_ist.replace(second=0, microsecond=0)
+            r_min = r_ist.replace(second=0, microsecond=0)
+            if workbook_kind == "task_business" and c_min == a_min == r_min:
+                continue
+            if a_min < c_min or r_min < a_min:
+                continue
+            if (a_min - c_min) > timedelta(minutes=16):
+                continue
+            _set_row_fill(row_idx, clear_fill)
+            if list_index < len(debug_rows):
+                notes_now = debug_rows[list_index].get("Notes", "")
+                if "BlueClearedFinalValidator" not in notes_now:
+                    debug_rows[list_index]["Notes"] = f"{notes_now}; BlueClearedFinalValidator"
+
+    workbook_timer = time.perf_counter()
+    logger.log(f"[INFO] Starting worksheet fill: {_workbook_label(workbook_kind)} ({template_path.name})")
     fill_result = fill_template(
         template_path=template_path,
-        output_path=output_dir / f"{template_path.stem}_filled.xlsx",
+        output_path=template_path,
         row_resolver=resolve_row,
         logger=logger,
         post_process=_sequence_ordering_pass,
+        sheet_name="LOG",
+    )
+    logger.log(
+        f"[INFO] Finished worksheet fill: {_workbook_label(workbook_kind)} "
+        f"in {time.perf_counter() - workbook_timer:.2f}s"
     )
 
+    csv_suffix = re.sub(r"[^a-z0-9]+", "_", template_path.stem.lower()).strip("_") or "output"
+
     write_csv(
-        output_dir / "automation_output.csv",
+        output_dir / f"automation_output_{csv_suffix}.csv",
         automation_rows,
         [
             "Description",
             "Requester",
             "Environment",
+            "Category Type",
             "Created Date & Time",
             "Actual Response Date & Time",
             "Actual Resolved Date & Time",
@@ -11014,7 +11762,7 @@ def main() -> int:
     )
 
     write_csv(
-        output_dir / "debug_subjects.csv",
+        output_dir / f"debug_subjects_{csv_suffix}.csv",
         debug_rows,
         [
             "Description",

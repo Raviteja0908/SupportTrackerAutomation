@@ -16,11 +16,41 @@ if ($env:EXCLUDE_CREATION_TIME) {
 Write-Host "Outlook export (PST append) - copy only, no move"
 Write-Host ("Start time: {0}" -f (Get-Date))
 Write-Host "Export script version: 2026-02-05-1"
+Write-Host "Prompt commands: type back to go to the previous step when supported, or quit to exit."
 Write-Host ""
 
+$Script:BackToken = "__SCRIPT_BACK__"
+$Script:DefaultScriptsDir = $PSScriptRoot
+$Script:DefaultTrackerRoot = Split-Path -Parent $Script:DefaultScriptsDir
+$Script:DefaultPstDir = Join-Path $Script:DefaultTrackerRoot "PstFiles"
+$Script:DefaultOutputDir = Join-Path $Script:DefaultTrackerRoot "DockerOutput"
+$Script:DefaultPstPath = Join-Path $Script:DefaultPstDir "export_filtered.pst"
+
+foreach ($dir in @($Script:DefaultTrackerRoot, $Script:DefaultScriptsDir, $Script:DefaultPstDir, $Script:DefaultOutputDir)) {
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+}
+
 Write-Host "Connecting to Outlook..."
+$startupPstHint = if ([string]::IsNullOrWhiteSpace($OutputPstPath)) { $Script:DefaultPstPath } else { $OutputPstPath }
+if ($startupPstHint -match '^[\\/]' -and $startupPstHint -notmatch '^[A-Za-z]:') {
+    $defaultDrive = [System.IO.Path]::GetPathRoot($Script:DefaultTrackerRoot).TrimEnd('\')
+    $startupPstHint = "$defaultDrive$startupPstHint"
+}
+$outlookReadyHintTimer = $null
+if (-not (Test-Path $startupPstHint)) {
+    $timerCallback = [System.Threading.TimerCallback]{
+        param($state)
+        Write-Host "Outlook seems to be waiting on a missing export PST popup. Click OK once, then the script will continue."
+    }
+    $outlookReadyHintTimer = New-Object System.Threading.Timer($timerCallback, $null, 8000, [System.Threading.Timeout]::Infinite)
+}
 $outlook = New-Object -ComObject Outlook.Application
 $namespace = $outlook.GetNamespace("MAPI")
+if ($outlookReadyHintTimer) {
+    $outlookReadyHintTimer.Dispose()
+}
 
 $fastExport = $true
 if ($env:FAST_EXPORT) {
@@ -58,15 +88,47 @@ function Split-InboxCombinedPath {
     return $parts
 }
 
+function Read-ScriptInput {
+    param(
+        [string]$Prompt,
+        [switch]$AllowBlank,
+        [switch]$AllowBack
+    )
+    while ($true) {
+        $value = Read-Host $Prompt
+        if ($null -eq $value) { $value = "" }
+        $trimmed = $value.Trim()
+        if ($trimmed -ieq ":quit" -or $trimmed -ieq ":exit" -or $trimmed -ieq "quit" -or $trimmed -ieq "exit") {
+            throw "User cancelled export."
+        }
+        if ($trimmed -ieq ":back" -or $trimmed -ieq "back") {
+            if ($AllowBack) {
+                return $Script:BackToken
+            }
+            Write-Host "Back is not available for this prompt. Type quit to exit."
+            continue
+        }
+        if (-not $AllowBlank -and [string]::IsNullOrWhiteSpace($value)) {
+            Write-Host "Input cannot be empty. Type back to return when supported, or quit to exit."
+            continue
+        }
+        return $value
+    }
+}
+
 function Read-DateValue {
     param(
         [string]$Label,
-        [string]$Initial
+        [string]$Initial,
+        [switch]$AllowBack
     )
     $current = $Initial
     while ($true) {
         if ([string]::IsNullOrWhiteSpace($current)) {
-            $current = Read-Host "$Label (DD-MM-YYYY)"
+            $current = Read-ScriptInput -Prompt "$Label (DD-MM-YYYY)" -AllowBack:$AllowBack
+        }
+        if ($current -eq $Script:BackToken) {
+            return @($Script:BackToken, $null)
         }
         $dt = [DateTime]::MinValue
         $ok = [DateTime]::TryParseExact($current, "dd-MM-yyyy", $null, [Globalization.DateTimeStyles]::None, [ref]$dt)
@@ -78,14 +140,114 @@ function Read-DateValue {
     }
 }
 
+function Test-ProtectedStoreName {
+    param([string]$text)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $false }
+    return $text.ToLower().Contains("@invenio-solutions.com")
+}
+
+function Get-SafeStores {
+    $stores = @()
+    $count = 0
+    try {
+        $count = [int]$namespace.Stores.Count
+    } catch {
+        return @()
+    }
+    for ($i = 1; $i -le $count; $i++) {
+        try {
+            $store = $namespace.Stores.Item($i)
+            if ($store) {
+                $stores += $store
+            }
+        } catch {
+            # Skip broken/stale entries without failing the whole export.
+            continue
+        }
+    }
+    return $stores
+}
+
+function Remove-StaleManagedPstStores {
+    param(
+        [string]$ManagedDir,
+        [string]$TargetPstPath = ""
+    )
+    $managedDirLower = ""
+    if (-not [string]::IsNullOrWhiteSpace($ManagedDir)) {
+        $managedDirLower = [System.IO.Path]::GetFullPath($ManagedDir).TrimEnd('\').ToLower()
+    }
+    $targetLower = ""
+    if (-not [string]::IsNullOrWhiteSpace($TargetPstPath)) {
+        try {
+            $targetLower = [System.IO.Path]::GetFullPath($TargetPstPath).ToLower()
+        } catch {
+            $targetLower = $TargetPstPath.ToLower()
+        }
+    }
+
+    foreach ($store in (Get-SafeStores)) {
+        $displayName = $null
+        $root = $null
+        $rootName = $null
+        $storePath = $null
+        try { $displayName = [string]$store.DisplayName } catch { $displayName = $null }
+        try {
+            $root = $store.GetRootFolder()
+            if ($root) { $rootName = [string]$root.Name }
+        } catch {
+            $root = $null
+            $rootName = $null
+        }
+        try { $storePath = [string]$store.FilePath } catch { $storePath = $null }
+
+        if (Test-ProtectedStoreName $displayName) { continue }
+        if (Test-ProtectedStoreName $rootName) { continue }
+        if (Test-ProtectedStoreName $storePath) { continue }
+        if ([string]::IsNullOrWhiteSpace($storePath)) { continue }
+        if (-not $storePath.ToLower().EndsWith(".pst")) { continue }
+
+        $storePathLower = ""
+        $storeDirLower = ""
+        try {
+            $storePathLower = [System.IO.Path]::GetFullPath($storePath).ToLower()
+            $storeDirLower = [System.IO.Path]::GetDirectoryName($storePathLower)
+        } catch {
+            $storePathLower = $storePath.ToLower()
+            $storeDirLower = (Split-Path -Parent $storePath).ToLower()
+        }
+
+        $matchesTarget = (-not [string]::IsNullOrWhiteSpace($targetLower)) -and ($storePathLower -eq $targetLower)
+        $inManagedDir = (-not [string]::IsNullOrWhiteSpace($managedDirLower)) -and ($storeDirLower -eq $managedDirLower)
+        if (-not $matchesTarget -and -not $inManagedDir) { continue }
+        if (Test-Path $storePath) { continue }
+        if (-not $root) { continue }
+
+        try {
+            $namespace.RemoveStore($root)
+            Write-Host ("Removed stale Outlook PST store: {0}" -f $storePath)
+        } catch {
+            Write-Host ("WARNING: Unable to remove stale Outlook PST store: {0}" -f $storePath)
+        }
+    }
+}
+
+Remove-StaleManagedPstStores -ManagedDir $Script:DefaultPstDir
+
 # Build store lookup (display name + root name) for shared mailboxes
 $storeInfos = @()
-foreach ($s in $namespace.Stores) {
+foreach ($s in (Get-SafeStores)) {
     $root = $null
+    $displayName = $null
     try { $root = $s.GetRootFolder() } catch { $root = $null }
+    try { $displayName = $s.DisplayName } catch { $displayName = $null }
+    if (-not $displayName -and -not $root) {
+        # Ignore stale/broken Outlook store entries safely.
+        continue
+    }
     $storeInfos += [PSCustomObject]@{
         Store       = $s
-        DisplayName = $s.DisplayName
+        DisplayName = $displayName
         RootFolder  = $root
         RootName    = if ($root) { $root.Name } else { $null }
     }
@@ -165,6 +327,28 @@ function Get-StoreInboxFolder {
     return $null
 }
 
+function Find-StoreByPath {
+    param([string]$targetPath)
+    if ([string]::IsNullOrWhiteSpace($targetPath)) { return $null }
+    $targetLower = $targetPath.ToLower()
+    foreach ($store in (Get-SafeStores)) {
+        $storePath = $null
+        try {
+            $storePath = $store.FilePath
+        } catch {
+            # Ignore stale/broken Outlook store entries safely.
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($storePath)) {
+            continue
+        }
+        if ($storePath.ToLower() -eq $targetLower) {
+            return $store
+        }
+    }
+    return $null
+}
+
 function Resolve-ChildPath {
     param(
         [object]$root,
@@ -210,37 +394,12 @@ function Resolve-RelativeInboxAcrossStores {
     return $null
 }
 
-function Debug-Print-InboxChildren {
-    param(
-        [string]$storeName,
-        [object]$inboxFolder
-    )
-    if (-not $inboxFolder) { return }
-    $limit = 50
-    $names = @()
-    foreach ($f in @($inboxFolder.Folders)) {
-        if ($names.Count -ge $limit) { break }
-        $names += $f.Name
-    }
-    Write-Host ("[DEBUG] Inbox children for {0} (showing up to {1}): {2}" -f $storeName, $limit, ($names -join ", "))
-}
-
 function Debug-Resolve-FolderNotFound {
     param(
         [string]$path,
         [string[]]$relativeParts
     )
-    Write-Host ("[DEBUG] Folder NOT FOUND: {0}" -f $path)
-    Write-Host ("[DEBUG] Relative parts: {0}" -f ($relativeParts -join " | "))
-    Write-Host "[DEBUG] Stores available:"
-    foreach ($info in $storeInfos) {
-        $name = if ($info.DisplayName) { $info.DisplayName } else { $info.RootName }
-        Write-Host ("[DEBUG]  - {0}" -f $name)
-        $inbox = $null
-        if ($info.DisplayName) { $inbox = Get-StoreInboxFolder -storeName $info.DisplayName }
-        if (-not $inbox -and $info.RootName) { $inbox = Get-StoreInboxFolder -storeName $info.RootName }
-        Debug-Print-InboxChildren -storeName $name -inboxFolder $inbox
-    }
+    return
 }
 
 function Enumerate-Folders {
@@ -248,11 +407,14 @@ function Enumerate-Folders {
         [object]$root,
         [string]$prefix
     )
-    foreach ($f in @($root.Folders)) {
-        $path = if ([string]::IsNullOrWhiteSpace($prefix)) { $f.Name } else { "$prefix\\$($f.Name)" }
-        [PSCustomObject]@{ Folder = $f; Path = $path }
-        foreach ($child in (Enumerate-Folders -root $f -prefix $path)) {
-            $child
+    $stack = New-Object System.Collections.Stack
+    $stack.Push([PSCustomObject]@{ Folder = $root; Prefix = $prefix })
+    while ($stack.Count -gt 0) {
+        $current = $stack.Pop()
+        foreach ($f in @($current.Folder.Folders)) {
+            $path = if ([string]::IsNullOrWhiteSpace($current.Prefix)) { $f.Name } else { "$($current.Prefix)\\$($f.Name)" }
+            [PSCustomObject]@{ Folder = $f; Path = $path }
+            $stack.Push([PSCustomObject]@{ Folder = $f; Prefix = $path })
         }
     }
 }
@@ -282,44 +444,214 @@ function Print-FolderTree {
         [int]$depth,
         [int]$maxDepth
     )
-    if ($depth -ge $maxDepth) { return }
-    foreach ($f in @($root.Folders)) {
-        $path = if ([string]::IsNullOrWhiteSpace($prefix)) { $f.Name } else { "$prefix\\$($f.Name)" }
-        Write-Host ("{0}{1}" -f (" " * ($depth * 2)), $path)
-        Print-FolderTree -root $f -prefix $path -depth ($depth + 1) -maxDepth $maxDepth
+    $stack = New-Object System.Collections.Stack
+    $stack.Push([PSCustomObject]@{ Folder = $root; Prefix = $prefix; Depth = $depth })
+    while ($stack.Count -gt 0) {
+        $current = $stack.Pop()
+        if ($current.Depth -ge $maxDepth) { continue }
+        $children = @($current.Folder.Folders)
+        for ($i = $children.Count - 1; $i -ge 0; $i--) {
+            $f = $children[$i]
+            $path = if ([string]::IsNullOrWhiteSpace($current.Prefix)) { $f.Name } else { "$($current.Prefix)\\$($f.Name)" }
+            Write-Host ("{0}{1}" -f (" " * ($current.Depth * 2)), $path)
+            $stack.Push([PSCustomObject]@{ Folder = $f; Prefix = $path; Depth = ($current.Depth + 1) })
+        }
     }
 }
 
-# Optional: list folder paths to help users pick correct paths (before asking for inputs)
-$listChoice = Read-Host "List folder paths for a mailbox? (y/N)"
-if ($listChoice -match '^(y|yes)$') {
-    $mb = Read-Host "Mailbox/store name (exact as listed above)"
-    $storeInfo = if (-not [string]::IsNullOrWhiteSpace($mb)) { Get-StoreInfo -storeName $mb } else { $null }
-    if ($storeInfo -and $storeInfo.RootFolder) {
-        $defaultMailboxName = $mb
-        $depthStr = Read-Host "Max depth to list (default 4)"
-        if (-not ($depthStr -match '^\d+$')) { $depthStr = '4' }
-        $maxDepth = [int]$depthStr
-        $inboxOnly = Read-Host "Start at Inbox only? (y/N)"
-        if ($inboxOnly -match '^(y|yes)$') {
-            $root = Get-StoreInboxFolder -storeName $mb
-            $defaultInboxFolder = $root
-            Write-Host ("Folder paths under: {0}\\Inbox" -f $mb)
-            if ($root) {
-                Print-FolderTree -root $root -prefix ("$mb\\Inbox") -depth 0 -maxDepth $maxDepth
-            } else {
-                Write-Host "Inbox not found for that mailbox."
+function Prompt-InteractiveExportDetails {
+    param(
+        [string]$InitialStartDate,
+        [string]$InitialEndDate,
+        [string]$InitialOutputPstPath
+    )
+
+    $listChoice = ""
+    $mb = ""
+    $inboxOnly = ""
+    $usedListing = $false
+    $folderCount = 0
+    $folderPathsLocal = @()
+    $folderIndex = 1
+    $startDateLocal = $InitialStartDate
+    $startDateObjLocal = $null
+    $endDateLocal = $InitialEndDate
+    $endDateObjLocal = $null
+    $outputPstLocal = $InitialOutputPstPath
+    $state = "listChoice"
+    $maxDepth = 6
+
+    while ($true) {
+        switch ($state) {
+            "listChoice" {
+                $listChoice = Read-ScriptInput -Prompt "List folder paths for a mailbox? (y/N)" -AllowBlank -AllowBack
+                if ($listChoice -eq $Script:BackToken) {
+                    Write-Host "Back is not available before the first prompt."
+                    continue
+                }
+                if ($listChoice -match '^(y|yes)$') {
+                    $usedListing = $true
+                    $state = "mailbox"
+                } else {
+                    $usedListing = $false
+                    $state = "count"
+                }
+                continue
             }
-        } else {
-            Write-Host ("Folder paths under: {0}" -f $mb)
-            Print-FolderTree -root $storeInfo.RootFolder -prefix $mb -depth 0 -maxDepth $maxDepth
+            "mailbox" {
+                $mb = Read-ScriptInput -Prompt "Mailbox/store name (exact as listed above)" -AllowBlank -AllowBack
+                if ($mb -eq $Script:BackToken) {
+                    $state = "listChoice"
+                    continue
+                }
+                $storeInfo = if (-not [string]::IsNullOrWhiteSpace($mb)) { Get-StoreInfo -storeName $mb } else { $null }
+                if (-not ($storeInfo -and $storeInfo.RootFolder)) {
+                    Write-Host "Store not found. Type back to return, or quit to exit."
+                    continue
+                }
+                $defaultMailboxName = $mb
+                $state = "inboxOnly"
+                continue
+            }
+            "inboxOnly" {
+                $inboxOnly = Read-ScriptInput -Prompt "Start at Inbox only? (y/N)" -AllowBlank -AllowBack
+                if ($inboxOnly -eq $Script:BackToken) {
+                    $state = "mailbox"
+                    continue
+                }
+                if ($inboxOnly -match '^(y|yes)$') {
+                    $root = Get-StoreInboxFolder -storeName $mb
+                    $defaultInboxFolder = $root
+                    Write-Host ("Folder paths under: {0}\\Inbox" -f $mb)
+                    if ($root) {
+                        Print-FolderTree -root $root -prefix ("$mb\\Inbox") -depth 0 -maxDepth $maxDepth
+                    } else {
+                        Write-Host "Inbox not found for that mailbox."
+                    }
+                } else {
+                    $storeInfo = Get-StoreInfo -storeName $mb
+                    Write-Host ("Folder paths under: {0}" -f $mb)
+                    Print-FolderTree -root $storeInfo.RootFolder -prefix $mb -depth 0 -maxDepth $maxDepth
+                }
+                $state = "count"
+                continue
+            }
+            "count" {
+                $countStr = Read-ScriptInput -Prompt 'How many folders to export?' -AllowBack
+                if ($countStr -eq $Script:BackToken) {
+                    if ($usedListing) {
+                        $state = "inboxOnly"
+                    } else {
+                        $state = "listChoice"
+                    }
+                    continue
+                }
+                if (-not ($countStr -match '^\d+$') -or [int]$countStr -le 0) {
+                    Write-Host 'Please enter a valid positive number.'
+                    continue
+                }
+                $folderCount = [int]$countStr
+                $folderPathsLocal = New-Object string[] $folderCount
+                $folderIndex = 1
+                $state = "folderPath"
+                continue
+            }
+            "folderPath" {
+                $pRaw = Read-ScriptInput -Prompt ("Folder $folderIndex path (under Inbox)") -AllowBack
+                if ($pRaw -eq $Script:BackToken) {
+                    if ($folderIndex -gt 1) {
+                        $folderIndex -= 1
+                        $folderPathsLocal[$folderIndex - 1] = $null
+                        Write-Host ("Back to Folder {0} path." -f $folderIndex)
+                    } else {
+                        $state = "count"
+                    }
+                    continue
+                }
+                $p = Normalize-UserPath -raw $pRaw
+                if ([string]::IsNullOrWhiteSpace($p)) {
+                    Write-Host 'Please enter a valid path like Inbox\\My Team.'
+                    continue
+                }
+                $parts = Split-InboxCombinedPath $p
+                if ($parts.Count -gt 1) {
+                    Write-Host 'It looks like multiple paths were pasted. Please enter only one path for this item.'
+                    continue
+                }
+                $folderPathsLocal[$folderIndex - 1] = $p
+                if ($folderIndex -lt $folderCount) {
+                    $folderIndex += 1
+                    continue
+                }
+                $folderPathsLocal = $folderPathsLocal | Where-Object { $_ -and $_.Trim() -ne '' }
+                $state = "startDate"
+                continue
+            }
+            "startDate" {
+                $result = Read-DateValue -Label "Start date" -Initial $startDateLocal -AllowBack
+                if ($result[0] -eq $Script:BackToken) {
+                    if ($folderCount -gt 0) {
+                        $folderIndex = $folderCount
+                        $state = "folderPath"
+                    } else {
+                        $state = "count"
+                    }
+                    $startDateLocal = ""
+                    continue
+                }
+                $startDateLocal = $result[0]
+                $startDateObjLocal = $result[1]
+                $state = "endDate"
+                continue
+            }
+            "endDate" {
+                $result = Read-DateValue -Label "End date" -Initial $endDateLocal -AllowBack
+                if ($result[0] -eq $Script:BackToken) {
+                    $startDateLocal = ""
+                    $endDateLocal = ""
+                    $state = "startDate"
+                    continue
+                }
+                $endDateLocal = $result[0]
+                $endDateObjLocal = $result[1]
+                $state = "outputPst"
+                continue
+            }
+            "outputPst" {
+                if ([string]::IsNullOrWhiteSpace($outputPstLocal)) {
+                    $outputPstLocal = $Script:DefaultPstPath
+                    Write-Host ("Using default PST path: {0}" -f $outputPstLocal)
+                }
+                $state = "confirmDetails"
+                continue
+            }
+            "confirmDetails" {
+                Write-Host ("Selected start date: {0}" -f $startDateLocal)
+                Write-Host ("Selected end date: {0}" -f $endDateLocal)
+                Write-Host ("Selected PST path: {0}" -f $outputPstLocal)
+                $confirm = Read-ScriptInput -Prompt "Press Enter to continue, or type back to change the end date" -AllowBlank -AllowBack
+                if ($confirm -eq $Script:BackToken) {
+                    $endDateLocal = ""
+                    $state = "endDate"
+                    continue
+                }
+                return [PSCustomObject]@{
+                    FolderPaths       = @($folderPathsLocal)
+                    StartDate         = $startDateLocal
+                    StartDateObj      = $startDateObjLocal
+                    EndDate           = $endDateLocal
+                    EndDateObj        = $endDateObjLocal
+                    OutputPstPath     = $outputPstLocal
+                    DefaultMailbox    = $defaultMailboxName
+                    DefaultInbox      = $defaultInboxFolder
+                }
+            }
         }
-    } else {
-        Write-Host "Store not found. Skipping folder listing."
     }
 }
 
 $folderPaths = @()
+$datesCollected = $false
 if (-not [string]::IsNullOrWhiteSpace($FolderPathsInput)) {
     # Split on comma/semicolon/newline, trim whitespace
     $rawPaths = ($FolderPathsInput -split '[,;\r\n]+' ) | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
@@ -335,37 +667,16 @@ if (-not [string]::IsNullOrWhiteSpace($FolderPathsInput)) {
     }
 } else {
     Write-Host 'Enter Outlook folder paths under Inbox.'
-    $countStr = Read-Host 'How many folders to export?'
-    while (-not ($countStr -match '^\d+$') -or [int]$countStr -le 0) {
-        Write-Host 'Please enter a valid positive number.'
-        $countStr = Read-Host 'How many folders to export?'
-    }
-    $count = [int]$countStr
-    $folderPaths = New-Object string[] $count
-    for ($i = 1; $i -le $count; $i++) {
-        while ($true) {
-            $pRaw = Read-Host ("Folder $i path (under Inbox)")
-            if ([string]::IsNullOrWhiteSpace($pRaw)) {
-                Write-Host 'Path cannot be empty.'
-                continue
-            }
-            $p = Normalize-UserPath -raw $pRaw
-            if ([string]::IsNullOrWhiteSpace($p)) {
-                Write-Host 'Please enter a valid path like Inbox\\My Team.'
-                continue
-            }
-            $parts = Split-InboxCombinedPath $p
-            if ($parts.Count -gt 1) {
-                Write-Host 'It looks like multiple paths were pasted. Please enter only one path for this item.'
-                continue
-            }
-            $folderPaths[$i-1] = $p
-            Write-Host ("[DEBUG] Added path: {0}" -f $p)
-            break
-        }
-    }
-    # Remove any empty slots just in case
-    $folderPaths = $folderPaths | Where-Object { $_ -and $_.Trim() -ne '' }
+    $interactive = Prompt-InteractiveExportDetails -InitialStartDate $StartDate -InitialEndDate $EndDate -InitialOutputPstPath $OutputPstPath
+    $folderPaths = @($interactive.FolderPaths)
+    $StartDate = $interactive.StartDate
+    $startDateObj = $interactive.StartDateObj
+    $EndDate = $interactive.EndDate
+    $endDateObj = $interactive.EndDateObj
+    $OutputPstPath = $interactive.OutputPstPath
+    if ($interactive.DefaultMailbox) { $defaultMailboxName = $interactive.DefaultMailbox }
+    if ($interactive.DefaultInbox) { $defaultInboxFolder = $interactive.DefaultInbox }
+    $datesCollected = $true
 }
 
 # Final normalize: split any combined Inbox paths
@@ -410,19 +721,30 @@ for ($i = 0; $i -lt $folderPaths.Count; $i++) {
     Write-Host (" {0}. {1}" -f ($i + 1), $folderPaths[$i])
 }
 
-$result = Read-DateValue -Label "Start date" -Initial $StartDate
-$StartDate = $result[0]
-$startDateObj = $result[1]
+if (-not $datesCollected) {
+    while ($true) {
+        $result = Read-DateValue -Label "Start date" -Initial $StartDate
+        if ($result[0] -eq $Script:BackToken) {
+            Write-Host "Back is not available before Start date."
+            $StartDate = ""
+            continue
+        }
+        $StartDate = $result[0]
+        $startDateObj = $result[1]
 
-$result = Read-DateValue -Label "End date" -Initial $EndDate
-$EndDate = $result[0]
-$endDateObj = $result[1]
-
-if ([string]::IsNullOrWhiteSpace($OutputPstPath)) {
-    $defaultPst = "D:\\Support_Tracker\\PstFiles\\export_filtered.pst"
-    $OutputPstPath = Read-Host ("Output PST path (default: {0})" -f $defaultPst)
+        $result = Read-DateValue -Label "End date" -Initial $EndDate -AllowBack
+        if ($result[0] -eq $Script:BackToken) {
+            $StartDate = ""
+            $EndDate = ""
+            continue
+        }
+        $EndDate = $result[0]
+        $endDateObj = $result[1]
+        break
+    }
     if ([string]::IsNullOrWhiteSpace($OutputPstPath)) {
-        $OutputPstPath = $defaultPst
+        $OutputPstPath = $Script:DefaultPstPath
+        Write-Host ("Using default PST path: {0}" -f $OutputPstPath)
     }
 }
 
@@ -432,7 +754,8 @@ if ([string]::IsNullOrWhiteSpace($OutputPstPath)) {
 
 # Auto-fix missing drive (e.g. \Support_Tracker\...)
 if ($OutputPstPath -match '^[\\/]' -and $OutputPstPath -notmatch '^[A-Za-z]:') {
-    $OutputPstPath = "D:$OutputPstPath"
+    $defaultDrive = [System.IO.Path]::GetPathRoot($Script:DefaultTrackerRoot).TrimEnd('\')
+    $OutputPstPath = "$defaultDrive$OutputPstPath"
     Write-Host ("WARNING: Drive letter missing; using {0}" -f $OutputPstPath)
 }
 $startDateObj = $startDateObj.Date
@@ -448,18 +771,20 @@ $outDir = Split-Path -Parent $OutputPstPath
 if ($outDir -and -not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir | Out-Null
 }
-if ($outDir -ne "D:\Support_Tracker\PstFiles") {
-    Write-Host ("WARNING: PST path is not in D:\Support_Tracker\PstFiles -> {0}" -f $outDir)
-    Write-Host "For team consistency, please use: D:\\Support_Tracker\\PstFiles"
+if ($outDir -ne $Script:DefaultPstDir) {
+    Write-Host ("WARNING: PST path is not in {0} -> {1}" -f $Script:DefaultPstDir, $outDir)
+    Write-Host ("For team consistency, please use: {0}" -f $Script:DefaultPstDir)
 }
+
+Remove-StaleManagedPstStores -ManagedDir $outDir -TargetPstPath $OutputPstPath
 
 Write-Host "Opening/creating PST at: $OutputPstPath"
 Write-Host "Checking if PST is already attached..."
-$destStore = $namespace.Stores | Where-Object { $_.FilePath -and $_.FilePath.ToLower() -eq $OutputPstPath.ToLower() }
+$destStore = Find-StoreByPath -targetPath $OutputPstPath
 if ($destStore) {
     Write-Host "PST already attached. Skipping AddStore."
 } else {
-    try {
+    $addStoreAction = {
         if ($namespace.PSObject.Methods.Name -contains "AddStoreEx") {
             Write-Host "Using AddStoreEx (Unicode PST)..."
             $namespace.AddStoreEx($OutputPstPath, 3) | Out-Null
@@ -467,15 +792,16 @@ if ($destStore) {
             Write-Host "Using AddStore..."
             $namespace.AddStore($OutputPstPath) | Out-Null
         }
+    }
+    try {
+        & $addStoreAction
     } catch {
-        throw "AddStore failed: $($_.Exception.Message)"
+        $firstError = $_.Exception.Message
+        throw ("AddStore failed: {0}`nManual action needed: detach and remove the stale export PST from Outlook Data Files, then run again.`nSafe target only: {1}`nNever remove anything containing @invenio-solutions.com." -f $firstError, $OutputPstPath)
     }
 }
 
-$destStore = $namespace.Stores | Where-Object { $_.FilePath -eq $OutputPstPath }
-if (-not $destStore) {
-    $destStore = $namespace.Stores | Where-Object { $_.FilePath.ToLower() -eq $OutputPstPath.ToLower() }
-}
+$destStore = Find-StoreByPath -targetPath $OutputPstPath
 if (-not $destStore) {
     throw "Unable to open PST store: $OutputPstPath"
 }
@@ -549,13 +875,7 @@ function Resolve-SourceFolder {
             if ($leaf) {
                 $candidates = Find-FolderByLeafNameAcrossStores -leafName $leaf
                 if ($candidates.Count -eq 1) {
-                    Write-Host ("[DEBUG] Fallback matched leaf '{0}' at: {1}" -f $leaf, $candidates[0].Path)
                     return $candidates[0].Folder
-                } elseif ($candidates.Count -gt 1) {
-                    Write-Host ("[DEBUG] Multiple fallback matches for leaf '{0}':" -f $leaf)
-                    foreach ($c in $candidates) {
-                        Write-Host ("[DEBUG]  - {0}" -f $c.Path)
-                    }
                 }
             }
             Debug-Resolve-FolderNotFound -path $path -relativeParts $relativeParts
@@ -591,13 +911,7 @@ function Resolve-SourceFolder {
             if ($leaf) {
                 $candidates = Find-FolderByLeafNameAcrossStores -leafName $leaf
                 if ($candidates.Count -eq 1) {
-                    Write-Host ("[DEBUG] Fallback matched leaf '{0}' at: {1}" -f $leaf, $candidates[0].Path)
                     return $candidates[0].Folder
-                } elseif ($candidates.Count -gt 1) {
-                    Write-Host ("[DEBUG] Multiple fallback matches for leaf '{0}':" -f $leaf)
-                    foreach ($c in $candidates) {
-                        Write-Host ("[DEBUG]  - {0}" -f $c.Path)
-                    }
                 }
             }
             Debug-Resolve-FolderNotFound -path $path -relativeParts $rel
@@ -757,25 +1071,40 @@ function Export-Folder {
     # No subfolder export (explicit folders only)
 }
 
-for ($day = $startDateObj; $day -le $endDateObj; $day = $day.AddDays(1)) {
-    $dayStart = $day
-    $dayEnd = $day.AddDays(1).AddSeconds(-1)
-    Write-Host ("--- Exporting day: {0} ---" -f $day.ToString("dd-MM-yyyy"))
-    foreach ($path in $folderPaths) {
-        $sourceFolder = Resolve-SourceFolder -path $path
-        if (-not $sourceFolder) {
-            continue
+$exportResult = $null
+try {
+    for ($day = $startDateObj; $day -le $endDateObj; $day = $day.AddDays(1)) {
+        $dayStart = $day
+        $dayEnd = $day.AddDays(1).AddSeconds(-1)
+        Write-Host ("--- Exporting day: {0} ---" -f $day.ToString("dd-MM-yyyy"))
+        foreach ($path in $folderPaths) {
+            $sourceFolder = Resolve-SourceFolder -path $path
+            if (-not $sourceFolder) {
+                continue
+            }
+            Write-Host "Exporting folder: $path"
+            Export-Folder -sourceFolder $sourceFolder -relativePath $path -dayStart $dayStart -dayEnd $dayEnd
         }
-        Write-Host "Exporting folder: $path"
-        Export-Folder -sourceFolder $sourceFolder -relativePath $path -dayStart $dayStart -dayEnd $dayEnd
+    }
+
+    Write-Host "Export completed."
+    Write-Host "PST written to: $OutputPstPath"
+
+    $exportResult = [PSCustomObject]@{
+        OutputPstPath = $OutputPstPath
+        StartDate     = $StartDate
+        EndDate       = $EndDate
+        FolderPaths   = @($folderPaths)
+    }
+} finally {
+    if ($destRoot) {
+        try {
+            $namespace.RemoveStore($destRoot)
+            Write-Host ("Detached export PST from Outlook: {0}" -f $OutputPstPath)
+        } catch {
+            Write-Host ("WARNING: Unable to detach export PST from Outlook automatically: {0}" -f $OutputPstPath)
+        }
     }
 }
 
-Write-Host "Export completed."
-Write-Host "PST written to: $OutputPstPath"
-
-try {
-    $namespace.RemoveStore($destRoot)
-} catch {
-    # ignore
-}
+return $exportResult

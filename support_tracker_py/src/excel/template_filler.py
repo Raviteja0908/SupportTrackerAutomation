@@ -51,11 +51,13 @@ def _normalize_header(text: str) -> str:
     if text is None:
         return ""
     norm = " ".join(str(text).replace("\n", " ").split()).strip().lower()
+    norm = norm.replace("?", "")
+    norm = norm.replace("/", " ")
+    norm = norm.replace("(", " ").replace(")", " ")
+    norm = " ".join(norm.split()).strip()
     aliases = {
-        "service request / incident": "servicerequest/incident?",
-        "service request/incident": "servicerequest/incident?",
-        "service request / incident type": "servicerequest/incident type?",
-        "service request/incident type": "servicerequest/incident type?",
+        "service request incident": "servicerequest incident",
+        "service request incident type": "servicerequest incident type",
     }
     return aliases.get(norm, norm)
 
@@ -67,12 +69,48 @@ class FillResult:
     unknown_count: int
 
 
-def fill_template(template_path, output_path, row_resolver, logger, post_process=None):
+def select_target_sheet(wb, logger=None, preferred_sheet_name="LOG"):
+    if preferred_sheet_name and preferred_sheet_name in wb.sheetnames:
+        if logger:
+            logger.log(f"[INFO] Using worksheet: {preferred_sheet_name}")
+        return wb[preferred_sheet_name]
+
+    expected = {_normalize_header(h) for h in EXPECTED_HEADERS}
+    best_ws = wb.active
+    best_hits = -1
+    for ws in wb.worksheets:
+        hits = 0
+        for row in range(1, min(15, ws.max_row) + 1):
+            row_values = [
+                _normalize_header(ws.cell(row, c).value)
+                for c in range(1, ws.max_column + 1)
+            ]
+            row_hits = sum(1 for v in row_values if v in expected and v)
+            if row_hits > hits:
+                hits = row_hits
+        if hits > best_hits:
+            best_hits = hits
+            best_ws = ws
+
+    if logger:
+        logger.log(f"[INFO] Using worksheet: {best_ws.title}")
+    return best_ws
+
+
+def fill_template(template_path, output_path, row_resolver, logger, post_process=None, sheet_name="LOG"):
     template_path = Path(template_path)
     output_path = Path(output_path)
 
     wb = load_workbook(template_path)
-    ws = wb.active
+    calc = getattr(wb, "calculation", None)
+    if calc is not None:
+        # openpyxl preserves the formulas themselves, but this template is in
+        # manual calc mode. Force Excel to recalculate when the user opens it.
+        calc.calcMode = "auto"
+        calc.fullCalcOnLoad = True
+        if hasattr(calc, "forceFullCalc"):
+            calc.forceFullCalc = True
+    ws = select_target_sheet(wb, logger, preferred_sheet_name=sheet_name)
     filter_subject = (os.environ.get("FILTER_SUBJECT") or "").strip().lower()
     filter_no_save = os.environ.get("FILTER_NO_SAVE") == "1"
 
@@ -255,9 +293,7 @@ def _parse_datetime_cell(value):
 
 
 def _write_comment(ws, row, comments_col, text):
-    if not comments_col:
-        return
-    ws.cell(row, comments_col).value = text
+    return
 
 
 def _mark_row(ws, row, fill):

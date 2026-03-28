@@ -143,3 +143,31 @@ def resolve_environment(subject_text: str, body_text: str = "") -> str:
     if _has_test_marker(body_text):
         return "UAT"
     return ""
+
+
+def resolve_environment_thread_fallback(thread_text: str) -> str:
+    """
+    Final-resort environment detection across broader mail-chain text.
+    Prefer explicit non-prod environments first, then generic test/non-prod,
+    and only then fall back to explicit PROD markers.
+    """
+    thread_text = thread_text or ""
+    if not thread_text:
+        return ""
+
+    # Prefer explicit non-prod environments when any appear anywhere
+    # in the broader chain. This is safer than defaulting to PROD.
+    if _UAT_RE.search(thread_text):
+        return "UAT"
+    if _QA_RE.search(thread_text):
+        return "QA"
+    if _DEV_RE.search(thread_text):
+        return "DEV"
+
+    # Generic non-prod/test hints still mean UAT as a final fallback.
+    if _has_test_marker(thread_text):
+        return "UAT"
+
+    if _PROD_RE.search(thread_text):
+        return "PROD"
+    return ""
