@@ -1,4 +1,5 @@
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -113,6 +114,10 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
     ws = select_target_sheet(wb, logger, preferred_sheet_name=sheet_name)
     filter_subject = (os.environ.get("FILTER_SUBJECT") or "").strip().lower()
     filter_no_save = os.environ.get("FILTER_NO_SAVE") == "1"
+    debug_stage_times = os.environ.get("DEBUG_STAGE_TIMES") == "1"
+    resolver_total_seconds = 0.0
+    resolver_calls = 0
+    slowest_rows = []
 
     header_row = _find_header_row(ws, logger)
     col_map = _build_col_map(ws, header_row)
@@ -143,7 +148,20 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
         if filter_subject and filter_subject not in desc_text.lower():
             continue
 
+        started_at = time.perf_counter() if debug_stage_times else None
         resolved = row_resolver(row_context)
+        if debug_stage_times and started_at is not None:
+            elapsed = max(0.0, time.perf_counter() - started_at)
+            resolver_total_seconds += elapsed
+            resolver_calls += 1
+            slowest_rows.append(
+                (
+                    elapsed,
+                    row,
+                    str(row_context.get("Service No", "") or ""),
+                    desc_text,
+                )
+            )
         mark_blue = resolved.pop("_MarkBlue", False)
         required_missing, reason = _is_unknown(resolved)
         if required_missing:
@@ -175,6 +193,16 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
             alt_path = _resolve_output_path(output_path, force_suffix=True)
             wb.save(alt_path)
             logger.log(f"[WARNING] Output locked, saved to: {alt_path}")
+
+    if debug_stage_times and resolver_calls:
+        slowest_rows.sort(key=lambda item: item[0], reverse=True)
+        logger.log(
+            f"[INFO] Row resolver timing: {resolver_total_seconds:.2f}s total across {resolver_calls} row(s)"
+        )
+        for elapsed, row_idx, service_no, description in slowest_rows[:10]:
+            logger.log(
+                f"[INFO]   slow-row {elapsed:.2f}s | row={row_idx} | service={service_no or '-'} | desc={description[:120]}"
+            )
 
     return FillResult(filled, maintenance, unknown)
 

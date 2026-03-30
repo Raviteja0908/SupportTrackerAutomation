@@ -23,6 +23,7 @@ from src.rules.time_resolver import (
     _match_requester,
     _is_ess_sender,
     _is_ack_like_reply,
+    _is_thanks_info_reply,
     _extract_request_time_from_email,
     _format_time,
     _to_ist,
@@ -441,6 +442,12 @@ def main() -> int:
             return ""
         s = str(value).strip().lower()
         return re.sub(r"[^a-z0-9]", "", s)
+
+    def _service_no_key(value: str) -> str:
+        if not value:
+            return ""
+        s = str(value).strip().upper()
+        return re.sub(r"\s+", "", s)
 
     def _parse_time_str(value: str):
         if not value:
@@ -1121,6 +1128,9 @@ def main() -> int:
 
     # Pre-scan template to count repeated subjects per consultant (safe, read-only)
     group_counts = {}
+    group_counts_by_service = {}
+    subject_service_keys = {}
+    subject_family_rows = {}
     try:
         from openpyxl import load_workbook
         wb = load_workbook(template_path)
@@ -1129,6 +1139,7 @@ def main() -> int:
         col_map = _build_col_map(ws, header_row)
         desc_col = col_map.get("description")
         consultant_col = col_map.get("consultant") or col_map.get("requester")
+        service_no_col = col_map.get("service no")
         if desc_col and consultant_col:
             for row in range(header_row + 1, ws.max_row + 1):
                 desc_val = ws.cell(row, desc_col).value
@@ -1137,17 +1148,174 @@ def main() -> int:
                     continue
                 subject_text = _subject_for_description(str(desc_val))
                 subject_norm = normalize_subject(subject_text)
-                if not subject_norm:
+                subject_key = (subject_norm or "").lower()
+                if not subject_key:
                     continue
-                if subject_exclusions and any(x in subject_norm.lower() for x in subject_exclusions):
-                    if "maintenance" not in subject_norm.lower():
+                if subject_exclusions and any(x in subject_key for x in subject_exclusions):
+                    if "maintenance" not in subject_key:
                         continue
-                key = (subject_norm, _requester_key(cons_val))
+                service_key = _service_no_key(ws.cell(row, service_no_col).value) if service_no_col else ""
+                key = (subject_key, _requester_key(cons_val))
                 group_counts[key] = group_counts.get(key, 0) + 1
+                subject_family_rows.setdefault(subject_key, []).append((row, service_key))
+                if service_key:
+                    subject_service_keys.setdefault(subject_key, set()).add(service_key)
+                    service_key_tuple = (subject_key, _requester_key(cons_val), service_key)
+                    group_counts_by_service[service_key_tuple] = group_counts_by_service.get(service_key_tuple, 0) + 1
         wb.close()
     except Exception as e:
         logger.log(f"[WARNING] Pre-scan for repeated subjects failed: {e}")
         group_counts = {}
+        group_counts_by_service = {}
+        subject_service_keys = {}
+        subject_family_rows = {}
+
+    def _subject_has_multiple_service_nos(subject_norm_value: str) -> bool:
+        subject_key = (subject_norm_value or "").lower()
+        return len(subject_service_keys.get(subject_key, set())) >= 2
+
+    def _subject_service_bucket(subject_norm_value: str, service_no_value: str = "") -> str:
+        subject_key = (subject_norm_value or "").lower()
+        service_key = _service_no_key(service_no_value)
+        if service_key and _subject_has_multiple_service_nos(subject_key):
+            return service_key
+        return ""
+
+    def _occurrence_group_key(subject_norm_value: str, requester_value: str, service_no_value: str = ""):
+        subject_key = (subject_norm_value or "").lower()
+        requester_key = _requester_key(requester_value)
+        service_bucket = _subject_service_bucket(subject_key, service_no_value)
+        if service_bucket:
+            return (subject_key, requester_key, service_bucket)
+        return (subject_key, requester_key)
+
+    def _occurrence_group_total(subject_norm_value: str, requester_value: str, service_no_value: str = "") -> int:
+        subject_key = (subject_norm_value or "").lower()
+        requester_key = _requester_key(requester_value)
+        service_bucket = _subject_service_bucket(subject_key, service_no_value)
+        if service_bucket:
+            return group_counts_by_service.get((subject_key, requester_key, service_bucket), 0)
+        return group_counts.get((subject_key, requester_key), 0)
+
+    def _pre_resolve_family_slot(subject_norm_value: str, row_index_value) -> tuple[int, int]:
+        subject_key = (subject_norm_value or "").lower()
+        family_rows = sorted(subject_family_rows.get(subject_key, []), key=lambda x: x[0])
+        if len({svc for _, svc in family_rows if svc}) < 2:
+            return 0, 1
+        slot_index = 0
+        for idx, (row_num, _svc) in enumerate(family_rows):
+            if row_num == row_index_value:
+                slot_index = idx
+                break
+        return slot_index, len(family_rows) or 1
+
+    def _bind_initial_thread_to_occurrence(thread, requester_value: str, subject_norm_value: str, row_index_value):
+        trace_subject_raw = (os.getenv("TRACE_SUBJECT_CONTAINS", "") or "").strip().lower()
+        should_trace = bool(trace_subject_raw) and trace_subject_raw in (subject_norm_value or "").lower()
+        def _bind_email_ist(email_record):
+            sent = getattr(email_record, "sent_time", None)
+            return _to_ist(sent) if sent else None
+        if not thread or not requester_value or not _subject_has_multiple_service_nos(subject_norm_value):
+            if should_trace:
+                why = "no_thread" if not thread else ("no_requester" if not requester_value else "not_multi_service")
+                logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | early_exit={why}")
+            return thread, ""
+        slot_index, family_total = _pre_resolve_family_slot(subject_norm_value, row_index_value)
+        if family_total < 2:
+            if should_trace:
+                logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | family_total={family_total} | early_exit=family_total_lt_2")
+            return thread, ""
+
+        consultant_replies = [
+            e for e in thread
+            if getattr(e, "sent_time", None)
+            and _match_requester(e.sender_name, e.sender_email, requester_value)
+            and not _is_ack_like_reply(e)
+            and not _is_thanks_info_reply(e)
+        ]
+        consultant_replies.sort(key=lambda e: e.sent_time)
+        if len(consultant_replies) < 2:
+            if should_trace:
+                logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | family_total={family_total} | slot={slot_index} | consultant_replies={len(consultant_replies)} | early_exit=consultant_lt_2")
+            return thread, ""
+
+        # Safest generic split: prefer distinct reply dates first. This catches
+        # repeated same-subject rows that belong to different day-lanes without
+        # inventing same-day episode separation.
+        date_buckets = {}
+        for e in consultant_replies:
+            e_ist = _bind_email_ist(e)
+            if not e_ist:
+                continue
+            date_buckets.setdefault(e_ist.date(), []).append(e)
+        ordered_dates = sorted(date_buckets)
+        if should_trace:
+            logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | family_total={family_total} | slot={slot_index} | consultant_replies={len(consultant_replies)} | distinct_dates={len(ordered_dates)} | dates={[str(d) for d in ordered_dates[:8]]}")
+        if len(ordered_dates) >= family_total:
+            chosen_date = ordered_dates[min(slot_index, len(ordered_dates) - 1)]
+            bucket = date_buckets.get(chosen_date) or []
+            if bucket:
+                cutoff = bucket[-1].sent_time
+                sliced = [e for e in thread if not getattr(e, "sent_time", None) or e.sent_time <= cutoff]
+                if sliced:
+                    if should_trace:
+                        logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | lane=InitialOccurrenceLaneDate#{slot_index + 1} | chosen_date={chosen_date} | cutoff={cutoff}")
+                    return sliced, f"InitialOccurrenceLaneDate#{slot_index + 1}"
+
+        unique_reply_minutes = []
+        seen_minutes = set()
+        for e in consultant_replies:
+            e_ist = _bind_email_ist(e)
+            if not e_ist:
+                continue
+            minute_key = e_ist.replace(second=0, microsecond=0)
+            if minute_key in seen_minutes:
+                continue
+            seen_minutes.add(minute_key)
+            unique_reply_minutes.append((minute_key, e))
+        if should_trace:
+            logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | distinct_reply_minutes={len(unique_reply_minutes)}")
+        if len(unique_reply_minutes) >= family_total:
+            pick_ist, pick_msg = unique_reply_minutes[min(slot_index, len(unique_reply_minutes) - 1)]
+            cutoff = pick_msg.sent_time
+            sliced = [e for e in thread if not getattr(e, "sent_time", None) or e.sent_time <= cutoff]
+            if sliced:
+                if should_trace:
+                    logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | lane=InitialOccurrenceLaneReply#{slot_index + 1} | chosen_minute={pick_ist} | cutoff={cutoff}")
+                return sliced, f"InitialOccurrenceLaneReply#{slot_index + 1}"
+
+        # Fallback: use wide chronology clusters only when they are clearly
+        # separated by long gaps, which is still safe for repeated day-based lanes.
+        clusters = []
+        current = []
+        prev_ist = None
+        for e in consultant_replies:
+            e_ist = _bind_email_ist(e)
+            if not e_ist:
+                continue
+            if prev_ist and (e_ist - prev_ist) > timedelta(hours=48):
+                if current:
+                    clusters.append(current)
+                current = [e]
+            else:
+                current.append(e)
+            prev_ist = e_ist
+        if current:
+            clusters.append(current)
+        if should_trace:
+            logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | clusters={len(clusters)}")
+        if len(clusters) >= family_total:
+            cluster = clusters[min(slot_index, len(clusters) - 1)]
+            cutoff = cluster[-1].sent_time
+            sliced = [e for e in thread if not getattr(e, "sent_time", None) or e.sent_time <= cutoff]
+            if sliced:
+                if should_trace:
+                    logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | lane=InitialOccurrenceLaneCluster#{slot_index + 1} | cutoff={cutoff}")
+                return sliced, f"InitialOccurrenceLaneCluster#{slot_index + 1}"
+
+        if should_trace:
+            logger.log(f"[TRACE_BIND] subject={subject_norm_value} | row={row_index_value} | no_safe_lane_selected=1")
+        return thread, ""
 
     episode_counters = {}
     duplicate_group_state = {}
@@ -1155,6 +1323,21 @@ def main() -> int:
     env_cache = {}
     _env_consultant_text_cache = {}
     _env_thread_text_cache = {}
+    stage_times_enabled = os.getenv("DEBUG_STAGE_TIMES", "0") == "1"
+    stage_time_stats = {}
+    trace_subject_filter = normalize_subject(os.getenv("TRACE_SUBJECT_CONTAINS", "") or "")
+    trace_service_filter = (os.getenv("TRACE_SERVICE_NO", "") or "").strip().lower()
+
+    def _stage_timer_start():
+        return time.perf_counter() if stage_times_enabled else None
+
+    def _stage_timer_stop(name: str, started_at, *, items: int = 0):
+        if not stage_times_enabled or started_at is None:
+            return
+        stat = stage_time_stats.setdefault(name, {"seconds": 0.0, "calls": 0, "items": 0})
+        stat["seconds"] += max(0.0, time.perf_counter() - started_at)
+        stat["calls"] += 1
+        stat["items"] += max(0, items)
 
     # Build deployment request/success index by DR ID (safe override case only)
     deployment_index = {}
@@ -1747,6 +1930,7 @@ def main() -> int:
         skip_history_update = False
         description = row_context.get("Description", "")
         requester = row_context.get("Consultant", "") or row_context.get("Requester", "")
+        service_no = row_context.get("Service No", "") or ""
         category_type_raw = row_context.get("Category Type", "")
         category_type = category_type_raw
         row_index = row_context.get("RowIndex")
@@ -1755,9 +1939,12 @@ def main() -> int:
         date_anchor_after = False
         base_times = None
         base_debug = None
+        group_key = ("", "")
         group_total = 0
 
         subject_text = _subject_for_description(description)
+        group_key = _occurrence_group_key(normalize_subject(subject_text), requester, service_no)
+        group_total = _occurrence_group_total(normalize_subject(subject_text), requester, service_no)
         # Interface tokens from description prefix help disambiguate
         # when the subject text itself loses the interface prefix.
         desc_prefix = ""
@@ -1929,27 +2116,40 @@ def main() -> int:
                         thread = new_thread
                         match_note = f"{match_note}; {refine_note}"
 
+        full_thread = thread
+        initial_occurrence_note = ""
+        if thread and requester and row_index:
+            bound_thread, bind_note = _bind_initial_thread_to_occurrence(
+                thread,
+                requester,
+                subject_norm,
+                row_index,
+            )
+            if bound_thread:
+                thread = bound_thread
+            initial_occurrence_note = bind_note or ""
+
         thread_key = (
-            id(thread) if thread else 0,
-            len(thread) if thread else 0,
+            id(full_thread) if full_thread else 0,
+            len(full_thread) if full_thread else 0,
         )
         env_cache_key = (
             (subject_text or "").strip().lower(),
             _requester_key(requester),
             thread_key,
-            (description or "").strip().lower() if not thread else "",
+            (description or "").strip().lower() if not full_thread else "",
         )
         env = env_cache.get(env_cache_key)
         if env is None:
             # Environment: subject -> consultant replies -> description ->
             # broader selected thread -> final default PROD.
             env = resolve_environment(subject_text, "")
-            if (not env) and thread and requester:
+            if (not env) and full_thread and requester:
                 consultant_text_key = (thread_key, _requester_key(requester))
                 consultant_text = _env_consultant_text_cache.get(consultant_text_key)
                 if consultant_text is None:
                     consultant_bodies = []
-                    for e in thread:
+                    for e in full_thread:
                         if not _match_requester(e.sender_name, e.sender_email, requester):
                             continue
                         # Read consultant content only when subject alone did not resolve env.
@@ -1963,11 +2163,11 @@ def main() -> int:
                     env = resolve_environment(subject_text, consultant_text)
             if not env:
                 env = resolve_environment(subject_text, description or "")
-            if (not env) and thread:
+            if (not env) and full_thread:
                 thread_text = _env_thread_text_cache.get(thread_key)
                 if thread_text is None:
                     thread_parts = []
-                    for e in thread:
+                    for e in full_thread:
                         subj = getattr(e, "subject", "") or ""
                         if subj:
                             thread_parts.append(subj)
@@ -2110,9 +2310,6 @@ def main() -> int:
         else:
             times = None
             debug = None
-            requester_key = _requester_key(requester)
-            group_key = (subject_norm, requester_key)
-            group_total = group_counts.get(group_key, 0)
             has_row_ids = bool(_inc_tokens(subject_text) or _extract_dr_ids(subject_text))
             date_anchor_missing = False
             date_anchor_after = False
@@ -2290,6 +2487,13 @@ def main() -> int:
                     ess_team=ess_team,
                     subject_norm=subject_norm,
                 )
+            if initial_occurrence_note and times and debug:
+                debug = TimeDebug(
+                    debug.created_src,
+                    debug.ack_src,
+                    debug.resolved_src,
+                    f"{debug.notes}; {initial_occurrence_note}",
+                )
             if date_anchor_missing and times and debug:
                 debug = TimeDebug(
                     debug.created_src,
@@ -2327,8 +2531,25 @@ def main() -> int:
                 consultant_replies.sort(key=lambda e: e.sent_time)
                 if len(consultant_replies) >= group_total and len(consultant_replies) >= 2:
                     idx = episode_counters.get(group_key, 0)
+                    occ_meta = _shared_occurrence_pick(
+                        {
+                            "occurrence_key": group_key,
+                            "group_total": group_total,
+                            "multi_service_subject": _subject_has_multiple_service_nos(subject_norm),
+                            "subject_norm": subject_norm,
+                            "requester": requester,
+                            "service_no": service_no,
+                            "list_index": None,
+                        },
+                        subject_norm_value=subject_norm,
+                        requester_value=requester,
+                        current_created_ist=None,
+                        current_ack_ist=None,
+                        current_resolved_ist=None,
+                        default_idx=idx,
+                    )
                     episode_counters[group_key] = idx + 1
-                    pick = consultant_replies[min(idx, len(consultant_replies) - 1)]
+                    pick = consultant_replies[min(occ_meta["pick_idx"], len(consultant_replies) - 1)]
                     cutoff = pick.sent_time
                     sliced_thread = [e for e in thread if e.sent_time <= cutoff]
                     if sliced_thread:
@@ -2921,6 +3142,11 @@ def main() -> int:
                 "description": description,
                 "category_type": category_type,
                 "requester": requester,
+                "service_no": service_no,
+                "service_no_key": _service_no_key(service_no),
+                "service_bucket": _subject_service_bucket(subject_norm, service_no),
+                "multi_service_subject": _subject_has_multiple_service_nos(subject_norm),
+                "occurrence_key": group_key,
                 "subject_norm": subject_norm,
                 "date_tokens": date_tokens,
                 "explicit_marker": explicit_marker,
@@ -2930,7 +3156,7 @@ def main() -> int:
                 "baseline_created_date": baseline_created_date,
                 "group_total": group_total,
                 "date_tokens_match_thread": bool(date_tokens) and _thread_has_date_token(thread, date_tokens),
-                "thread": thread,
+                "thread": full_thread or thread,
                 "times": times,
                 "debug": debug,
                 "row_has_ids": state_row_has_ids,
@@ -3330,6 +3556,65 @@ def main() -> int:
         # on blue-marked rows.
         blue_only_post_resolver = os.getenv("BLUE_ONLY_POST_RESOLVER", "1") == "1"
         nonblue_row_states = [] if blue_only_post_resolver else row_states
+        state_by_list_index = {
+            s.get("list_index"): s
+            for s in row_states
+            if s.get("list_index") is not None
+        }
+        _subject_family_list_indexes_cache = {}
+
+        def _subject_family_list_indexes(subject_norm_value: str):
+            subject_key = (subject_norm_value or "").lower()
+            cached = _subject_family_list_indexes_cache.get(subject_key)
+            if cached is not None:
+                return cached
+            out = [
+                s.get("list_index")
+                for s in row_states
+                if s.get("list_index") is not None
+                and ((s.get("subject_norm") or "").lower() == subject_key)
+            ]
+            out.sort()
+            _subject_family_list_indexes_cache[subject_key] = out
+            return out
+
+        def _trace_row(list_index, state, tag: str, **fields):
+            if not trace_subject_filter and not trace_service_filter:
+                return
+            state = state or state_by_list_index.get(list_index) or {}
+            subject_norm_value = normalize_subject((state.get("subject_norm") or "").lower())
+            service_no_value = ((state.get("service_no") or "").strip().lower())
+            if trace_subject_filter:
+                hay = subject_norm_value or normalize_subject(
+                    debug_rows[list_index].get("SubjectKey", "") if list_index is not None and list_index < len(debug_rows) else ""
+                )
+                if trace_subject_filter not in hay:
+                    return
+            if trace_service_filter and trace_service_filter != service_no_value:
+                return
+            ordered = []
+            for key, value in fields.items():
+                if isinstance(value, list):
+                    value = [str(v) for v in value]
+                ordered.append(f"{key}={value}")
+            logger.log(
+                f"[TRACE_SUBJECT] row={list_index} | service={state.get('service_no') or ''} | subject={state.get('subject_norm') or ''} | tag={tag}"
+                + (f" | {'; '.join(ordered)}" if ordered else "")
+            )
+
+        def _trace_stage_row(state, list_index, stage: str):
+            if list_index is None or list_index >= len(automation_rows):
+                return
+            row_vals = automation_rows[list_index]
+            _trace_row(
+                list_index,
+                state,
+                f"stage:{stage}",
+                created=row_vals.get("Created Date & Time") or "",
+                response=row_vals.get("Actual Response Date & Time") or "",
+                resolved=row_vals.get("Actual Resolved Date & Time") or "",
+                notes=(debug_rows[list_index].get("Notes", "") if list_index < len(debug_rows) else ""),
+            )
 
         def _expanded_thread(subject_norm_value, base_thread, requester_name, include_non_ess=False, reference_ist=None):
             if not base_thread:
@@ -3535,6 +3820,8 @@ def main() -> int:
             )
 
         _risk_guard_precheck_cache = {}
+        _episode_candidate_cache = {}
+        _rewrite_guard_profile_cache = {}
 
         def _risk_guard_precheck(state, row_vals, list_index):
             notes_l = (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else ""
@@ -3567,14 +3854,175 @@ def main() -> int:
             _risk_guard_precheck_cache[cache_key] = out
             return out
 
+        def _rewrite_guard_profile(row_vals, list_index):
+            notes_l = (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else ""
+            created_src = (debug_rows[list_index].get("CreatedSource") or "") if list_index < len(debug_rows) else ""
+            ack_src = (debug_rows[list_index].get("AckSource") or "") if list_index < len(debug_rows) else ""
+            resolved_src = (debug_rows[list_index].get("ResolvedSource") or "") if list_index < len(debug_rows) else ""
+            c_raw = row_vals.get("Created Date & Time") or ""
+            a_raw = row_vals.get("Actual Response Date & Time") or ""
+            r_raw = row_vals.get("Actual Resolved Date & Time") or ""
+            cache_key = (list_index, notes_l, created_src, ack_src, resolved_src, c_raw, a_raw, r_raw)
+            cached = _rewrite_guard_profile_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            c_dt = _parse_time_str(c_raw) if c_raw else None
+            a_dt = _parse_time_str(a_raw) if a_raw else None
+            r_dt = _parse_time_str(r_raw) if r_raw else None
+            c_ist = _to_ist(c_dt) if c_dt else None
+            a_ist = _to_ist(a_dt) if a_dt else None
+            r_ist = _to_ist(r_dt) if r_dt else None
+            c_min = c_ist.replace(second=0, microsecond=0) if c_ist else None
+            a_min = a_ist.replace(second=0, microsecond=0) if a_ist else None
+            r_min = r_ist.replace(second=0, microsecond=0) if r_ist else None
+            ordered = bool(c_ist and a_ist and r_ist and c_ist <= a_ist <= r_ist)
+            ack_gap = (a_min - c_min) if (c_min and a_min and a_min >= c_min) else None
+            all_same = bool(c_min and a_min and r_min and c_min == a_min == r_min)
+            ack_src_l = ack_src.lower()
+            strong_live_ack = bool(
+                ordered
+                and ack_gap is not None
+                and ack_gap <= timedelta(minutes=16)
+                and (
+                    "quotedrequestonlypreservedliveack" in notes_l
+                    or (
+                        ack_src
+                        and not ack_src_l.startswith("parsed_from_")
+                    )
+                )
+            )
+            out = {
+                "notes_l": notes_l,
+                "created_src": created_src,
+                "ack_src": ack_src,
+                "resolved_src": resolved_src,
+                "c_ist": c_ist,
+                "a_ist": a_ist,
+                "r_ist": r_ist,
+                "c_min": c_min,
+                "a_min": a_min,
+                "r_min": r_min,
+                "ordered": ordered,
+                "ack_gap": ack_gap,
+                "all_same": all_same,
+                "strong_live_ack": strong_live_ack,
+            }
+            _rewrite_guard_profile_cache[cache_key] = out
+            return out
+
+        def _allow_guard_rewrite(row_vals, list_index, cand_c_ist, cand_a_ist, cand_r_ist, owner_tag: str, candidate_kind: str) -> bool:
+            if not (cand_c_ist and cand_a_ist and cand_r_ist):
+                return False
+            cand_c_min = cand_c_ist.replace(second=0, microsecond=0)
+            cand_a_min = cand_a_ist.replace(second=0, microsecond=0)
+            cand_r_min = cand_r_ist.replace(second=0, microsecond=0)
+            if not (cand_c_min <= cand_a_min <= cand_r_min):
+                return False
+
+            profile = _rewrite_guard_profile(row_vals, list_index)
+            if not profile.get("ordered"):
+                return True
+
+            cur_c_min = profile.get("c_min")
+            cur_a_min = profile.get("a_min")
+            cur_r_min = profile.get("r_min")
+            if not (cur_c_min and cur_a_min and cur_r_min):
+                return True
+            notes_l = profile.get("notes_l", "")
+
+            # Protect already-good live/local windows from later continuation or
+            # quoted-style guards. These are the rows that tend to drift without
+            # becoming suspicious enough for risky validation.
+            if profile.get("strong_live_ack") and candidate_kind in {"quoted", "hybrid", "requester_ack", "continuation", "risk"}:
+                return False
+
+            # Preserve intentional source-owned collapse rules. These rows are
+            # meant to stay all-three-same unless the initial resolver itself
+            # changes, so later repair/continuation guards should not reshape
+            # them.
+            if (
+                "force prod subject; all times same" in notes_l
+                and candidate_kind in {"quoted", "hybrid", "requester_ack", "continuation", "risk"}
+            ):
+                return cand_c_min == cur_c_min and cand_a_min == cur_a_min and cand_r_min == cur_r_min
+
+            # Do not let all-three collapse owners flatten a row that is already a
+            # proper ordered span.
+            if (
+                candidate_kind in {"requester_ack", "continuation"}
+                and cand_c_min == cand_a_min == cand_r_min
+                and not profile.get("all_same")
+            ):
+                return False
+
+            # Quoted-style owners should not move a row backward to an older/weaker
+            # local episode when the current row already has a valid request->ack
+            # span, even if that current span is not explicitly tagged as preserved.
+            cur_gap = profile.get("ack_gap")
+            if (
+                candidate_kind in {"quoted", "hybrid"}
+                and cur_gap is not None
+                and cur_gap <= timedelta(minutes=16)
+                and cand_r_min == cur_r_min
+                and cand_a_min <= cur_a_min
+                and cand_c_min <= cur_c_min
+            ):
+                return False
+
+            # For repeated same-subject multi-service families, do not allow a
+            # later guard to converge multiple distinct rows onto the exact same
+            # triplet. This is the shared anti-drift rule that prevents one
+            # occurrence lane from stealing another lane's episode.
+            state = state_by_list_index.get(list_index)
+            if state and state.get("multi_service_subject"):
+                subject_norm_value = (state.get("subject_norm") or "").lower()
+                current_occ_key = state.get("occurrence_key") or _occurrence_group_key(
+                    subject_norm_value,
+                    state.get("requester") or "",
+                    state.get("service_no") or "",
+                )
+                cand_triplet = (cand_c_min, cand_a_min, cand_r_min)
+                cur_triplet = (cur_c_min, cur_a_min, cur_r_min)
+                for other_li in _subject_family_list_indexes(subject_norm_value):
+                    if other_li == list_index or other_li >= len(automation_rows):
+                        continue
+                    other_state = state_by_list_index.get(other_li)
+                    if not other_state or not other_state.get("multi_service_subject"):
+                        continue
+                    other_occ_key = other_state.get("occurrence_key") or _occurrence_group_key(
+                        (other_state.get("subject_norm") or "").lower(),
+                        other_state.get("requester") or "",
+                        other_state.get("service_no") or "",
+                    )
+                    if other_occ_key == current_occ_key:
+                        continue
+                    other_row_vals = automation_rows[other_li]
+                    other_c_dt = _parse_time_str(other_row_vals.get("Created Date & Time") or "")
+                    other_a_dt = _parse_time_str(other_row_vals.get("Actual Response Date & Time") or "")
+                    other_r_dt = _parse_time_str(other_row_vals.get("Actual Resolved Date & Time") or "")
+                    if not (other_c_dt and other_a_dt and other_r_dt):
+                        continue
+                    other_triplet = (
+                        _to_ist(other_c_dt).replace(second=0, microsecond=0),
+                        _to_ist(other_a_dt).replace(second=0, microsecond=0),
+                        _to_ist(other_r_dt).replace(second=0, microsecond=0),
+                    )
+                    if cand_triplet == other_triplet and cur_triplet != cand_triplet:
+                        return False
+
+            return True
+
         def _occurrence_expected_reply_ist(state):
             requester = state.get("requester") or ""
+            service_no = state.get("service_no") or ""
             subject_norm_value = (state.get("subject_norm") or "").lower()
             base_thread = state.get("thread") or []
             row_group_total = state.get("group_total") or 0
             list_index = state.get("list_index")
             if row_group_total < 2 or list_index is None or not requester or not subject_norm_value or not base_thread:
                 return None
+            current_occ_key = state.get("occurrence_key") or _occurrence_group_key(subject_norm_value, requester, service_no)
 
             def _occurrence_notes_match(notes_l: str) -> bool:
                 return (
@@ -3588,9 +4036,12 @@ def main() -> int:
                 other_li = s.get("list_index")
                 if other_li is None or other_li >= len(automation_rows):
                     continue
-                if _requester_key(s.get("requester") or "") != _requester_key(requester):
-                    continue
-                if (s.get("subject_norm") or "").lower() != subject_norm_value:
+                other_occ_key = s.get("occurrence_key") or _occurrence_group_key(
+                    (s.get("subject_norm") or "").lower(),
+                    s.get("requester") or "",
+                    s.get("service_no") or "",
+                )
+                if other_occ_key != current_occ_key:
                     continue
                 other_notes_l = (debug_rows[other_li].get("Notes", "") or "").lower() if other_li < len(debug_rows) else ""
                 if not _occurrence_notes_match(other_notes_l):
@@ -3662,10 +4113,12 @@ def main() -> int:
                 other_li = other_state.get("list_index")
                 if other_li is None or other_li in group_list_indexes or other_li >= len(automation_rows):
                     continue
-                if _requester_key(other_state.get("requester") or "") != _requester_key(requester):
-                    continue
-                other_subject = (other_state.get("subject_norm") or "").lower()
-                if other_subject != subject_norm_value:
+                other_occ_key = other_state.get("occurrence_key") or _occurrence_group_key(
+                    (other_state.get("subject_norm") or "").lower(),
+                    other_state.get("requester") or "",
+                    other_state.get("service_no") or "",
+                )
+                if other_occ_key != current_occ_key:
                     continue
                 other_a_dt = _parse_time_str(automation_rows[other_li].get("Actual Response Date & Time"))
                 other_a_ist = _to_ist(other_a_dt) if other_a_dt else None
@@ -3697,7 +4150,107 @@ def main() -> int:
                 "group_size": len(group_sorted),
             }
 
-        def _risk_guard_episode_for_row(state, row_vals, list_index):
+        _subject_family_slot_cache = {}
+
+        def _subject_family_slot(state):
+            list_index = state.get("list_index")
+            if list_index in _subject_family_slot_cache:
+                return _subject_family_slot_cache[list_index]
+            if not state.get("multi_service_subject"):
+                out = (0, 1)
+                _subject_family_slot_cache[list_index] = out
+                return out
+            subject_norm_value = (state.get("subject_norm") or "").lower()
+            if not subject_norm_value:
+                out = (0, 1)
+                _subject_family_slot_cache[list_index] = out
+                return out
+            family = []
+            for s in row_states:
+                other_li = s.get("list_index")
+                if other_li is None or other_li >= len(automation_rows):
+                    continue
+                if not s.get("multi_service_subject"):
+                    continue
+                if (s.get("subject_norm") or "").lower() != subject_norm_value:
+                    continue
+                family.append(s)
+            family.sort(key=lambda s: s.get("row_index") or 10**9)
+            slot_index = 0
+            for idx, s in enumerate(family):
+                if s.get("list_index") == list_index:
+                    slot_index = idx
+                    break
+            out = (slot_index, len(family) or 1)
+            _subject_family_slot_cache[list_index] = out
+            return out
+
+        def _shared_occurrence_pick(
+            state,
+            *,
+            subject_norm_value: str,
+            requester_value: str,
+            current_created_ist=None,
+            current_ack_ist=None,
+            current_resolved_ist=None,
+            default_idx: int = 0,
+        ):
+            occ_key = state.get("occurrence_key") or _occurrence_group_key(
+                subject_norm_value,
+                requester_value,
+                state.get("service_no") or "",
+            )
+            family_idx, family_total = _subject_family_slot(state)
+            multi_service = bool(state.get("multi_service_subject")) and family_total >= 2
+            pick_idx = family_idx if multi_service else max(0, default_idx)
+            total_rows = family_total if multi_service else (
+                state.get("group_total") or _occurrence_group_total(
+                    subject_norm_value,
+                    requester_value,
+                    state.get("service_no") or "",
+                )
+            )
+            # For multi-service repeated-subject families, current row times are
+            # often exactly the stale values we are trying to escape. In that
+            # case, route by shared family slot and avoid reusing the row's
+            # current timestamps as an occurrence anchor.
+            if multi_service:
+                target_ist = None
+                target_reply_ist = None
+            else:
+                target_ist = current_ack_ist or current_resolved_ist or current_created_ist
+                target_reply_ist = current_resolved_ist or current_ack_ist or current_created_ist
+            return {
+                "occ_key": occ_key,
+                "pick_idx": pick_idx,
+                "total_rows": total_rows,
+                "multi_service": multi_service,
+                "target_ist": target_ist,
+                "target_reply_ist": target_reply_ist,
+            }
+
+        def _dedupe_multi_service_lanes(items, lane_key_fn):
+            out = []
+            seen = set()
+            for item in items:
+                lane_key = lane_key_fn(item)
+                if lane_key is None:
+                    out.append(item)
+                    continue
+                if lane_key in seen:
+                    continue
+                seen.add(lane_key)
+                out.append(item)
+            return out
+
+        def _episode_candidate_for_row(
+            state,
+            row_vals,
+            list_index,
+            *,
+            require_risky_notes: bool,
+            require_suspicious: bool,
+        ):
             requester = state.get("requester") or ""
             subject_norm_value = (state.get("subject_norm") or "").lower()
             base_thread = state.get("thread") or []
@@ -3705,18 +4258,33 @@ def main() -> int:
                 return None
 
             precheck = _risk_guard_precheck(state, row_vals, list_index)
+            cache_key = (
+                list_index,
+                require_risky_notes,
+                require_suspicious,
+                precheck.get("notes_l", ""),
+                row_vals.get("Created Date & Time") or "",
+                row_vals.get("Actual Response Date & Time") or "",
+                row_vals.get("Actual Resolved Date & Time") or "",
+            )
+            if cache_key in _episode_candidate_cache:
+                return _episode_candidate_cache[cache_key]
+
             c_ist = precheck.get("c_ist")
             a_ist = precheck.get("a_ist")
             r_ist = precheck.get("r_ist")
             if not (c_ist and a_ist and r_ist):
+                _episode_candidate_cache[cache_key] = None
                 return None
             suspicious_all_same = precheck.get("suspicious_all_same", False)
             suspicious_created_ack = precheck.get("suspicious_created_ack", False)
-            if not (suspicious_all_same or suspicious_created_ack):
+            if require_suspicious and not (suspicious_all_same or suspicious_created_ack):
+                _episode_candidate_cache[cache_key] = None
                 return None
 
             notes_l = precheck.get("notes_l", "")
-            if not precheck.get("has_risky_notes"):
+            if require_risky_notes and not precheck.get("has_risky_notes"):
+                _episode_candidate_cache[cache_key] = None
                 return None
             row_group_total = state.get("group_total") or 0
             if row_group_total >= 2:
@@ -3724,6 +4292,7 @@ def main() -> int:
                 # Repeated rows are occurrence problems first. Validate against the
                 # same occurrence pool, then let the later distinct mapper own the
                 # actual repair so we don't split the triplet here.
+                _episode_candidate_cache[cache_key] = None
                 return None
 
             row_tokens = _match_tokens(subject_norm_value)
@@ -3767,6 +4336,7 @@ def main() -> int:
                 merged_sources.append(src)
 
             if not merged_sources:
+                _episode_candidate_cache[cache_key] = None
                 return None
 
             anchor_minute = anchor_ist.replace(second=0, microsecond=0)
@@ -3844,6 +4414,7 @@ def main() -> int:
 
             resolved_candidates.sort(key=lambda x: (x[0], x[1], _email_ist(x[2]) or anchor_ist))
             if not resolved_candidates:
+                _episode_candidate_cache[cache_key] = None
                 return None
 
             def _episode_locality_bucket(created_when, ack_when, resolved_when):
@@ -3987,14 +4558,28 @@ def main() -> int:
                         best_episode = episode
 
             if not best_episode:
+                _episode_candidate_cache[cache_key] = None
                 return None
             if best_episode["created"] == best_episode["response"] == best_episode["resolved"]:
+                _episode_candidate_cache[cache_key] = None
                 return None
             if best_episode["created"] >= best_episode["response"]:
+                _episode_candidate_cache[cache_key] = None
                 return None
             if best_episode["response"] > best_episode["resolved"]:
+                _episode_candidate_cache[cache_key] = None
                 return None
+            _episode_candidate_cache[cache_key] = best_episode
             return best_episode
+
+        def _risk_guard_episode_for_row(state, row_vals, list_index):
+            return _episode_candidate_for_row(
+                state,
+                row_vals,
+                list_index,
+                require_risky_notes=True,
+                require_suspicious=True,
+            )
 
         def _best_req_before_ack(reqs, ack_ist):
             if not reqs:
@@ -6898,6 +7483,7 @@ def main() -> int:
                     key = (
                         subject_norm,
                         requester.strip().lower(),
+                        state.get("service_bucket") or "",
                         cand_ist.replace(second=0, microsecond=0),
                     )
                     if key in used_ess_continuation:
@@ -6941,6 +7527,7 @@ def main() -> int:
                     key = (
                         subject_norm,
                         requester.strip().lower(),
+                        state.get("service_bucket") or "",
                         latest_ist.replace(second=0, microsecond=0),
                     )
                     if key in used_ess_continuation:
@@ -6949,6 +7536,16 @@ def main() -> int:
                         continue
                     t = _format_time(latest.sent_time)
                     if not t:
+                        continue
+                    if not _allow_guard_rewrite(
+                        row_vals,
+                        list_index,
+                        latest_ist,
+                        latest_ist,
+                        latest_ist,
+                        "ESSContinuationGuard[AllThreeStrict]",
+                        "continuation",
+                    ):
                         continue
                     used_ess_continuation.add(key)
                     row_vals["Created Date & Time"] = t
@@ -6975,6 +7572,16 @@ def main() -> int:
                     continue
 
                 if c_ist == a_ist and a_ist == r_ist:
+                    if not _allow_guard_rewrite(
+                        row_vals,
+                        list_index,
+                        latest_ist,
+                        latest_ist,
+                        latest_ist,
+                        "ESSContinuationGuard[AllThree]",
+                        "continuation",
+                    ):
+                        continue
                     row_vals["Created Date & Time"] = t
                     row_vals["Actual Response Date & Time"] = t
                     row_vals["Actual Resolved Date & Time"] = t
@@ -6983,6 +7590,16 @@ def main() -> int:
                     if latest_ist <= (r_ist + timedelta(minutes=3)):
                         continue
                     if latest_ist >= c_ist:
+                        if not _allow_guard_rewrite(
+                            row_vals,
+                            list_index,
+                            c_ist,
+                            latest_ist,
+                            latest_ist,
+                            "ESSContinuationGuard[ResponseResolved]",
+                            "continuation",
+                        ):
+                            continue
                         row_vals["Actual Response Date & Time"] = t
                         row_vals["Actual Resolved Date & Time"] = t
                         mode = "ResponseResolved"
@@ -7889,9 +8506,11 @@ def main() -> int:
             for col in range(1, ws.max_column + 1):
                 ws.cell(row_idx, col).fill = fill_obj
 
+        blue_gap_audit_started_at = _stage_timer_start()
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "blue_gap_final_audit")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
@@ -8370,6 +8989,7 @@ def main() -> int:
             norm = normalize_subject(key)
             subject_norm_cache[key] = norm
             return norm
+        _stage_timer_stop("blue_gap_final_audit", blue_gap_audit_started_at, items=len(row_states))
         raw_id_token_cache = {}
         def _row_id_in_raw(msg, row_id_tokens_set):
             if not row_id_tokens_set:
@@ -8410,9 +9030,11 @@ def main() -> int:
             subj_tokens = _id_like_tokens(subject or "")
             return bool(subj_tokens & row_id_tokens_set)
 
+        quoted_only_tag_started_at = _stage_timer_start()
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "quoted_request_only_tag")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
@@ -8420,6 +9042,7 @@ def main() -> int:
             notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
             if "quotedrequestonly" in notes_l:
                 quoted_request_only.add(list_index)
+                _trace_row(list_index, state, "quoted_only_tag_existing")
                 continue
             requester = state.get("requester") or ""
             if not requester:
@@ -8667,8 +9290,16 @@ def main() -> int:
                         if q is not None
                     }
                 )
-                occ_key = (subject_norm, _requester_key(requester))
-                total_rows_for_subject = group_counts.get(occ_key, 0)
+                occ_meta = _shared_occurrence_pick(
+                    state,
+                    subject_norm_value=subject_norm,
+                    requester_value=requester,
+                    current_created_ist=c_ist if 'c_ist' in locals() else None,
+                    current_ack_ist=a_ist if 'a_ist' in locals() else None,
+                    current_resolved_ist=r_ist if 'r_ist' in locals() else None,
+                    default_idx=0,
+                )
+                total_rows_for_subject = occ_meta["total_rows"]
                 reply_led_candidate = None
                 if total_rows_for_subject <= 1:
                     resolved_candidates = []
@@ -8835,24 +9466,34 @@ def main() -> int:
             # Note: full-mailbox quoted scans disabled for performance.
             if has_pair:
                 quoted_request_only.add(list_index)
+                _trace_row(
+                    list_index,
+                    state,
+                    "quoted_only_tag_apply",
+                    hybrid_pair=quoted_only_hybrid_pairs.get(list_index),
+                    hybrid_req_src=quoted_only_hybrid_req_sources.get(list_index),
+                    hybrid_req_debug=quoted_only_hybrid_req_debug.get(list_index),
+                )
                 if list_index < len(debug_rows):
-                    note = "QuotedRequestOnlyHybridLiveAck" if hybrid_pair else "QuotedRequestOnly"
-                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note}"
+                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; QuotedRequestOnly"
             elif has_wide_pair:
                 # Found a quoted pair but gap is too large: mark blue for audit.
                 _set_row_fill(row_idx, blue_fill)
                 if list_index < len(debug_rows):
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; QuotedPairGap>16m"
 
+        _stage_timer_stop("quoted_request_only_tag", quoted_only_tag_started_at, items=len(row_states))
         # ESS-only strict pass (isolated from blue):
         # Run for ESS-only rows regardless of blue, but only if times are not already equal.
         used_ess_continuation_ess_only = set()
         ess_only_reply_index = {}
         ess_only_reply_month_gate = {}
 
+        ess_only_strict_started_at = _stage_timer_start()
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "ess_only_strict_pass")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
@@ -8961,7 +9602,7 @@ def main() -> int:
                         parent_is_ess = is_ess
                 parent_ess_cache[key] = (parent_is_ess, has_non_ess)
                 return parent_ess_cache[key]
-            occ_key = (subject_norm, requester.strip().lower())
+            occ_key = state.get("occurrence_key") or _occurrence_group_key(subject_norm, requester, state.get("service_no") or "")
             idx = ess_only_reply_index.get(occ_key, 0)
             consultant_msgs = []
             ess_reply_msgs = []
@@ -9005,8 +9646,32 @@ def main() -> int:
                         for tok in re.split(r"[^a-z0-9]+", name_raw):
                             if len(tok) >= 3:
                                 ess_name_tokens_all.add(tok)
-            target_ist = None
-            if idx < len(consultant_msgs):
+            occ_meta = _shared_occurrence_pick(
+                state,
+                subject_norm_value=subject_norm,
+                requester_value=requester,
+                current_created_ist=_to_ist(c_dt) if c_dt else None,
+                current_ack_ist=_to_ist(a_dt) if a_dt else None,
+                current_resolved_ist=_to_ist(r_dt) if r_dt else None,
+                default_idx=idx,
+            )
+            multi_service_subject = occ_meta["multi_service"]
+            quoted_pick_idx = occ_meta["pick_idx"]
+            quoted_pick_total = occ_meta["total_rows"]
+            target_ist = occ_meta["target_ist"]
+            if quoted_only:
+                _trace_row(
+                    list_index,
+                    state,
+                    "quoted_only_occurrence",
+                    multi_service=multi_service_subject,
+                    pick_idx=quoted_pick_idx,
+                    total_rows=quoted_pick_total,
+                    target_ist=target_ist,
+                    consultant_count=len(consultant_msgs),
+                    ess_reply_count=len(ess_reply_msgs),
+                )
+            if (not multi_service_subject) and idx < len(consultant_msgs):
                 target_ist = _email_ist(consultant_msgs[idx])
 
             anchor_day = None
@@ -9178,16 +9843,16 @@ def main() -> int:
                     if candidate_pairs_all:
                         break
 
-            if (not candidate_pairs_all) and quoted_only:
+            if quoted_only:
                 hybrid_pair = quoted_only_hybrid_pairs.get(list_index)
                 if hybrid_pair:
                     candidate_pairs_all.append(hybrid_pair)
-                    hybrid_pair_used = True
 
             pair_req = None
             pair_ack = None
             pair_reply = None
             pair_req_src = "PARSED_FROM_QUOTED_REQUEST"
+            selected_pair_is_hybrid = False
             direct_reply_gap_blue = False
             # Do not block quoted reanchor by span notes; we require a real
             # consultant reply after the ack, which is the safer filter.
@@ -9197,6 +9862,14 @@ def main() -> int:
                 for req_ist, ack_ist in candidate_pairs_all:
                     uniq[(req_ist, ack_ist)] = (req_ist, ack_ist)
                 candidate_pairs = list(uniq.values())
+                if quoted_only:
+                    _trace_row(
+                        list_index,
+                        state,
+                        "quoted_only_pairs_raw",
+                        pair_count=len(candidate_pairs),
+                        pairs=[f"{req}->{ack}" for req, ack in candidate_pairs[:8]],
+                    )
 
                 # Note: full-mailbox pair widening disabled for performance.
                 # If baseline anchor looks stale and there are no explicit date tokens,
@@ -9241,19 +9914,23 @@ def main() -> int:
 
                 # For quoted-only rows, prefer the day of the consultant reply occurrence
                 # if a matching pair exists on that day (avoids cross-episode bleed).
-                if quoted_only and consultant_msgs:
-                    pick_msg = consultant_msgs[idx] if idx < len(consultant_msgs) else consultant_msgs[0]
-                    pick_ist = _email_ist(pick_msg)
-                    if pick_ist:
-                        c_day = pick_ist.date()
-                        if any(p[1].date() == c_day for p in candidate_pairs):
-                            anchor_day = c_day
-                            filtered = [
-                                p for p in candidate_pairs
-                                if p[0].date() == anchor_day and p[1].date() == anchor_day
-                            ]
-                            if filtered:
-                                candidate_pairs = filtered
+                if quoted_only:
+                    c_day = None
+                    if multi_service_subject and target_ist:
+                        c_day = target_ist.date()
+                    elif consultant_msgs:
+                        pick_msg = consultant_msgs[quoted_pick_idx] if quoted_pick_idx < len(consultant_msgs) else consultant_msgs[0]
+                        pick_ist = _email_ist(pick_msg)
+                        if pick_ist:
+                            c_day = pick_ist.date()
+                    if c_day and any(p[1].date() == c_day for p in candidate_pairs):
+                        anchor_day = c_day
+                        filtered = [
+                            p for p in candidate_pairs
+                            if p[0].date() == anchor_day and p[1].date() == anchor_day
+                        ]
+                        if filtered:
+                            candidate_pairs = filtered
                 # Require a real consultant reply shortly after the ack,
                 # otherwise the pair is likely from a different episode.
                 candidate_pairs_with_reply = []
@@ -9293,15 +9970,14 @@ def main() -> int:
                 reply_pool_real.sort(key=lambda e: e.sent_time)
                 reply_window_hours = 48
                 direct_reply_candidate = None
-                occ_key = (subject_norm, _requester_key(requester))
-                total_rows = group_counts.get(occ_key, 0)
-                target_reply_ist = None
-                if consultant_msgs:
+                total_rows = quoted_pick_total
+                target_reply_ist = occ_meta["target_reply_ist"]
+                if (not multi_service_subject) and consultant_msgs:
                     if total_rows <= 1:
                         target_reply_ist = _email_ist(consultant_msgs[-1])
                     else:
                         target_reply_ist = _email_ist(
-                            consultant_msgs[min(idx, len(consultant_msgs) - 1)]
+                            consultant_msgs[min(quoted_pick_idx, len(consultant_msgs) - 1)]
                         )
                 elif reply_pool_real:
                     target_reply_ist = _email_ist(reply_pool_real[-1])
@@ -9342,7 +10018,7 @@ def main() -> int:
                                     )
                                 else:
                                     reply_matches.sort(key=lambda e: _email_ist(e))
-                                reply_pick = reply_matches[min(idx, len(reply_matches) - 1)]
+                                reply_pick = reply_matches[min(quoted_pick_idx, len(reply_matches) - 1)]
                         else:
                             reply_pick = reply_matches[0]
                     if reply_pick:
@@ -9363,11 +10039,39 @@ def main() -> int:
                             candidate_pairs_with_reply.sort(
                                 key=lambda p: (-_email_ist(p[2]).timestamp(), p[1])
                             )
-                        pick_idx = 0 if total_rows <= 1 else (idx if idx < len(candidate_pairs_with_reply) else 0)
+                        if multi_service_subject:
+                            candidate_pairs_with_reply = _dedupe_multi_service_lanes(
+                                candidate_pairs_with_reply,
+                                lambda p: (
+                                    _email_ist(p[2]).replace(second=0, microsecond=0)
+                                    if _email_ist(p[2]) else None
+                                ),
+                            )
+                        _trace_row(
+                            list_index,
+                            state,
+                            "quoted_only_pairs_with_reply",
+                            pair_count=len(candidate_pairs_with_reply),
+                            target_reply_ist=target_reply_ist,
+                            pairs=[
+                                f"{req}->{ack}->{_email_ist(reply) if reply else None}"
+                                for req, ack, reply in candidate_pairs_with_reply[:8]
+                            ],
+                        )
+                        pick_idx = 0 if total_rows <= 1 else (quoted_pick_idx if quoted_pick_idx < len(candidate_pairs_with_reply) else 0)
                         pair_req, pair_ack, pair_reply = candidate_pairs_with_reply[pick_idx]
+                        _trace_row(
+                            list_index,
+                            state,
+                            "quoted_only_pair_selected",
+                            pick_idx=pick_idx,
+                            pair_req=pair_req,
+                            pair_ack=pair_ack,
+                            pair_reply=_email_ist(pair_reply) if pair_reply else None,
+                        )
                     else:
-                        if idx < len(consultant_msgs):
-                            target_ist = _email_ist(consultant_msgs[idx])
+                        if quoted_pick_idx < len(consultant_msgs):
+                            target_ist = _email_ist(consultant_msgs[quoted_pick_idx])
                             if target_ist:
                                 candidate_pairs_with_reply.sort(
                                     key=lambda p: (
@@ -9380,6 +10084,8 @@ def main() -> int:
                         else:
                             candidate_pairs_with_reply.sort(key=lambda p: _email_ist(p[2]))
                         pair_req, pair_ack, pair_reply = candidate_pairs_with_reply[0]
+                    if quoted_only and hybrid_pair and pair_req and pair_ack:
+                        selected_pair_is_hybrid = (pair_req, pair_ack) == hybrid_pair
                 else:
                     # Direct-reply fallback for quoted-request-only rows:
                     # if no ack pair is usable, allow a real consultant reply
@@ -9400,7 +10106,24 @@ def main() -> int:
                             if len(direct_replies) <= 1:
                                 direct_reply_candidate = direct_replies[0]
                             else:
-                                direct_reply_candidate = direct_replies[min(idx, len(direct_replies) - 1)]
+                                if multi_service_subject:
+                                    direct_replies = _dedupe_multi_service_lanes(
+                                        direct_replies,
+                                        lambda e: (
+                                            _email_ist(e).replace(second=0, microsecond=0)
+                                            if _email_ist(e) else None
+                                        ),
+                                    )
+                                if multi_service_subject and target_reply_ist:
+                                    direct_replies.sort(
+                                        key=lambda e: (
+                                            abs((_email_ist(e) - target_reply_ist).total_seconds()),
+                                            _email_ist(e),
+                                        )
+                                    )
+                                    direct_reply_candidate = direct_replies[0]
+                                else:
+                                    direct_reply_candidate = direct_replies[min(quoted_pick_idx, len(direct_replies) - 1)]
                             direct_gap = _email_ist(direct_reply_candidate) - latest_quoted_req if direct_reply_candidate else None
                             if direct_gap and direct_gap <= timedelta(minutes=16):
                                 pair_req, pair_ack, pair_reply = (
@@ -9435,7 +10158,16 @@ def main() -> int:
                         continue
                     direct_replies.append(e)
                 if direct_replies:
-                    direct_reply_candidate = direct_replies[min(idx, len(direct_replies) - 1)] if len(direct_replies) > 1 else direct_replies[0]
+                    if len(direct_replies) > 1 and multi_service_subject and target_reply_ist:
+                        direct_replies.sort(
+                            key=lambda e: (
+                                abs((_email_ist(e) - target_reply_ist).total_seconds()),
+                                _email_ist(e),
+                            )
+                        )
+                        direct_reply_candidate = direct_replies[0]
+                    else:
+                        direct_reply_candidate = direct_replies[min(quoted_pick_idx, len(direct_replies) - 1)] if len(direct_replies) > 1 else direct_replies[0]
                     direct_gap = _email_ist(direct_reply_candidate) - latest_quoted_req
                     if direct_gap <= timedelta(minutes=16):
                         pair_req = latest_quoted_req
@@ -9472,6 +10204,18 @@ def main() -> int:
                                         f"{notes_now}; QuotedRequestOnlyPreservedLiveAck; BlueClearedStrict"
                                     )
                             continue
+                        # Do not let quoted-only reanchor move a row backward to an
+                        # older episode when the current row already has a valid
+                        # newer local request->ack window. This keeps quoted repair
+                        # from overwriting a stronger live/local episode.
+                        if (
+                            cur_a_min >= cur_c_min
+                            and (cur_a_min - cur_c_min) <= timedelta(minutes=16)
+                            and cur_r_ist is not None
+                            and cur_r_ist >= cur_a_ist
+                            and pair_ack_min < cur_a_min
+                        ):
+                            continue
 
                 t_c = _format_time(pair_req)
                 t_a = _format_time(pair_ack)
@@ -9479,8 +10223,8 @@ def main() -> int:
                 # Pick resolved reply for quoted-only:
                 # - If only one row for this subject+requester: pick latest reply after ack (within 48h).
                 # - If multiple rows: pick by occurrence order (earliest for row1, next for row2, etc.).
-                occ_key = (subject_norm, _requester_key(requester))
-                total_rows = group_counts.get(occ_key, 0)
+                occ_key = state.get("occurrence_key") or _occurrence_group_key(subject_norm, requester, state.get("service_no") or "")
+                total_rows = state.get("group_total") or _occurrence_group_total(subject_norm, requester, state.get("service_no") or "")
                 resolved_pick = None
                 replies_after_ack = []
                 reply_source_pool = reply_pool_real if "reply_pool_real" in locals() and reply_pool_real else consultant_msgs
@@ -9499,23 +10243,62 @@ def main() -> int:
                         continue
                     replies_after_ack.append(e)
                 if replies_after_ack:
+                    if multi_service_subject:
+                        replies_after_ack = _dedupe_multi_service_lanes(
+                            replies_after_ack,
+                            lambda e: (
+                                _email_ist(e).replace(second=0, microsecond=0)
+                                if _email_ist(e) else None
+                            ),
+                        )
                     if total_rows <= 1:
                         resolved_pick = replies_after_ack[-1]
                     else:
-                        resolved_pick = replies_after_ack[min(idx, len(replies_after_ack) - 1)]
+                        resolved_pick = replies_after_ack[min(quoted_pick_idx, len(replies_after_ack) - 1)]
                 elif "pair_reply" in locals():
                     resolved_pick = pair_reply
 
                 if resolved_pick and resolved_pick.sent_time:
                     t_r = _format_time(resolved_pick.sent_time)
+                    resolved_pick_ist = _email_ist(resolved_pick)
                 else:
                     t_r = row_vals.get("Actual Resolved Date & Time") or t_a
                     r_dt_now = _parse_time_str(t_r)
                     r_ist_now = _to_ist(r_dt_now) if r_dt_now else None
                     if not r_ist_now or r_ist_now < pair_ack:
                         t_r = t_a
+                    resolved_pick_ist = _to_ist(_parse_time_str(t_r)) if t_r else None
 
                 if t_c and t_a and t_r:
+                    candidate_kind = "hybrid" if (quoted_only and selected_pair_is_hybrid) else "quoted"
+                    if not _allow_guard_rewrite(
+                        row_vals,
+                        list_index,
+                        pair_req,
+                        pair_ack,
+                        resolved_pick_ist or pair_ack,
+                        "QuotedRequestOnlyCandidate",
+                        candidate_kind,
+                    ):
+                        _trace_row(
+                            list_index,
+                            state,
+                            "quoted_only_rewrite_blocked",
+                            pair_req=pair_req,
+                            pair_ack=pair_ack,
+                            pair_reply=resolved_pick_ist or pair_ack,
+                            candidate_kind=candidate_kind,
+                        )
+                        continue
+                    _trace_row(
+                        list_index,
+                        state,
+                        "quoted_only_rewrite_apply",
+                        pair_req=pair_req,
+                        pair_ack=pair_ack,
+                        pair_reply=resolved_pick_ist or pair_ack,
+                        candidate_kind=candidate_kind,
+                    )
                     row_vals["Created Date & Time"] = t_c
                     row_vals["Actual Response Date & Time"] = t_a
                     row_vals["Actual Resolved Date & Time"] = t_r
@@ -9530,12 +10313,12 @@ def main() -> int:
                             debug_rows[list_index]["ResolvedSource"] = resolved_pick.sender_email or resolved_pick.sender_name
                         elif t_r == t_a:
                             debug_rows[list_index]["ResolvedSource"] = "PARSED_FROM_QUOTED_REPLY"
-                        if quoted_only and hybrid_pair_used:
+                        if quoted_only and selected_pair_is_hybrid:
                             debug_rows[list_index]["CreatedSource"] = quoted_only_hybrid_req_sources.get(list_index) or pair_req_src
                             debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; HybridReqSrc={quoted_only_hybrid_req_debug.get(list_index, 'unknown')}"
                         else:
                             debug_rows[list_index]["CreatedSource"] = pair_req_src
-                        if quoted_only and hybrid_pair_used:
+                        if quoted_only and selected_pair_is_hybrid:
                             note_tag = "QuotedRequestOnlyHybridLiveAck"
                         elif quoted_only and resolved_pick and _email_ist(resolved_pick) == pair_ack:
                             note_tag = "QuotedRequestOnlyDirectReply"
@@ -9543,27 +10326,47 @@ def main() -> int:
                             note_tag = "QuotedRequestOnlyReanchor" if quoted_only else "ESSOnlyQuotedPairReanchor"
                         debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note_tag}"
                     # Advance occurrence index when a quoted pair is used.
-                    occ_key = (subject_norm, requester.strip().lower())
+                    occ_key = state.get("occurrence_key") or _occurrence_group_key(subject_norm, requester, state.get("service_no") or "")
                     idx = ess_only_reply_index.get(occ_key, 0)
                     ess_only_reply_index[occ_key] = idx + 1
                     continue
             if quoted_only:
                 if direct_reply_gap_blue:
+                    _trace_row(list_index, state, "quoted_only_direct_reply_gap_blue", latest_quoted_req=latest_quoted_req)
                     _set_row_fill(row_idx, blue_fill)
                     if list_index < len(debug_rows):
                         debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; QuotedDirectReplyGap>16m"
                     continue
                 # If this is a quoted-request-only row and no valid pair was found,
                 # allow ESS-only fallback instead of forcing blue.
+                _trace_row(list_index, state, "quoted_only_no_pair")
                 if list_index < len(debug_rows):
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; QuotedRequestOnlyNoPair"
 
             # Fallback: collapse to consultant reply by occurrence (ESS-only)
             if merged_msgs:
                 if consultant_msgs:
+                    occ_meta = _shared_occurrence_pick(
+                        state,
+                        subject_norm_value=subject_norm,
+                        requester_value=requester,
+                        current_created_ist=c_ist if 'c_ist' in locals() else None,
+                        current_ack_ist=a_ist if 'a_ist' in locals() else None,
+                        current_resolved_ist=r_ist if 'r_ist' in locals() else None,
+                        default_idx=idx,
+                    )
+                    pick_idx = occ_meta["pick_idx"]
                     # Pick reply by occurrence for this subject+requester.
-                    key_count = (subject_norm, _requester_key(requester))
-                    total_rows = group_counts.get(key_count, 0)
+                    key_count = occ_meta["occ_key"]
+                    total_rows = occ_meta["total_rows"]
+                    if occ_meta["multi_service"]:
+                        consultant_msgs = _dedupe_multi_service_lanes(
+                            consultant_msgs,
+                            lambda e: (
+                                _email_ist(e).replace(second=0, microsecond=0)
+                                if _email_ist(e) else None
+                            ),
+                        )
                     if total_rows <= 1:
                         pick = consultant_msgs[-1]
                     else:
@@ -9572,7 +10375,7 @@ def main() -> int:
                         month_gate_used = False
                         month_key = ess_only_reply_month_gate.get(occ_key)
                         if month_key is None:
-                            base_pick = consultant_msgs[min(idx, len(consultant_msgs) - 1)]
+                            base_pick = consultant_msgs[min(pick_idx, len(consultant_msgs) - 1)]
                             base_ist = _email_ist(base_pick)
                             if base_ist:
                                 month_key = (base_ist.year, base_ist.month)
@@ -9586,12 +10389,12 @@ def main() -> int:
                                 if (e_ist.year, e_ist.month) == month_key:
                                     same_month.append(e)
                             if same_month:
-                                pick = same_month[min(idx, len(same_month) - 1)]
+                                pick = same_month[min(pick_idx, len(same_month) - 1)]
                                 month_gate_used = True
                             else:
-                                pick = consultant_msgs[min(idx, len(consultant_msgs) - 1)]
+                                pick = consultant_msgs[min(pick_idx, len(consultant_msgs) - 1)]
                         else:
-                            pick = consultant_msgs[min(idx, len(consultant_msgs) - 1)]
+                            pick = consultant_msgs[min(pick_idx, len(consultant_msgs) - 1)]
                     notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
                     allow_acky = "requester span(all-ack->ess)" in notes_l
                     # Validator only: if this looks like ack, do not collapse
@@ -9604,11 +10407,22 @@ def main() -> int:
                     key = (
                         subject_norm,
                         requester.strip().lower(),
+                        state.get("service_bucket") or "",
                         cand_ist.replace(second=0, microsecond=0),
                     )
                     if key in used_ess_continuation_ess_only:
                         continue
                     if pick.sent_time:
+                        if not _allow_guard_rewrite(
+                            row_vals,
+                            list_index,
+                            cand_ist,
+                            cand_ist,
+                            cand_ist,
+                            "ESSContinuationGuard[AllThreeStrictEssOnly]",
+                            "continuation",
+                        ):
+                            continue
                         t = _format_time(pick.sent_time)
                         if t:
                             row_vals["Created Date & Time"] = t
@@ -9627,9 +10441,12 @@ def main() -> int:
                             # Advance occurrence index only when we collapse
                             ess_only_reply_index[occ_key] = idx + 1
                             used_ess_continuation_ess_only.add(key)
+        _stage_timer_stop("ess_only_strict_pass", ess_only_strict_started_at, items=len(row_states))
+        blue_quoted_started_at = _stage_timer_start()
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "blue_quoted_and_continuation_passes")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
@@ -9778,6 +10595,7 @@ def main() -> int:
                     pair_key = (
                         subject_norm,
                         requester.strip().lower(),
+                        state.get("service_bucket") or "",
                         q_req_ist.replace(second=0, microsecond=0),
                         q_ack_ist.replace(second=0, microsecond=0),
                     )
@@ -9793,6 +10611,17 @@ def main() -> int:
                         if not r_ist_now or r_ist_now < q_ack_ist:
                             t_r = t_a
                         if t_c and t_a and t_r:
+                            cand_r_ist = _to_ist(_parse_time_str(t_r)) if t_r else None
+                            if not _allow_guard_rewrite(
+                                row_vals,
+                                list_index,
+                                q_req_ist,
+                                q_ack_ist,
+                                cand_r_ist or q_ack_ist,
+                                "BlueQuotedPairReanchor",
+                                "quoted",
+                            ):
+                                continue
                             used_quoted_pair_keys.add(pair_key)
                             row_vals["Created Date & Time"] = t_c
                             row_vals["Actual Response Date & Time"] = t_a
@@ -9984,6 +10813,7 @@ def main() -> int:
                     key = (
                         subject_norm,
                         requester.strip().lower(),
+                        state.get("service_bucket") or "",
                         cand[0].replace(second=0, microsecond=0),
                         cand[1].replace(second=0, microsecond=0),
                     )
@@ -10003,6 +10833,7 @@ def main() -> int:
                         key = (
                             subject_norm,
                             requester.strip().lower(),
+                            state.get("service_bucket") or "",
                             cand[0].replace(second=0, microsecond=0),
                             cand[1].replace(second=0, microsecond=0),
                         )
@@ -10021,6 +10852,7 @@ def main() -> int:
                     pair_key = (
                         subject_norm,
                         requester.strip().lower(),
+                        state.get("service_bucket") or "",
                         q_req_ist.replace(second=0, microsecond=0),
                         q_ack_ist.replace(second=0, microsecond=0),
                     )
@@ -10037,6 +10869,17 @@ def main() -> int:
                         if not r_ist_now or r_ist_now < q_ack_ist:
                             t_r = t_a
                         if t_c and t_a and t_r:
+                            cand_r_ist = _to_ist(_parse_time_str(t_r)) if t_r else None
+                            if not _allow_guard_rewrite(
+                                row_vals,
+                                list_index,
+                                q_req_ist,
+                                q_ack_ist,
+                                cand_r_ist or q_ack_ist,
+                                "BlueQuotedPairReanchorNonESS",
+                                "quoted",
+                            ):
+                                continue
                             used_quoted_pair_keys.add(pair_key)
                             row_vals["Created Date & Time"] = t_c
                             row_vals["Actual Response Date & Time"] = t_a
@@ -10166,6 +11009,7 @@ def main() -> int:
                                 key = (
                                     subject_norm,
                                     requester.strip().lower(),
+                                    state.get("service_bucket") or "",
                                     cand_ist.replace(second=0, microsecond=0),
                                 )
                                 if key in used_ess_continuation_blue:
@@ -10238,6 +11082,17 @@ def main() -> int:
                                     if not r_ist_now or r_ist_now < pair_ack:
                                         t_r = t_a
                                     if t_c and t_a and t_r:
+                                        cand_r_ist = _to_ist(_parse_time_str(t_r)) if t_r else None
+                                        if not _allow_guard_rewrite(
+                                            row_vals,
+                                            list_index,
+                                            pair_req,
+                                            pair_ack,
+                                            cand_r_ist or pair_ack,
+                                            "BlueQuotedPairReanchorNonESSLatest",
+                                            "quoted",
+                                        ):
+                                            continue
                                         row_vals["Created Date & Time"] = t_c
                                         row_vals["Actual Response Date & Time"] = t_a
                                         row_vals["Actual Resolved Date & Time"] = t_r
@@ -10653,6 +11508,7 @@ def main() -> int:
                     if list_index < len(debug_rows):
                         debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
 
+        _stage_timer_stop("blue_quoted_and_continuation_passes", blue_quoted_started_at, items=len(row_states))
         # Duplicate same-time de-collision (isolated):
         # If multiple rows for the same requester ended up with identical
         # created/response/resolved, move only secondary rows to another valid
@@ -10662,9 +11518,11 @@ def main() -> int:
         # episode and latest requester mail is an update/ack-like, recover the
         # latest quoted requester reply under that mail and use it as the true
         # episode anchor.
+        episode_guard_started_at = _stage_timer_start()
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "requester_ack_episode_guard")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
@@ -10730,6 +11588,16 @@ def main() -> int:
             t = _format_time(q_ist)
             if not t:
                 continue
+            if not _allow_guard_rewrite(
+                row_vals,
+                list_index,
+                q_ist,
+                q_ist,
+                q_ist,
+                "RequesterAckLikeQuotedEpisodeGuard",
+                "requester_ack",
+            ):
+                continue
             row_vals["Created Date & Time"] = t
             row_vals["Actual Response Date & Time"] = t
             row_vals["Actual Resolved Date & Time"] = t
@@ -10763,6 +11631,7 @@ def main() -> int:
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "ess_hybrid_ack_episode_guard")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
@@ -10891,6 +11760,16 @@ def main() -> int:
             t_r = _format_time(resolved_ist)
             if not (t_c and t_a and t_r):
                 continue
+            if not _allow_guard_rewrite(
+                row_vals,
+                list_index,
+                req_pick,
+                ack_ist,
+                resolved_ist,
+                "EssHybridAckEpisodeGuard",
+                "hybrid",
+            ):
+                continue
 
             row_vals["Created Date & Time"] = t_c
             row_vals["Actual Response Date & Time"] = t_a
@@ -10908,12 +11787,15 @@ def main() -> int:
                 if list_index < len(debug_rows):
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
 
+        _stage_timer_stop("requester_ack_and_hybrid_episode_guards", episode_guard_started_at, items=len(row_states) * 2)
         # Risky fallback collapse guard (narrow):
         # Inspect only risky fallback rows that collapsed all three timestamps to
         # one point, and only re-anchor when a clearly better episode is found.
+        risky_and_duplicate_started_at = _stage_timer_start()
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "risky_fallback_collapse_guard")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
@@ -11007,6 +11889,16 @@ def main() -> int:
                 return
             if not (e_c_ist < e_a_ist <= e_r_ist):
                 return
+            if not _allow_guard_rewrite(
+                row_vals,
+                list_index,
+                e_c_ist,
+                e_a_ist,
+                e_r_ist,
+                owner_tag,
+                "risk",
+            ):
+                return
 
             row_vals["Created Date & Time"] = t_c
             row_vals["Actual Response Date & Time"] = t_a
@@ -11028,6 +11920,7 @@ def main() -> int:
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
 
         for state in row_states:
+            _trace_stage_row(state, state.get("list_index"), "risky_guard_owner_apply")
             _apply_risk_guard_episode_to_owner(
                 state,
                 lambda notes_l: "quotedrequestonly" in notes_l,
@@ -11051,6 +11944,7 @@ def main() -> int:
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "distinct_occurrence_map")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
@@ -11066,6 +11960,10 @@ def main() -> int:
                 continue
             row_vals = automation_rows[list_index]
             req = _requester_key(state.get("requester") or "")
+            service_bucket = state.get("service_bucket") or _subject_service_bucket(
+                (state.get("subject_norm") or "").lower(),
+                state.get("service_no") or "",
+            )
             c = row_vals.get("Created Date & Time") or ""
             a = row_vals.get("Actual Response Date & Time") or ""
             r = row_vals.get("Actual Resolved Date & Time") or ""
@@ -11078,9 +11976,9 @@ def main() -> int:
                 # occurrence. Group by requester+subject+created/ack so the
                 # later distinct-occurrence repair can still re-align all
                 # three timestamps together.
-                key = ("ess_like_created_ack", req, subject_key, c, a)
+                key = ("ess_like_created_ack", req, subject_key, service_bucket, c, a)
             else:
-                key = ("triplet", req, c, a, r)
+                key = ("triplet", req, service_bucket, c, a, r)
             duplicate_groups.setdefault(key, []).append(state)
 
         for dkey, group in duplicate_groups.items():
@@ -11353,6 +12251,7 @@ def main() -> int:
                     debug_rows[li]["ResolvedSource"] = who
                     debug_rows[li]["Notes"] = f"{debug_rows[li].get('Notes','')}; DuplicateDecollision"
 
+        _stage_timer_stop("risky_and_duplicate_repair_passes", risky_and_duplicate_started_at, items=len(row_states))
         if workbook_kind == "task_business":
             raw_task_candidate_cache = {}
             task_msgs_by_core = {}
@@ -11396,6 +12295,7 @@ def main() -> int:
                 for key in list(bucket.keys()):
                     bucket[key].sort(key=lambda e: _email_ist(e) or datetime.min)
 
+            task_post_started_at = _stage_timer_start()
             for state in row_states:
                 list_index = state.get("list_index")
                 row_idx = state.get("row_index")
@@ -11451,9 +12351,17 @@ def main() -> int:
                         return sent_ist >= same_all_lower_bound
                     return sent_ist.date() == ack_ist.date()
 
-                best_pick_ist = None
-                best_pick_src = ""
-                best_pick_note = ""
+                candidate_picks = []
+
+                def _push_task_pick(sent_ist, src, note, priority: int):
+                    if not sent_ist:
+                        return
+                    sent_minute = sent_ist.replace(second=0, microsecond=0)
+                    if not _task_pick_in_window(sent_ist, sent_minute):
+                        return
+                    if not task_same_all and sent_minute <= created_minute:
+                        return
+                    candidate_picks.append((sent_ist, priority, src, note))
 
                 live_pick_pool = (
                     task_non_ess_msgs_by_core.get(subject_core, [])
@@ -11462,20 +12370,18 @@ def main() -> int:
                 )
                 for e in live_pick_pool:
                     e_ist = _email_ist(e)
-                    e_minute = e_ist.replace(second=0, microsecond=0) if e_ist else None
-                    if not _task_pick_in_window(e_ist, e_minute):
+                    if not e_ist:
                         continue
-                    if best_pick_ist is None or e_ist > best_pick_ist:
-                        best_pick_ist = e_ist
-                        best_pick_src = e.sender_email or e.sender_name or ""
-                        best_pick_note = "TaskNearestPreAckRequest"
+                    _push_task_pick(
+                        e_ist,
+                        e.sender_email or e.sender_name or "",
+                        "TaskNearestPreAckRequest",
+                        0,
+                    )
 
-                if best_pick_ist is None and row_id_tokens:
+                if row_id_tokens:
                     for subject_raw, sent_dt, sender_email, sender_name in _raw_task_candidates_for_ids(row_id_tokens):
                         sent_ist = _to_ist(sent_dt)
-                        sent_minute = sent_ist.replace(second=0, microsecond=0) if sent_ist else None
-                        if not _task_pick_in_window(sent_ist, sent_minute):
-                            continue
                         if sender_email and (
                             sender_email in ess_email_set
                             or ("@" in sender_email and sender_email.split("@", 1)[-1] in ess_domain_set)
@@ -11484,10 +12390,12 @@ def main() -> int:
                         s_core = _task_subject_core(subject_raw)
                         if not s_core or s_core != subject_core:
                             continue
-                        if best_pick_ist is None or sent_ist > best_pick_ist:
-                            best_pick_ist = sent_ist
-                            best_pick_src = sender_email or sender_name or "RAW_EML_SUBJECT_MATCH"
-                            best_pick_note = "TaskNearestPreAckRequestRaw"
+                        _push_task_pick(
+                            sent_ist,
+                            sender_email or sender_name or "RAW_EML_SUBJECT_MATCH",
+                            "TaskNearestPreAckRequestRaw",
+                            2,
+                        )
 
                 def _quoted_from_line_is_ess(from_line: str):
                     addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", from_line or "", flags=re.I)
@@ -11497,39 +12405,31 @@ def main() -> int:
                     domains_l = [em.split("@", 1)[-1] for em in emails_l if "@" in em]
                     return any(em in ess_email_set for em in emails_l) or any(d in ess_domain_set for d in domains_l)
 
-                if best_pick_ist is None:
-                    quoted_pick = None
-                    quoted_live_pool = (
-                        task_msgs_by_core.get(subject_core, [])
-                        if task_same_all
-                        else task_msgs_by_core_day.get((subject_core, ack_ist.date()), [])
-                    )
-                    for e in quoted_live_pool:
-                        e_ist = _email_ist(e)
-                        e_minute = e_ist.replace(second=0, microsecond=0) if e_ist else None
-                        if not _task_pick_in_window(e_ist, e_minute):
+                quoted_live_pool = (
+                    task_msgs_by_core.get(subject_core, [])
+                    if task_same_all
+                    else task_msgs_by_core_day.get((subject_core, ack_ist.date()), [])
+                )
+                for e in quoted_live_pool:
+                    e_ist = _email_ist(e)
+                    e_minute = e_ist.replace(second=0, microsecond=0) if e_ist else None
+                    if not _task_pick_in_window(e_ist, e_minute):
+                        continue
+                    for from_line, sent_ist, q_subj in _get_quoted_blocks_with_subject_cached(e):
+                        q_core = _task_subject_core(q_subj or "")
+                        if not q_core or q_core != subject_core:
                             continue
-                        for from_line, sent_ist, q_subj in _get_quoted_blocks_with_subject_cached(e):
-                            sent_minute = sent_ist.replace(second=0, microsecond=0) if sent_ist else None
-                            if not _task_pick_in_window(sent_ist, sent_minute):
-                                continue
-                            if (not task_same_all) and sent_minute <= created_minute:
-                                continue
-                            q_core = _task_subject_core(q_subj or "")
-                            if not q_core or q_core != subject_core:
-                                continue
-                            is_ess = _quoted_from_line_is_ess(from_line)
-                            if is_ess is not False:
-                                continue
-                            if quoted_pick is None or sent_ist > quoted_pick[0]:
-                                quoted_pick = (sent_ist, from_line)
-                    if quoted_pick:
-                        best_pick_ist = quoted_pick[0]
-                        best_pick_src = "PARSED_FROM_QUOTED_REQUEST"
-                        best_pick_note = "TaskQuotedPreAckRequest"
+                        is_ess = _quoted_from_line_is_ess(from_line)
+                        if is_ess is not False:
+                            continue
+                        _push_task_pick(
+                            sent_ist,
+                            "PARSED_FROM_QUOTED_REQUEST",
+                            "TaskQuotedPreAckRequest",
+                            1,
+                        )
 
-                if best_pick_ist is None and subject_core:
-                    quoted_pick = None
+                if subject_core and row_id_tokens:
                     raw_paths = _find_eml_paths_by_id(row_id_tokens)
                     for path in raw_paths:
                         header_summary = _get_eml_header_summary(path)
@@ -11539,25 +12439,35 @@ def main() -> int:
                         if not s_core or s_core != subject_core:
                             continue
                         for from_line, sent_ist, q_subj in _get_quoted_blocks_from_eml_path(path):
-                            sent_minute = sent_ist.replace(second=0, microsecond=0) if sent_ist else None
-                            if not _task_pick_in_window(sent_ist, sent_minute):
-                                continue
-                            if (not task_same_all) and sent_minute <= created_minute:
-                                continue
                             q_core = _task_subject_core(q_subj or "")
                             if not q_core or q_core != subject_core:
                                 continue
                             is_ess = _quoted_from_line_is_ess(from_line)
                             if is_ess is not False:
                                 continue
-                            if quoted_pick is None or sent_ist > quoted_pick[0]:
-                                quoted_pick = (sent_ist, path)
-                    if quoted_pick:
-                        best_pick_ist = quoted_pick[0]
-                        best_pick_src = "PARSED_FROM_RAW_QUOTED_TASK"
-                        best_pick_note = "TaskQuotedPreAckRequestRaw"
+                            _push_task_pick(
+                                sent_ist,
+                                "PARSED_FROM_RAW_QUOTED_TASK",
+                                "TaskQuotedPreAckRequestRaw",
+                                3,
+                            )
 
-                best_pick_minute = best_pick_ist.replace(second=0, microsecond=0) if best_pick_ist else None
+                best_pick_ist = None
+                best_pick_src = ""
+                best_pick_note = ""
+                best_pick_minute = None
+                if candidate_picks:
+                    candidate_picks.sort(
+                        key=lambda item: (
+                            item[0].replace(second=0, microsecond=0),
+                            -item[1],
+                            item[0],
+                        ),
+                        reverse=True,
+                    )
+                    best_pick_ist, _best_priority, best_pick_src, best_pick_note = candidate_picks[0]
+                    best_pick_minute = best_pick_ist.replace(second=0, microsecond=0)
+
                 if not best_pick_ist:
                     continue
                 if task_same_all:
@@ -11576,6 +12486,94 @@ def main() -> int:
                     debug_rows[list_index]["CreatedSource"] = best_pick_src
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {best_pick_note}"
                 if (ack_minute - best_pick_minute) <= timedelta(minutes=16):
+                    _set_row_fill(row_idx, clear_fill)
+                    if list_index < len(debug_rows):
+                        debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
+
+            # Task local ack refinement:
+            # For suspicious task rows, prefer a real in-between ESS ack from the
+            # same local episode instead of leaving response collapsed to resolved
+            # or to a later non-ack mail. Keep this cache-backed and day-local.
+            for state in row_states:
+                list_index = state.get("list_index")
+                row_idx = state.get("row_index")
+                if list_index is None or list_index >= len(automation_rows) or not row_idx:
+                    continue
+                if state.get("is_dep_req") or state.get("is_dep_succ"):
+                    continue
+
+                row_vals = automation_rows[list_index]
+                requester = state.get("requester") or ""
+                subject_norm = (state.get("subject_norm") or "").lower()
+                created_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+                ack_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+                resolved_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time"))
+                if not (created_dt and ack_dt and resolved_dt):
+                    continue
+                created_ist = _to_ist(created_dt)
+                ack_ist = _to_ist(ack_dt)
+                resolved_ist = _to_ist(resolved_dt)
+                if not (created_ist and ack_ist and resolved_ist):
+                    continue
+                created_minute = created_ist.replace(second=0, microsecond=0)
+                ack_minute = ack_ist.replace(second=0, microsecond=0)
+                resolved_minute = resolved_ist.replace(second=0, microsecond=0)
+                is_blue_row = _row_has_blue_fill(row_idx)
+                if not (is_blue_row or ack_minute == resolved_minute):
+                    continue
+                if resolved_minute <= created_minute:
+                    continue
+
+                subject_core = _task_subject_core(subject_norm)
+                if not subject_core:
+                    continue
+
+                episode_pool = task_msgs_by_core_day.get((subject_core, resolved_ist.date()), [])
+                if not episode_pool:
+                    episode_pool = task_msgs_by_core.get(subject_core, [])
+                if not episode_pool:
+                    continue
+
+                ack_candidates = []
+                for e in episode_pool:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
+                        continue
+                    e_minute = e_ist.replace(second=0, microsecond=0)
+                    if e_minute <= created_minute or e_minute > resolved_minute:
+                        continue
+                    if requester and _req_match(e, requester):
+                        continue
+                    if not _ess_sender(e):
+                        continue
+                    explicit_ack = _ack_like(e) or _ack_like_text_fallback(e)
+                    short_ack = _ess_only_short_ack(e)
+                    if not explicit_ack and not short_ack:
+                        continue
+                    ack_candidates.append((0 if explicit_ack else 1, e_ist, e))
+
+                if not ack_candidates:
+                    continue
+
+                ack_candidates.sort(key=lambda item: (item[0], item[1]))
+                _ack_rank, ack_pick_ist, ack_pick = ack_candidates[0]
+                ack_pick_minute = ack_pick_ist.replace(second=0, microsecond=0)
+
+                if ack_pick_minute >= resolved_minute:
+                    continue
+                if ack_pick_minute == ack_minute:
+                    continue
+
+                t_a = _format_time(ack_pick_ist)
+                if not t_a:
+                    continue
+
+                row_vals["Actual Response Date & Time"] = t_a
+                ws.cell(row_idx, response_col).value = t_a
+                if list_index < len(debug_rows):
+                    debug_rows[list_index]["AckSource"] = ack_pick.sender_email or ack_pick.sender_name or "TASK_EPISODE_ACK"
+                    debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; TaskEpisodeAckRefine"
+                if (ack_pick_minute - created_minute) <= timedelta(minutes=16):
                     _set_row_fill(row_idx, clear_fill)
                     if list_index < len(debug_rows):
                         debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
@@ -11690,6 +12688,8 @@ def main() -> int:
                     if list_index < len(debug_rows):
                         debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
 
+            _stage_timer_stop("task_postprocess_passes", task_post_started_at, items=len(row_states) * 3)
+
         # Final blue cleanup validator:
         # If a row still has blue fill but its current Created->Response gap is no
         # longer blue-worthy, clear blue at the end so earlier stale markers do not
@@ -11697,6 +12697,7 @@ def main() -> int:
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
+            _trace_stage_row(state, list_index, "final_blue_cleanup")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if not _row_has_blue_fill(row_idx):
@@ -11741,6 +12742,16 @@ def main() -> int:
         f"[INFO] Finished worksheet fill: {_workbook_label(workbook_kind)} "
         f"in {time.perf_counter() - workbook_timer:.2f}s"
     )
+    if stage_times_enabled and stage_time_stats:
+        logger.log("[INFO] Stage timing summary:")
+        for name, stat in sorted(stage_time_stats.items(), key=lambda item: item[1]["seconds"], reverse=True):
+            items = stat.get("items", 0)
+            calls = stat.get("calls", 0)
+            avg_ms = ((stat["seconds"] / items) * 1000.0) if items else 0.0
+            logger.log(
+                f"[INFO]   {name}: {stat['seconds']:.2f}s "
+                f"(calls={calls}, items={items}, avg={avg_ms:.2f}ms/item)"
+            )
 
     csv_suffix = re.sub(r"[^a-z0-9]+", "_", template_path.stem.lower()).strip("_") or "output"
 

@@ -32,11 +32,25 @@ ACK_PHRASES = [
 NON_ACK_PHRASES = [
     "could you please provide us an update on the below",
     "could you please provide us an update regarding the below",
+    "could you please provide an update on the below request",
+    "could you please provide an update on the below",
+    "could you please provide an update regarding the below request",
+    "could you please provide an update regarding the below",
+    "could you please provide and update on the below request",
+    "could you please provide and update on the below",
     "could you update us on the below",
+    "could you update us regarding the below",
     "please provide us an update on the below",
     "please provide us an update",
+    "please provide an update on the below request",
     "please provide an update on the below",
+    "please provide an update regarding the below request",
+    "please provide an update regarding the below",
     "please provide an update",
+    "please update us on the below request",
+    "please update us on the below",
+    "please update us regarding the below request",
+    "please update us regarding the below",
     "thank you for the information",
     "thanks for the information",
     "thank you for the update",
@@ -202,7 +216,7 @@ def _is_thanks_info_reply(email_record) -> bool:
             "we will ignore",
             *NON_ACK_PHRASES,
         ],
-    )
+    ) or _is_update_chasing_text(body)
 
 
 def _normalize_for_phrase_match(text: str) -> str:
@@ -222,6 +236,21 @@ def _contains_any_phrase(text: str, phrases: list[str]) -> bool:
         if pn and pn in t:
             return True
     return False
+
+
+def _is_update_chasing_text(text: str) -> bool:
+    t = _normalize_for_phrase_match(text)
+    if not t:
+        return False
+    if _contains_any_phrase(t, NON_ACK_PHRASES):
+        return True
+    patterns = [
+        r"\bcould you(?: please)? provide(?: us)? (?:an|and)? update(?: on| regarding)?(?: the)? below(?: request)?\b",
+        r"\bplease provide(?: us)? (?:an|and)? update(?: on| regarding)?(?: the)? below(?: request)?\b",
+        r"\bcould you(?: please)? update us(?: on| regarding)?(?: the)? below(?: request)?\b",
+        r"\bplease update us(?: on| regarding)?(?: the)? below(?: request)?\b",
+    ]
+    return any(re.search(pat, t) for pat in patterns)
 
 
 def _is_explicit_ack_signal(text: str) -> bool:
@@ -273,7 +302,7 @@ def _is_ack_body(body: str) -> bool:
     if not body:
         return False
     top = _leading_body_segment(body)
-    if _contains_any_phrase(top, NON_ACK_PHRASES):
+    if _is_update_chasing_text(top):
         return False
     return _is_explicit_ack_signal(top)
 
@@ -286,7 +315,7 @@ def _email_has_explicit_ack_signal(email_record) -> bool:
     if not raw_full:
         return False
     top = _leading_body_segment(raw_full)
-    if _contains_any_phrase(top, NON_ACK_PHRASES):
+    if _is_update_chasing_text(top):
         return False
     fallback = raw_full[:2000]
     return _is_explicit_ack_signal(top) or (
@@ -306,7 +335,7 @@ def _email_has_short_ess_ack_signal(email_record) -> bool:
         return False
     if _contains_any_phrase(top, FILE_ACTION_PHRASES):
         return False
-    if _contains_any_phrase(top, NON_ACK_PHRASES):
+    if _is_update_chasing_text(top):
         return False
     if ("received" in top_l) and ("idoc" in top_l or "file" in top_l or "files" in top_l):
         return False
