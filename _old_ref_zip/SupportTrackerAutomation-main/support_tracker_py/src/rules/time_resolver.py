@@ -150,21 +150,6 @@ def _tokenize(name: str):
     return tokens
 
 
-def _is_force_same_time_subject(subject_norm: str | None, thread=None) -> bool:
-    subj_values = []
-    if subject_norm:
-        subj_values.append((subject_norm or "").lower())
-    for e in (thread or []):
-        subj = (getattr(e, "subject", "") or "").lower()
-        if subj:
-            subj_values.append(subj)
-    return any(
-        phrase in subj
-        for subj in subj_values
-        for phrase in FORCE_PROD_SAME_TIME_PHRASES
-    )
-
-
 def _email_local(sender_email: str) -> str:
     if not sender_email:
         return ""
@@ -384,68 +369,6 @@ def _email_has_short_ess_ack_signal(email_record) -> bool:
     if ("cid:" in raw_full.lower()) or ("<img" in raw_full.lower()):
         return False
     return True
-
-
-def _is_nonfinal_followup_reply(email_record) -> bool:
-    raw_full = f"{email_record.body or ''}\n{getattr(email_record, 'body_html', '') or ''}"
-    if not raw_full:
-        return False
-    top = _leading_body_segment(raw_full)
-    if not top:
-        return False
-    if _is_thanks_info_reply(email_record):
-        return True
-    return _is_update_chasing_text(top) or _contains_any_phrase(top, NON_ACK_PHRASES)
-
-
-def _has_direct_resolution_signal(email_record) -> bool:
-    raw_full = f"{email_record.body or ''}\n{getattr(email_record, 'body_html', '') or ''}"
-    if not raw_full:
-        return False
-    top = _leading_body_segment(raw_full)
-    if not top:
-        return False
-    if _is_update_chasing_text(top):
-        return False
-    return _contains_any_phrase(top, DIRECT_RESOLUTION_PHRASES)
-
-
-def _is_real_reply_candidate(email_record) -> bool:
-    if not email_record:
-        return False
-    if _has_direct_resolution_signal(email_record):
-        return True
-    if _is_nonfinal_followup_reply(email_record):
-        return False
-    if _email_has_explicit_ack_signal(email_record):
-        return False
-    if _email_has_short_ess_ack_signal(email_record):
-        return False
-    if _is_ack_like_reply(email_record):
-        return False
-    return True
-
-
-def _resolution_candidate_rank(email_record, ess_team) -> int:
-    if not _is_real_reply_candidate(email_record):
-        return -1
-    if _has_direct_resolution_signal(email_record) and _is_ess_sender(email_record, ess_team):
-        return 4
-    if _has_direct_resolution_signal(email_record):
-        return 3
-    return 2
-
-
-def _is_consultant_real_reply_candidate(email_record, requester_name: str, ess_team) -> bool:
-    if not email_record:
-        return False
-    if not _match_requester(
-        getattr(email_record, "sender_name", ""),
-        getattr(email_record, "sender_email", ""),
-        requester_name,
-    ):
-        return False
-    return _resolution_candidate_rank(email_record, ess_team) >= 0
 
 
 def _is_ack_like_reply(email_record) -> bool:
@@ -707,19 +630,13 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
         if (e.sender_email in requester_candidates)
         or _match_requester(e.sender_name, e.sender_email, requester_name)
     ]
-
-    if _is_force_same_time_subject(subject_norm, ordered):
-        t = _format_time(first.sent_time)
-        src = first.sender_email or first.sender_name
-        return (
-            TimeResult(t, t, t),
-            TimeDebug(src, src, src, "Force PROD subject; all times same"),
-        )
-
     def _latest_requester_non_ack(msgs):
         for e in reversed(msgs):
-            if _is_real_reply_candidate(e):
-                return e
+            if _is_ack_like_reply(e):
+                continue
+            if _is_thanks_info_reply(e):
+                continue
+            return e
         return None
 
     # Global resolved selector:
@@ -768,7 +685,13 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
     # non-ESS request in-between, anchor all three times to that latest requester reply.
     # This covers ESS-initiated and running chains with stale earlier request anchors.
     if requester_emails:
-        requester_non_ack = [e for e in requester_emails if _is_real_reply_candidate(e)]
+        requester_non_ack = [
+            e
+            for e in requester_emails
+            if not _is_ack_like_reply(e)
+            and not _is_thanks_info_reply(e)
+            and not _email_has_explicit_ack_signal(e)
+        ]
         if len(requester_non_ack) >= 2:
             latest_requester = max(requester_non_ack, key=lambda e: _to_ist(e.sent_time))
             prev_candidates = [
@@ -841,7 +764,9 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
             latest_top = ordered[-1]
             if (
                 _match_requester(latest_top.sender_name, latest_top.sender_email, requester_name)
-                and _is_real_reply_candidate(latest_top)
+                and not _is_ack_like_reply(latest_top)
+                and not _is_thanks_info_reply(latest_top)
+                and not _email_has_explicit_ack_signal(latest_top)
             ):
                 prev_msg = None
                 for e in reversed(ordered[:-1]):
@@ -860,6 +785,21 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                         TimeResult(t, t, t),
                         TimeDebug(src, src, src, "Requester follow-up(top-only)"),
                     )
+
+    # Force PROD subjects: all three times are the first email time
+    for e in ordered:
+        subj = (e.subject or "").lower()
+        if any(p in subj for p in FORCE_PROD_SAME_TIME_PHRASES):
+            t = _format_time(first.sent_time)
+            return (
+                TimeResult(t, t, t),
+                TimeDebug(
+                    first.sender_email,
+                    first.sender_email,
+                    first.sender_email,
+                    "Force PROD subject; all times same",
+                ),
+            )
 
     # If no ESS reply and no requester reply, mark all three same
     if not ess_emails and not requester_emails:
@@ -880,7 +820,9 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
             latest_msg = ordered[-1]
             if _match_requester(latest_msg.sender_name, latest_msg.sender_email, requester_name):
                 if (
-                    _is_real_reply_candidate(latest_msg)
+                    not _is_ack_like_reply(latest_msg)
+                    and not _is_thanks_info_reply(latest_msg)
+                    and not _email_has_explicit_ack_signal(latest_msg)
                 ):
                     prev_ess = None
                     for e in reversed(ordered[:-1]):
@@ -949,7 +891,11 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 # When the latest requester mail is a real (non-ack/non-thanks) update
                 # and it is on top of an ESS continuation (own/teammate), keep all three
                 # timestamps on that latest requester reply.
-                requester_non_ack_tail = [e for e in requester_emails if _is_real_reply_candidate(e)]
+                requester_non_ack_tail = [
+                    e
+                    for e in requester_emails
+                    if not _is_ack_like_reply(e) and not _is_thanks_info_reply(e)
+                ]
                 if requester_non_ack_tail:
                     latest_req_tail = max(requester_non_ack_tail, key=lambda e: e.sent_time)
                     latest_ess = max(ess_emails, key=lambda e: e.sent_time)
@@ -984,7 +930,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 if requester_emails:
                     try:
                         requester_non_ack_initial = [
-                            e for e in requester_emails if _is_real_reply_candidate(e)
+                            e for e in requester_emails if not _is_ack_like_reply(e)
                         ]
                         requester_first = min(requester_emails, key=lambda e: e.sent_time)
                         requester_first_non_ack = (
@@ -1012,25 +958,13 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                     except Exception:
                         pass
                 created_t = _format_time(created_mail_pick.sent_time)
-                non_ack_ess = [e for e in ess_emails if _is_real_reply_candidate(e)]
+                non_ack_ess = [e for e in ess_emails if not _is_ack_like_reply(e)]
                 last_ess = max(non_ack_ess, key=lambda e: e.sent_time) if non_ack_ess else max(ess_emails, key=lambda e: e.sent_time)
 
-                # Prefer the strongest real consultant reply in ESS-only
-                # requester-span threads. Do not let another ESS teammate win
-                # resolved when the row's consultant/requester lane should own it.
-                resolution_candidates = []
-                for e in requester_emails:
-                    if not getattr(e, "sent_time", None):
-                        continue
-                    if _to_ist(e.sent_time) < _to_ist(created_mail_pick.sent_time):
-                        continue
-                    if not _is_consultant_real_reply_candidate(e, requester_name, ess_team):
-                        continue
-                    rank = _resolution_candidate_rank(e, ess_team)
-                    resolution_candidates.append((rank, _to_ist(e.sent_time), e))
-                if resolution_candidates:
-                    resolution_candidates.sort(key=lambda item: (item[0], item[1]))
-                    resolved_mail_pick = resolution_candidates[-1][2]
+                # Prefer requester-owned reply for resolved in ESS-only span threads.
+                requester_non_ack = [e for e in requester_emails if not _is_ack_like_reply(e)]
+                if requester_non_ack:
+                    resolved_mail_pick = max(requester_non_ack, key=lambda e: e.sent_time)
                     span_note = "ESS-only; no non-ESS request; requester span"
                 elif requester_emails:
                     # All requester replies are ack-like/update-like; do not use them
@@ -1302,7 +1236,8 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 e for e in requester_emails
                 if getattr(e, "sent_time", None)
                 and _to_ist(e.sent_time) >= _to_ist(req_time)
-                and _is_real_reply_candidate(e)
+                and not _is_ack_like_reply(e)
+                and not _is_thanks_info_reply(e)
             ]
             req_after.sort(key=lambda e: e.sent_time)
             if req_after:
@@ -1819,7 +1754,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
             for e in requester_emails:
                 if not e.sent_time:
                     continue
-                if not _is_real_reply_candidate(e):
+                if _is_ack_like_reply(e):
                     continue
                 sent_dt = _to_ist(e.sent_time)
                 if sent_dt > ack_dt and sent_dt <= window_end:

@@ -139,110 +139,6 @@ function Get-WorkbookLabel {
     }
 }
 
-function Get-TemplateOutputStem {
-    param([string]$FileName)
-    $stem = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
-    $stem = $stem.ToLowerInvariant()
-    $stem = [regex]::Replace($stem, '[^a-z0-9]+', '_').Trim('_')
-    return $stem
-}
-
-function Assert-LastExitCode {
-    param([string]$Context)
-    if ($LASTEXITCODE -ne 0) {
-        throw ("{0} failed with exit code {1}." -f $Context, $LASTEXITCODE)
-    }
-}
-
-function Clear-TemplateArtifactsInVolume {
-    param(
-        [string]$VolumeName,
-        [string]$TemplateName
-    )
-    $stem = Get-TemplateOutputStem -FileName $TemplateName
-    & docker run --rm --entrypoint sh -v "${VolumeName}:/app/output" support-tracker -c "rm -f '/app/output/automation_output_${stem}.csv' '/app/output/debug_subjects_${stem}.csv'"
-    Assert-LastExitCode ("Clearing prior CSV artifacts for {0}" -f $TemplateName)
-    return $stem
-}
-
-function Get-TemplateArtifactsFromVolume {
-    param(
-        [string]$VolumeName,
-        [string]$TemplateName
-    )
-    $stem = Get-TemplateOutputStem -FileName $TemplateName
-    $cmd = 'a=''/app/output/automation_output_{0}.csv''; d=''/app/output/debug_subjects_{0}.csv''; test -s "$a" && test -s "$d" || exit 11; a_lines=$(wc -l < "$a"); d_lines=$(wc -l < "$d"); [ "$a_lines" -gt 1 ] && [ "$d_lines" -gt 1 ] || exit 12; printf ''%s|%s'' "$a_lines" "$d_lines"' -f $stem
-    $summary = & docker run --rm --entrypoint sh -v "${VolumeName}:/app/output" support-tracker -c $cmd
-    Assert-LastExitCode ("Verifying fresh CSV outputs for {0}" -f $TemplateName)
-    $parts = (($summary | Out-String).Trim()) -split '\|'
-    if ($parts.Count -ne 2) {
-        throw ("Unexpected CSV verification output for {0}: {1}" -f $TemplateName, $summary)
-    }
-    return [PSCustomObject]@{
-        AutomationLines = [int]$parts[0]
-        DebugLines = [int]$parts[1]
-    }
-}
-
-function Clear-TemplateArtifactsOnHost {
-    param(
-        [string]$OutputDir,
-        [string]$TemplateName
-    )
-    $stem = Get-TemplateOutputStem -FileName $TemplateName
-    foreach ($name in @("automation_output_${stem}.csv", "debug_subjects_${stem}.csv")) {
-        $path = Join-Path $OutputDir $name
-        if (Test-Path $path) {
-            Remove-Item -LiteralPath $path -Force
-        }
-    }
-    return $stem
-}
-
-function Get-TemplateArtifactsOnHost {
-    param(
-        [string]$OutputDir,
-        [string]$TemplateName
-    )
-    $stem = Get-TemplateOutputStem -FileName $TemplateName
-    $automationPath = Join-Path $OutputDir "automation_output_${stem}.csv"
-    $debugPath = Join-Path $OutputDir "debug_subjects_${stem}.csv"
-    foreach ($path in @($automationPath, $debugPath)) {
-        if (-not (Test-Path $path)) {
-            throw ("Expected output file was not created: {0}" -f $path)
-        }
-    }
-    $automationLines = (Get-Content -LiteralPath $automationPath | Measure-Object -Line).Lines
-    $debugLines = (Get-Content -LiteralPath $debugPath | Measure-Object -Line).Lines
-    if ($automationLines -le 1 -or $debugLines -le 1) {
-        throw ("Output CSVs look empty for {0}: automation={1}, debug={2}" -f $TemplateName, $automationLines, $debugLines)
-    }
-    return [PSCustomObject]@{
-        AutomationLines = [int]$automationLines
-        DebugLines = [int]$debugLines
-    }
-}
-
-function Assert-WorkbookCopiedBack {
-    param([string]$WorkbookPath)
-    if (-not (Test-Path $WorkbookPath)) {
-        throw ("Workbook was not copied back: {0}" -f $WorkbookPath)
-    }
-    $item = Get-Item -LiteralPath $WorkbookPath
-    if ($item.Length -le 0) {
-        throw ("Workbook copy looks empty: {0}" -f $WorkbookPath)
-    }
-}
-
-function Reset-VolumeRunArtifacts {
-    param([string]$VolumeName)
-    $cmd = @'
-find /app/output -mindepth 1 -maxdepth 1 ! -name eml -exec rm -rf {} +
-'@
-    & docker run --rm --entrypoint sh -v "${VolumeName}:/app/output" support-tracker -c $cmd
-    Assert-LastExitCode ("Resetting run artifacts in Docker volume {0}" -f $VolumeName)
-}
-
 Write-Host "Step 1b: Ensure Outlook export is finished before Docker"
 if (Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue) {
     $closed = Close-OutlookGracefully
@@ -333,34 +229,22 @@ if ($useVolume) {
     }
     Write-Host ("Using Docker volume for output: {0}" -f $volumeName)
     & docker volume create $volumeName | Out-Null
-    Assert-LastExitCode ("Creating Docker volume {0}" -f $volumeName)
-    if ($KeepVolumeData) {
-        Write-Host "Keeping EML cache, but clearing prior run artifacts from volume..."
-        Reset-VolumeRunArtifacts -VolumeName $volumeName
-    }
     foreach ($templateInfo in $templates) {
         $template = $templateInfo.File
         Write-Host ("Copying workbook into volume: {0}" -f $template.Name)
         & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "$($template.FullName):/host/template.xlsx:ro" support-tracker -c "cp /host/template.xlsx '/app/output/$($template.Name)'"
-        Assert-LastExitCode ("Copying workbook {0} into Docker volume" -f $template.Name)
     }
     try {
         $totalSw = [Diagnostics.Stopwatch]::StartNew()
         foreach ($templateInfo in $templates) {
             $template = $templateInfo.File
-            $null = Clear-TemplateArtifactsInVolume -VolumeName $volumeName -TemplateName $template.Name
             Write-Host ("Starting workbook fill: {0} ({1})" -f $templateInfo.Label, $template.Name)
             $sw = [Diagnostics.Stopwatch]::StartNew()
             & docker run --rm -e "TEMPLATE_PATH=/app/output/$($template.Name)" -v "${pstDir}:/app/input" -v "${volumeName}:/app/output" support-tracker
-            Assert-LastExitCode ("Docker workbook fill for {0}" -f $template.Name)
             $sw.Stop()
-            $csvSummary = Get-TemplateArtifactsFromVolume -VolumeName $volumeName -TemplateName $template.Name
             Write-Host ("Finished workbook fill: {0} | Time: {1}" -f $templateInfo.Label, $sw.Elapsed)
-            Write-Host ("Verified fresh outputs: {0} data row(s), {1} debug row(s)" -f ($csvSummary.AutomationLines - 1), ($csvSummary.DebugLines - 1))
             Write-Host ("Copying workbook back to host file: {0}" -f $template.Name)
             & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "${outputDir}:/host" support-tracker -c "cp '/app/output/$($template.Name)' '/host/$($template.Name)'"
-            Assert-LastExitCode ("Copying workbook {0} back to host" -f $template.Name)
-            Assert-WorkbookCopiedBack -WorkbookPath (Join-Path $outputDir $template.Name)
         }
         $totalSw.Stop()
         Write-Host ("Total workbook fill time: {0}" -f $totalSw.Elapsed)
@@ -368,7 +252,6 @@ if ($useVolume) {
         if (-not $KeepVolumeData) {
             Write-Host "Clearing volume data..."
             & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" support-tracker -c "find /app/output -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
-            Assert-LastExitCode ("Clearing Docker volume {0}" -f $volumeName)
             Write-Host "Cleanup complete (volume cleared)."
         } else {
             Write-Host "Keeping volume data (EMLs retained)."
@@ -410,15 +293,10 @@ if ($useVolume) {
     $totalSw = [Diagnostics.Stopwatch]::StartNew()
     foreach ($templateInfo in $templates) {
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        $null = Clear-TemplateArtifactsOnHost -OutputDir $outputDir -TemplateName $templateInfo.File.Name
         Write-Host ("Starting workbook fill: {0} ({1})" -f $templateInfo.Label, $templateInfo.File.Name)
         & docker run --rm -e "TEMPLATE_PATH=/app/output/$($templateInfo.File.Name)" -v "${pstDir}:/app/input" -v "${outputDir}:/app/output" support-tracker
-        Assert-LastExitCode ("Docker workbook fill for {0}" -f $templateInfo.File.Name)
         $sw.Stop()
-        $csvSummary = Get-TemplateArtifactsOnHost -OutputDir $outputDir -TemplateName $templateInfo.File.Name
         Write-Host ("Finished workbook fill: {0} | Time: {1}" -f $templateInfo.Label, $sw.Elapsed)
-        Write-Host ("Verified fresh outputs: {0} data row(s), {1} debug row(s)" -f ($csvSummary.AutomationLines - 1), ($csvSummary.DebugLines - 1))
-        Assert-WorkbookCopiedBack -WorkbookPath $templateInfo.File.FullName
     }
     $totalSw.Stop()
     Write-Host ("Total workbook fill time: {0}" -f $totalSw.Elapsed)

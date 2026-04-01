@@ -33,7 +33,6 @@ foreach ($dir in @($Script:DefaultTrackerRoot, $Script:DefaultScriptsDir, $Scrip
 }
 
 Write-Host "Connecting to Outlook..."
-$outlookWasRunning = @(Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue).Count -gt 0
 $startupPstHint = if ([string]::IsNullOrWhiteSpace($OutputPstPath)) { $Script:DefaultPstPath } else { $OutputPstPath }
 if ($startupPstHint -match '^[\\/]' -and $startupPstHint -notmatch '^[A-Za-z]:') {
     $defaultDrive = [System.IO.Path]::GetPathRoot($Script:DefaultTrackerRoot).TrimEnd('\')
@@ -233,79 +232,6 @@ function Remove-StaleManagedPstStores {
     }
 }
 
-function Remove-ManagedPstStoreByPath {
-    param(
-        [string]$TargetPstPath,
-        [int]$Retries = 3,
-        [int]$RetryDelaySeconds = 2
-    )
-    if ([string]::IsNullOrWhiteSpace($TargetPstPath)) { return $false }
-
-    $targetLower = ""
-    try {
-        $targetLower = [System.IO.Path]::GetFullPath($TargetPstPath).ToLower()
-    } catch {
-        $targetLower = $TargetPstPath.ToLower()
-    }
-
-    for ($attempt = 1; $attempt -le $Retries; $attempt++) {
-        $matchingStore = $null
-        $root = $null
-        foreach ($store in (Get-SafeStores)) {
-            $displayName = $null
-            $rootName = $null
-            $storePath = $null
-            try { $displayName = [string]$store.DisplayName } catch { $displayName = $null }
-            try {
-                $root = $store.GetRootFolder()
-                if ($root) { $rootName = [string]$root.Name }
-            } catch {
-                $root = $null
-                $rootName = $null
-            }
-            try { $storePath = [string]$store.FilePath } catch { $storePath = $null }
-
-            if (Test-ProtectedStoreName $displayName) { continue }
-            if (Test-ProtectedStoreName $rootName) { continue }
-            if (Test-ProtectedStoreName $storePath) { continue }
-            if ([string]::IsNullOrWhiteSpace($storePath)) { continue }
-            if (-not $storePath.ToLower().EndsWith(".pst")) { continue }
-
-            $storePathLower = ""
-            try {
-                $storePathLower = [System.IO.Path]::GetFullPath($storePath).ToLower()
-            } catch {
-                $storePathLower = $storePath.ToLower()
-            }
-
-            if ($storePathLower -ne $targetLower) { continue }
-            if (-not $root) { continue }
-
-            $matchingStore = $store
-            break
-        }
-
-        if (-not $matchingStore -or -not $root) {
-            return $true
-        }
-
-        try {
-            $namespace.RemoveStore($root)
-            Write-Host ("Detached managed export PST from Outlook: {0}" -f $TargetPstPath)
-            Start-Sleep -Seconds 1
-        } catch {
-            if ($attempt -ge $Retries) {
-                Write-Host ("WARNING: Unable to detach managed export PST after {0} attempt(s): {1}" -f $Retries, $TargetPstPath)
-                return $false
-            }
-            Write-Host ("WARNING: Detach attempt {0}/{1} failed for export PST, retrying: {2}" -f $attempt, $Retries, $TargetPstPath)
-            Start-Sleep -Seconds $RetryDelaySeconds
-        }
-    }
-
-    return (-not (Find-StoreByPath -targetPath $TargetPstPath))
-}
-
 Remove-StaleManagedPstStores -ManagedDir $Script:DefaultPstDir
 
 # Build store lookup (display name + root name) for shared mailboxes
@@ -418,28 +344,6 @@ function Find-StoreByPath {
         }
         if ($storePath.ToLower() -eq $targetLower) {
             return $store
-        }
-    }
-    return $null
-}
-
-function Wait-ForStoreByPath {
-    param(
-        [string]$TargetPath,
-        [int]$Retries = 8,
-        [int]$RetryDelaySeconds = 2
-    )
-    if ([string]::IsNullOrWhiteSpace($TargetPath)) { return $null }
-    for ($attempt = 1; $attempt -le $Retries; $attempt++) {
-        $store = Find-StoreByPath -targetPath $TargetPath
-        if ($store) {
-            if ($attempt -gt 1) {
-                Write-Host ("PST store became available after retry {0}/{1}." -f $attempt, $Retries)
-            }
-            return $store
-        }
-        if ($attempt -lt $Retries) {
-            Start-Sleep -Seconds $RetryDelaySeconds
         }
     }
     return $null
@@ -873,11 +777,10 @@ if ($outDir -ne $Script:DefaultPstDir) {
 }
 
 Remove-StaleManagedPstStores -ManagedDir $outDir -TargetPstPath $OutputPstPath
-Remove-ManagedPstStoreByPath -TargetPstPath $OutputPstPath | Out-Null
 
 Write-Host "Opening/creating PST at: $OutputPstPath"
 Write-Host "Checking if PST is already attached..."
-$destStore = Wait-ForStoreByPath -TargetPath $OutputPstPath -Retries 2 -RetryDelaySeconds 1
+$destStore = Find-StoreByPath -targetPath $OutputPstPath
 if ($destStore) {
     Write-Host "PST already attached. Skipping AddStore."
 } else {
@@ -896,9 +799,9 @@ if ($destStore) {
         $firstError = $_.Exception.Message
         throw ("AddStore failed: {0}`nManual action needed: detach and remove the stale export PST from Outlook Data Files, then run again.`nSafe target only: {1}`nNever remove anything containing @invenio-solutions.com." -f $firstError, $OutputPstPath)
     }
-    $destStore = Wait-ForStoreByPath -TargetPath $OutputPstPath -Retries 10 -RetryDelaySeconds 2
 }
 
+$destStore = Find-StoreByPath -targetPath $OutputPstPath
 if (-not $destStore) {
     throw "Unable to open PST store: $OutputPstPath"
 }
@@ -1195,29 +1098,12 @@ try {
     }
 } finally {
     if ($destRoot) {
-        $null = Remove-ManagedPstStoreByPath -TargetPstPath $OutputPstPath -Retries 4 -RetryDelaySeconds 3
-    }
-    try {
-        if (-not $outlookWasRunning -and $outlook) {
-            try {
-                $outlook.Quit()
-                Write-Host "Closed Outlook instance started by export script."
-            } catch {
-            }
+        try {
+            $namespace.RemoveStore($destRoot)
+            Write-Host ("Detached export PST from Outlook: {0}" -f $OutputPstPath)
+        } catch {
+            Write-Host ("WARNING: Unable to detach export PST from Outlook automatically: {0}" -f $OutputPstPath)
         }
-    } finally {
-        foreach ($comObj in @($destRoot, $destStore, $inbox, $namespace, $outlook)) {
-            if ($comObj) {
-                try {
-                    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObj)
-                } catch {
-                }
-            }
-        }
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
     }
 }
 
