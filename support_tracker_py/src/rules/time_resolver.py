@@ -410,20 +410,60 @@ def _has_direct_resolution_signal(email_record) -> bool:
     return _contains_any_phrase(top, DIRECT_RESOLUTION_PHRASES)
 
 
-def _is_real_reply_candidate(email_record) -> bool:
+def _classify_reply_kind(email_record) -> dict:
     if not email_record:
-        return False
-    if _has_direct_resolution_signal(email_record):
-        return True
-    if _is_nonfinal_followup_reply(email_record):
-        return False
-    if _email_has_explicit_ack_signal(email_record):
-        return False
-    if _email_has_short_ess_ack_signal(email_record):
-        return False
-    if _is_ack_like_reply(email_record):
-        return False
-    return True
+        return {
+            "direct_resolution": False,
+            "thanks_info": False,
+            "nonfinal_followup": False,
+            "explicit_ack": False,
+            "short_ess_ack": False,
+            "ack_like": False,
+            "real_reply": False,
+            "kind": "none",
+        }
+
+    direct_resolution = _has_direct_resolution_signal(email_record)
+    thanks_info = _is_thanks_info_reply(email_record)
+    nonfinal_followup = _is_nonfinal_followup_reply(email_record)
+    explicit_ack = _email_has_explicit_ack_signal(email_record)
+    short_ess_ack = _email_has_short_ess_ack_signal(email_record)
+    ack_like = _is_ack_like_reply(email_record)
+    real_reply = False
+    if direct_resolution:
+        real_reply = True
+    elif not (nonfinal_followup or explicit_ack or short_ess_ack or ack_like):
+        real_reply = True
+
+    if direct_resolution:
+        kind = "direct_resolution"
+    elif real_reply:
+        kind = "real_reply"
+    elif short_ess_ack:
+        kind = "short_ess_ack"
+    elif explicit_ack or ack_like:
+        kind = "ack_like"
+    elif thanks_info:
+        kind = "thanks_info"
+    elif nonfinal_followup:
+        kind = "nonfinal_followup"
+    else:
+        kind = "other"
+
+    return {
+        "direct_resolution": direct_resolution,
+        "thanks_info": thanks_info,
+        "nonfinal_followup": nonfinal_followup,
+        "explicit_ack": explicit_ack,
+        "short_ess_ack": short_ess_ack,
+        "ack_like": ack_like,
+        "real_reply": real_reply,
+        "kind": kind,
+    }
+
+
+def _is_real_reply_candidate(email_record) -> bool:
+    return _classify_reply_kind(email_record)["real_reply"]
 
 
 def _resolution_candidate_rank(email_record, ess_team) -> int:

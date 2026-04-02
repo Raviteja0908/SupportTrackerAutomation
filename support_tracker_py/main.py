@@ -23,6 +23,7 @@ from src.rules.time_resolver import (
     _match_requester,
     _is_ess_sender,
     _is_ack_like_reply,
+    _classify_reply_kind as _shared_reply_classification,
     _is_thanks_info_reply,
     _email_has_explicit_ack_signal,
     _is_force_same_time_subject,
@@ -125,6 +126,28 @@ def _shared_resolution_candidates(candidates):
     ]
     preferred = [e for e in ordered if _is_shared_real_reply_candidate(e)]
     return preferred
+
+
+def _post_ack_reply_rank(email_record, requester_name: str = ""):
+    cls = _shared_reply_classification(email_record)
+    requester_match = bool(
+        requester_name
+        and _match_requester(
+            getattr(email_record, "sender_name", ""),
+            getattr(email_record, "sender_email", ""),
+            requester_name,
+        )
+    )
+    direct_resolution = bool(cls.get("direct_resolution"))
+    real_reply = bool(cls.get("real_reply"))
+    ack_like = bool(cls.get("ack_like") or cls.get("explicit_ack") or cls.get("short_ess_ack"))
+    return (
+        0 if requester_match else 1,
+        0 if direct_resolution else 1,
+        0 if real_reply else 1,
+        1 if ack_like else 0,
+        _to_ist(getattr(email_record, "sent_time", None)) or datetime.max,
+    )
 
 
 def _remove_note_tokens(notes_text: str, tokens_to_remove) -> str:
@@ -292,6 +315,24 @@ def main() -> int:
                     tokens.add(part)
         return tokens
 
+    def _task_subject_core(text: str) -> str:
+        norm = normalize_subject(text or "")
+        if not norm:
+            return ""
+        core = norm
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("ess - ", "re: ", "fw: ", "fwd: "):
+                if core.startswith(prefix):
+                    core = core[len(prefix):].strip()
+                    changed = True
+        core = re.sub(r"\s*-\s*task\d+\b", "", core, flags=re.IGNORECASE).strip()
+        core = re.sub(r"\s*(?:--?>|=>)\s*\d{1,2}[-/.]\d{1,2}(?:[-/.]\d{2,4})?\s*$", "", core, flags=re.IGNORECASE).strip()
+        core = re.sub(r"\s*(?:--?>|=>)\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$", "", core, flags=re.IGNORECASE).strip()
+        core = re.sub(r"\s+", " ", core).strip(" -:")
+        return core.lower()
+
     def _part_tokens(text: str):
         if not text:
             return set()
@@ -457,6 +498,172 @@ def main() -> int:
             out.add(n)
         return out
 
+    def _subject_family_similarity(a: str, b: str) -> float:
+        a_norm = normalize_subject_for_match(a or "")
+        b_norm = normalize_subject_for_match(b or "")
+        a_tokens = _match_tokens(a_norm)
+        b_tokens = _match_tokens(b_norm)
+        if not a_tokens or not b_tokens:
+            return 0.0
+        return _token_overlap_score(a_tokens, b_tokens)
+
+    def _same_subject_family(a: str, b: str) -> bool:
+        a_norm = normalize_subject_for_match(a or "")
+        b_norm = normalize_subject_for_match(b or "")
+        if not a_norm or not b_norm:
+            return False
+        if a_norm == b_norm:
+            return True
+        if (a_norm in b_norm or b_norm in a_norm) and _subject_family_similarity(a_norm, b_norm) >= 0.45:
+            return True
+        return False
+
+    def _strong_identity_overlap(a: str, b: str) -> bool:
+        if not a or not b:
+            return False
+        signal_pairs = (
+            (_inc_tokens(a), _inc_tokens(b)),
+            (_interface_tokens(a), _interface_tokens(b)),
+            (_id_like_tokens(a), _id_like_tokens(b)),
+            (_sig_num_tokens(a), _sig_num_tokens(b)),
+            (_part_tokens(a), _part_tokens(b)),
+        )
+        for left, right in signal_pairs:
+            if left and right and not left.isdisjoint(right):
+                return True
+        return False
+
+    def _fresh_picker_subject_safe(subject_norm: str, key: str, iface_tokens=None, allow_added_inc: bool = False) -> bool:
+        if not subject_norm or not key:
+            return False
+        subj_norm = normalize_subject_for_match(subject_norm)
+        key_norm = normalize_subject_for_match(key)
+        subj_inc_set = _inc_tokens(subj_norm)
+        key_inc_set = _inc_tokens(key_norm)
+        if not allow_added_inc and _defer_added_inc_identity(subj_inc_set, key_inc_set):
+            return False
+        if _same_subject_family(subj_norm, key_norm):
+            return True
+        if not _strong_identity_overlap(subj_norm, key_norm):
+            return False
+        subj_iface_set = _interface_tokens(subj_norm)
+        if not subj_iface_set and iface_tokens:
+            subj_iface_set = set(iface_tokens)
+        key_iface_set = _interface_tokens(key_norm)
+        if subj_iface_set and key_iface_set and subj_iface_set.isdisjoint(key_iface_set):
+            return False
+        similarity = _subject_family_similarity(subj_norm, key_norm)
+        if similarity >= 0.55:
+            return True
+        shared_num = _sig_num_tokens(subj_norm) & _sig_num_tokens(key_norm)
+        shared_part = _part_tokens(subj_norm) & _part_tokens(key_norm)
+        shared_iface = subj_iface_set & key_iface_set if subj_iface_set and key_iface_set else set()
+        shared_id = _id_like_tokens(subj_norm) & _id_like_tokens(key_norm)
+        return similarity >= 0.35 and bool(shared_num or shared_part or shared_iface or shared_id)
+
+    def _find_hidden_subject_rescue(subject_norm: str, requester: str, date_tokens=None, iface_tokens=None, baseline_date=None):
+        if not subject_norm or not requester:
+            return None
+        iface_tokens = iface_tokens or set()
+        subj_norm = normalize_subject_for_match(subject_norm)
+        subj_tokens = _match_tokens(subj_norm)
+        if not subj_tokens:
+            return None
+        subj_inc_set = _inc_tokens(subj_norm)
+        subj_iface_set = _interface_tokens(subj_norm) or set(iface_tokens)
+        ranked = []
+        for key, thread in threads.items():
+            if not thread:
+                continue
+            has_requester = _thread_has_requester(thread, requester)
+            has_consultant_date = bool(date_tokens and _thread_has_consultant_on_or_near_date(thread, date_tokens, requester))
+            has_thread_date = bool(date_tokens and _thread_has_date_token(thread, date_tokens))
+            if not has_requester and not has_consultant_date:
+                continue
+            if date_tokens and not (has_thread_date or has_consultant_date):
+                continue
+            best_hidden_subject = None
+            best_hidden_score = None
+            best_hidden_similarity = 0.0
+            best_hidden_id_overlap = False
+            for e in thread:
+                subj_raw = getattr(e, "subject", "") or ""
+                hidden_norm = normalize_subject_for_match(subj_raw)
+                if not hidden_norm:
+                    continue
+                same_family = _same_subject_family(subj_norm, hidden_norm)
+                strong_id = _strong_identity_overlap(subj_norm, hidden_norm)
+                if not same_family and not strong_id:
+                    continue
+                hidden_iface_set = _interface_tokens(hidden_norm)
+                if subj_iface_set and hidden_iface_set and subj_iface_set.isdisjoint(hidden_iface_set):
+                    continue
+                hidden_inc_set = _inc_tokens(hidden_norm)
+                if subj_inc_set and hidden_inc_set and subj_inc_set.isdisjoint(hidden_inc_set):
+                    continue
+                similarity = _subject_family_similarity(subj_norm, hidden_norm)
+                if similarity < 0.45 and not strong_id:
+                    continue
+                score = similarity
+                if same_family:
+                    score += 0.18
+                if strong_id:
+                    score += 0.16
+                if has_requester:
+                    score += 0.10
+                if has_thread_date:
+                    score += 0.08
+                if has_consultant_date:
+                    score += 0.12
+                if baseline_date:
+                    delta = _requester_min_delta_days(thread, requester, baseline_date)
+                    if delta is not None:
+                        score += max(0.0, 0.08 - min(0.08, 0.02 * delta))
+                if best_hidden_score is None or score > best_hidden_score:
+                    best_hidden_score = score
+                    best_hidden_subject = subj_raw
+                    best_hidden_similarity = similarity
+                    best_hidden_id_overlap = strong_id
+            if best_hidden_score is None:
+                continue
+            ranked.append((
+                -best_hidden_score,
+                -best_hidden_similarity,
+                0 if best_hidden_id_overlap else 1,
+                key,
+                best_hidden_subject,
+                thread,
+            ))
+        if not ranked:
+            return None
+        ranked.sort()
+        best = ranked[0]
+        second = ranked[1] if len(ranked) > 1 else None
+        best_score = -best[0]
+        second_score = -second[0] if second else -1.0
+        if best_score < 0.78:
+            return None
+        if second and (best_score - second_score) < 0.08:
+            return None
+        return best[5], f"HiddenSubjectRescue:{best[4]}"
+
+    def _baseline_refine_safe(subject_norm: str, current_match_note: str, refined_key: str) -> bool:
+        if not refined_key:
+            return False
+        if _same_subject_family(subject_norm, refined_key):
+            return True
+        match_note_l = (current_match_note or "").lower()
+        exact_like = (
+            "rowexact" in match_note_l
+            or match_note_l.startswith("exact")
+            or match_note_l.startswith("altexact")
+        )
+        if exact_like:
+            return False
+        if not _strong_identity_overlap(subject_norm, refined_key):
+            return False
+        return _subject_family_similarity(subject_norm, refined_key) >= 0.35
+
     def _subject_for_description(description: str) -> str:
         subject_text = extract_subject_from_description(description or "")
         if description and re.search(r"(?:--?>|â†’|âž”|âž¡|=>)", description):
@@ -541,13 +748,18 @@ def main() -> int:
                 return True
         return False
 
-    def _pick_reply_after_ack(consultant_after, ack_ist, grace_minutes: int = 16):
+    def _pick_reply_after_ack(consultant_after, ack_ist, requester_name: str = "", grace_minutes: int = 16):
         if not consultant_after:
             return None
         # Prefer the earliest non-ack/non-reminder reply after ack.
         non_ack = _shared_resolution_candidates(consultant_after)
         if non_ack:
-            non_ack.sort(key=lambda e: e.sent_time)
+            non_ack.sort(
+                key=lambda e: (
+                    _post_ack_reply_rank(e, requester_name),
+                    e.sent_time,
+                )
+            )
             for e in non_ack:
                 try:
                     if _to_ist(e.sent_time) > ack_ist:
@@ -583,6 +795,8 @@ def main() -> int:
         pool = list(threads.items())
         for key, thread in pool:
             if not _thread_has_requester(thread, requester):
+                continue
+            if not _fresh_picker_subject_safe(subject_norm, key, iface_tokens=iface_tokens):
                 continue
             key_tokens = _match_tokens(key)
             if not key_tokens:
@@ -636,6 +850,8 @@ def main() -> int:
         pool = list(threads.items())
         for key, thread in pool:
             if not _thread_has_requester(thread, requester):
+                continue
+            if not _fresh_picker_subject_safe(subject_norm, key, iface_tokens=iface_tokens):
                 continue
             key_tokens = _match_tokens(key)
             if not key_tokens:
@@ -706,7 +922,7 @@ def main() -> int:
             return thread, f"RequesterDateBest:{key}"
         return None
 
-    def _union_alt_threads(alt_subject, requester=None):
+    def _union_alt_threads(alt_subject, requester=None, subject_norm=None, iface_tokens=None):
         if not alt_subject:
             return None
         keys = alt_index.get(alt_subject, [])
@@ -716,6 +932,8 @@ def main() -> int:
         seen = set()
         has_requester = False
         for k in keys:
+            if subject_norm and not _fresh_picker_subject_safe(subject_norm, k, iface_tokens=iface_tokens):
+                continue
             for e in threads.get(k, []):
                 dedup_key = (e.subject, e.sender_email, e.sent_time)
                 if dedup_key in seen:
@@ -912,6 +1130,8 @@ def main() -> int:
         pool = list(threads.items())
         for key, thread in pool:
             if not _thread_has_requester(thread, requester):
+                continue
+            if not _fresh_picker_subject_safe(subject_norm, key, iface_tokens=iface_tokens):
                 continue
             key_tokens = _match_tokens(key)
             if not key_tokens:
@@ -1282,8 +1502,9 @@ def main() -> int:
             e for e in thread
             if getattr(e, "sent_time", None)
             and _match_requester(e.sender_name, e.sender_email, requester_value)
+            and not _is_ack_like_reply(e)
+            and not _is_thanks_info_reply(e)
         ]
-        consultant_replies = _shared_resolution_candidates(consultant_replies)
         consultant_replies.sort(key=lambda e: e.sent_time)
         if len(consultant_replies) < 2:
             return thread, ""
@@ -1515,7 +1736,7 @@ def main() -> int:
                         return alt
                     # Last-resort union of alt-subject threads when requester is missing
                     if alt_subject:
-                        union = _union_alt_threads(alt_subject, requester)
+                        union = _union_alt_threads(alt_subject, requester, subject_norm=subject_norm, iface_tokens=iface_tokens)
                         if union:
                             return union, f"AltUnion:{alt_subject}"
             return t, "Exact"
@@ -1545,7 +1766,7 @@ def main() -> int:
                         return alt
                     # Last-resort union of alt-subject threads when requester is missing
                     if alt_subject:
-                        union = _union_alt_threads(alt_subject, requester)
+                        union = _union_alt_threads(alt_subject, requester, subject_norm=subject_norm, iface_tokens=iface_tokens)
                         if union:
                             return union, f"AltUnion:{alt_subject}"
             return t, "AltExact"
@@ -1575,6 +1796,8 @@ def main() -> int:
         for key, thread in threads.items():
             key_tokens = _match_tokens(key)
             if not key_tokens:
+                continue
+            if not _fresh_picker_subject_safe(subject_norm, key, iface_tokens=subj_iface_set or iface_tokens):
                 continue
 
             key_prefix = _interface_prefix(key)
@@ -1628,6 +1851,8 @@ def main() -> int:
 
         if alt_subject and alt_subject in alt_index:
             for key in alt_index[alt_subject]:
+                if not _fresh_picker_subject_safe(subject_norm, key, iface_tokens=subj_iface_set or iface_tokens):
+                    continue
                 thread = threads.get(key, [])
                 candidates.append((0.95, key, thread, "AltKey"))
 
@@ -1809,6 +2034,15 @@ def main() -> int:
                 candidates = inc_fallback
 
         if not candidates:
+            hidden_rescue = _find_hidden_subject_rescue(
+                subject_norm,
+                requester,
+                date_tokens=date_tokens,
+                iface_tokens=subj_iface_set or iface_tokens,
+                baseline_date=baseline_date,
+            )
+            if hidden_rescue:
+                return hidden_rescue
             return [], "No match"
 
         # Prefer candidates that actually contain a non-ESS request email.
@@ -1847,6 +2081,8 @@ def main() -> int:
                 pool = list(threads.items())
                 for key, thread in pool:
                     if not _thread_has_consultant_on_or_near_date(thread, date_tokens, requester):
+                        continue
+                    if not _fresh_picker_subject_safe(subject_norm, key, iface_tokens=subj_iface_set or iface_tokens):
                         continue
                     key_tokens = _match_tokens(key)
                     if not key_tokens:
@@ -2097,6 +2333,8 @@ def main() -> int:
                 for key, cand_thread in threads.items():
                     if not _thread_has_requester(cand_thread, requester):
                         continue
+                    if not _fresh_picker_subject_safe(subject_norm, key, iface_tokens=iface_hint_tokens):
+                        continue
                     key_tokens = _match_tokens(key)
                     if not key_tokens:
                         continue
@@ -2164,7 +2402,8 @@ def main() -> int:
                 )
                 if refined:
                     new_thread, refine_note, new_delta = refined
-                    if current_delta is None or new_delta + 1 < current_delta:
+                    refined_key = refine_note.split(":", 1)[1] if ":" in refine_note else ""
+                    if (current_delta is None or new_delta + 1 < current_delta) and _baseline_refine_safe(subject_norm, match_note, refined_key):
                         thread = new_thread
                         match_note = f"{match_note}; BaselineThreadRefined:{refine_note}" if match_note else f"BaselineThreadRefined:{refine_note}"
 
@@ -2180,7 +2419,8 @@ def main() -> int:
                 )
                 if refined:
                     new_thread, refine_note, new_delta = refined
-                    if current_delta is None or new_delta + 1 < current_delta:
+                    refined_key = refine_note.split(":", 1)[1] if ":" in refine_note else ""
+                    if (current_delta is None or new_delta + 1 < current_delta) and _baseline_refine_safe(subject_norm, match_note, refined_key):
                         thread = new_thread
                         match_note = f"{match_note}; {refine_note}"
 
@@ -3104,7 +3344,7 @@ def main() -> int:
                                 fallback_30m_used = True
 
                         if consultant_after:
-                            next_reply = _pick_reply_after_ack(consultant_after, ack_ist)
+                            next_reply = _pick_reply_after_ack(consultant_after, ack_ist, requester)
                             next_str = _format_time(next_reply.sent_time)
                             if next_str:
                                 times = TimeResult(times.created, times.response, next_str)
@@ -3240,6 +3480,9 @@ def main() -> int:
                 "thread": full_thread or thread,
                 "times": times,
                 "debug": debug,
+                "shared_decision": None,
+                "occurrence_locked": False,
+                "occurrence_lock_triplet": None,
                 "row_has_ids": state_row_has_ids,
                 "is_dep_req": is_dep_req,
                 "is_dep_succ": is_dep_succ,
@@ -3336,7 +3579,8 @@ def main() -> int:
             key = id(e)
             if key in _ack_like_cache:
                 return _ack_like_cache[key]
-            v = _is_ack_like_reply(e)
+            cls = _shared_reply_classification(e)
+            v = bool(cls.get("ack_like") or cls.get("explicit_ack"))
             _ack_like_cache[key] = v
             return v
 
@@ -3344,7 +3588,8 @@ def main() -> int:
             key = id(e)
             if key in _ack_like_text_cache:
                 return _ack_like_text_cache[key]
-            out = _shared_nonfinal_followup_reply(e)
+            cls = _shared_reply_classification(e)
+            out = bool(cls.get("nonfinal_followup") or cls.get("thanks_info"))
             _ack_like_text_cache[key] = out
             return out
 
@@ -3690,6 +3935,712 @@ def main() -> int:
             _expanded_thread_cache[cache_key] = out
             return out
 
+        def _is_occurrence_managed_notes(notes_l: str) -> bool:
+            notes_l = (notes_l or "").lower()
+            return (
+                "dateanchoroccurrence" in notes_l
+                or "ess-only; no non-ess request" in notes_l
+                or "requester follow-up" in notes_l
+                or "esscontinuationguard[" in notes_l
+                or "quotedrequestonlynopair" in notes_l
+            )
+
+        def _is_all_ack_to_ess_notes(notes_l: str) -> bool:
+            notes_l = (notes_l or "").lower()
+            return (
+                "requester span(all-ack->ess)" in notes_l
+                and "ess-only; no non-ess request" in notes_l
+            )
+
+        def _shared_occurrence_lane_plan(state):
+            requester = state.get("requester") or ""
+            subject_norm_value = (state.get("subject_norm") or "").lower()
+            service_no = state.get("service_no") or ""
+            list_index = state.get("list_index")
+            row_group_total = state.get("group_total") or 0
+            if list_index is None or not requester or not subject_norm_value:
+                return None
+
+            current_occ_key = state.get("occurrence_key") or _occurrence_group_key(subject_norm_value, requester, service_no)
+            current_notes_l = (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else ""
+            current_is_all_ack_to_ess = _is_all_ack_to_ess_notes(current_notes_l)
+            current_service_bucket = state.get("service_bucket") or _subject_service_bucket(subject_norm_value, service_no)
+            current_iface_tokens = _interface_tokens(subject_norm_value)
+
+            def _group_subject_match(other_subject_norm: str) -> bool:
+                other_norm = (other_subject_norm or "").lower()
+                if not other_norm:
+                    return False
+                return _fresh_picker_subject_safe(
+                    subject_norm_value,
+                    other_norm,
+                    iface_tokens=current_iface_tokens,
+                    allow_added_inc=True,
+                )
+
+            def _collect_group(subject_wide: bool):
+                group = []
+                group_requesters = set()
+                allow_acky_local = False
+                for s in row_states:
+                    other_li = s.get("list_index")
+                    if other_li is None or other_li >= len(automation_rows):
+                        continue
+                    other_notes_l = (debug_rows[other_li].get("Notes", "") or "").lower() if other_li < len(debug_rows) else ""
+                    if not _is_occurrence_managed_notes(other_notes_l):
+                        continue
+                    if subject_wide:
+                        if current_is_all_ack_to_ess and not _is_all_ack_to_ess_notes(other_notes_l):
+                            continue
+                        other_subject_norm = (s.get("subject_norm") or "").lower()
+                        if not _group_subject_match(other_subject_norm):
+                            continue
+                        other_service_bucket = s.get("service_bucket") or _subject_service_bucket(
+                            other_subject_norm,
+                            s.get("service_no") or "",
+                        )
+                        if current_service_bucket and other_service_bucket and other_service_bucket != current_service_bucket:
+                            continue
+                    else:
+                        other_occ_key = s.get("occurrence_key") or _occurrence_group_key(
+                            (s.get("subject_norm") or "").lower(),
+                            s.get("requester") or "",
+                            s.get("service_no") or "",
+                        )
+                        if other_occ_key != current_occ_key:
+                            continue
+                    allow_acky_local = allow_acky_local or ("requester span(all-ack->ess)" in other_notes_l)
+                    group.append(s)
+                    other_requester = (s.get("requester") or "").strip()
+                    if other_requester:
+                        group_requesters.add(other_requester)
+                group.sort(key=lambda x: x.get("row_index") or 10**9)
+                return group, group_requesters, allow_acky_local
+
+            requester_group, requester_group_requesters, requester_allow_acky = _collect_group(False)
+            use_subject_wide_ess = (
+                current_is_all_ack_to_ess
+                and _is_occurrence_managed_notes(current_notes_l)
+            )
+            subject_group = []
+            subject_group_requesters = set()
+            subject_allow_acky = False
+            if use_subject_wide_ess:
+                subject_group, subject_group_requesters, subject_allow_acky = _collect_group(True)
+
+            if len(subject_group) >= 2 and len(subject_group) > len(requester_group):
+                group_sorted = subject_group
+                group_requesters = subject_group_requesters
+                allow_acky = subject_allow_acky
+                selected_scope = "subject_wide_ess"
+            else:
+                group_sorted = requester_group
+                group_requesters = requester_group_requesters
+                allow_acky = requester_allow_acky
+                selected_scope = "requester"
+
+            if len(group_sorted) < 2 and row_group_total < 2:
+                return None
+            if len(group_sorted) < 2:
+                return None
+
+            group_sorted.sort(key=lambda x: x.get("row_index") or 10**9)
+            slot_index = None
+            for idx, s in enumerate(group_sorted):
+                if s.get("list_index") == list_index:
+                    slot_index = idx
+                    break
+            if slot_index is None:
+                return None
+
+            merged = []
+            for s in group_sorted:
+                base_thread = s.get("thread") or []
+                merged.extend(base_thread)
+                expanded = _expanded_thread(
+                    subject_norm_value,
+                    base_thread,
+                    requester,
+                    include_non_ess=True,
+                    reference_ist=None,
+                )
+                merged.extend(expanded or [])
+
+            dedup = {}
+            for e in merged:
+                sent_time = getattr(e, "sent_time", None)
+                if not sent_time:
+                    continue
+                key = (
+                    getattr(e, "subject", "") or "",
+                    getattr(e, "sender_email", "") or "",
+                    getattr(e, "sender_name", "") or "",
+                    sent_time,
+                )
+                dedup[key] = e
+            merged = list(dedup.values())
+            merged.sort(key=lambda e: e.sent_time)
+            if not merged:
+                return None
+
+            row_tokens = _match_tokens(subject_norm_value)
+            requester_names = tuple(sorted(group_requesters)) if group_requesters else ((requester,) if requester else tuple())
+
+            def _group_req_match(e):
+                if not requester_names:
+                    return False
+                return any(_match_requester(e.sender_name, e.sender_email, req_name) for req_name in requester_names if req_name)
+
+            def _collect_pool(allow_acky_local: bool, use_ess_pool: bool):
+                out = []
+                for e in merged:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
+                        continue
+                    if use_ess_pool:
+                        if not _ess_sender(e):
+                            continue
+                        cls = _shared_reply_classification(e)
+                        if _system_like_sender(e) or cls.get("thanks_info") or cls.get("nonfinal_followup"):
+                            continue
+                    else:
+                        cls = _shared_reply_classification(e)
+                        if not _group_req_match(e):
+                            continue
+                        if not allow_acky_local and not cls.get("real_reply"):
+                            continue
+                    if row_tokens:
+                        s_norm = normalize_subject(getattr(e, "subject", "") or "")
+                        s_tokens = _match_tokens(s_norm)
+                        score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                        contains = bool(
+                            subject_norm_value and s_norm and (
+                                subject_norm_value in s_norm or s_norm in subject_norm_value
+                            )
+                        )
+                        if score < 0.45 and not contains:
+                            continue
+                    out.append(e)
+
+                return _dedupe_reply_minutes_prefer_consultant(
+                    out,
+                    requester,
+                    created_role=not use_ess_pool,
+                    all_same=use_ess_pool,
+                )
+
+            def _collect_non_ess_ack_pool():
+                out = []
+                for e in merged:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
+                        continue
+                    if not _group_req_match(e):
+                        continue
+                    cls = _shared_reply_classification(e)
+                    if not (
+                        cls.get("ack_like")
+                        or cls.get("explicit_ack")
+                        or cls.get("short_ess_ack")
+                    ):
+                        continue
+                    if row_tokens:
+                        s_norm = normalize_subject(getattr(e, "subject", "") or "")
+                        s_tokens = _match_tokens(s_norm)
+                        score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                        contains = bool(
+                            subject_norm_value and s_norm and (
+                                subject_norm_value in s_norm or s_norm in subject_norm_value
+                            )
+                        )
+                        if score < 0.45 and not contains:
+                            continue
+                    out.append(e)
+
+                return _dedupe_reply_minutes_prefer_consultant(
+                    out,
+                    requester,
+                    created_role=False,
+                    all_same=False,
+                )
+
+            def _collect_direct_resolution_pool():
+                out = []
+                for e in merged:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
+                        continue
+                    if not _group_req_match(e):
+                        continue
+                    if not _shared_reply_classification(e).get("direct_resolution"):
+                        continue
+                    if row_tokens:
+                        s_norm = normalize_subject(getattr(e, "subject", "") or "")
+                        s_tokens = _match_tokens(s_norm)
+                        score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                        contains = bool(
+                            subject_norm_value and s_norm and (
+                                subject_norm_value in s_norm or s_norm in subject_norm_value
+                            )
+                        )
+                        if score < 0.45 and not contains:
+                            continue
+                    out.append(e)
+                return _dedupe_reply_minutes_prefer_consultant(
+                    out,
+                    requester,
+                    created_role=True,
+                    all_same=False,
+                )
+
+            def _collect_consultant_ess_pool():
+                out = []
+                for e in merged:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
+                        continue
+                    if not _ess_sender(e):
+                        continue
+                    if not _group_req_match(e):
+                        continue
+                    cls = _shared_reply_classification(e)
+                    if _system_like_sender(e) or cls.get("thanks_info") or cls.get("nonfinal_followup"):
+                        continue
+                    if row_tokens:
+                        s_norm = normalize_subject(getattr(e, "subject", "") or "")
+                        s_tokens = _match_tokens(s_norm)
+                        score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
+                        contains = bool(
+                            subject_norm_value and s_norm and (
+                                subject_norm_value in s_norm or s_norm in subject_norm_value
+                            )
+                        )
+                        if score < 0.45 and not contains:
+                            continue
+                    out.append(e)
+                return _dedupe_reply_minutes_prefer_consultant(
+                    out,
+                    requester,
+                    created_role=False,
+                    all_same=True,
+                )
+
+            reply_pool = _collect_pool(False, False)
+            acky_pool = _collect_pool(True, False) if allow_acky else list(reply_pool)
+            ess_pool = _collect_pool(True, True)
+            ack_pool = _collect_non_ess_ack_pool()
+            direct_pool = _collect_direct_resolution_pool()
+            consultant_ess_pool = _collect_consultant_ess_pool()
+
+            anchor_li = group_sorted[0].get("list_index")
+            a_dt = _parse_time_str(automation_rows[anchor_li].get("Actual Response Date & Time")) if anchor_li is not None else None
+            a_ist = _to_ist(a_dt) if a_dt else None
+            def _same_month_pool(pool_in):
+                if not a_ist:
+                    return list(pool_in)
+                same_month = []
+                for e in pool_in:
+                    e_ist = _email_ist(e)
+                    if e_ist and e_ist.year == a_ist.year and e_ist.month == a_ist.month:
+                        same_month.append(e)
+                if len(same_month) >= len(group_sorted):
+                    return same_month
+                return list(pool_in)
+
+            reply_pool = _same_month_pool(reply_pool)
+            acky_pool = _same_month_pool(acky_pool)
+            ess_pool = _same_month_pool(ess_pool)
+            ack_pool = _same_month_pool(ack_pool)
+            direct_pool = _same_month_pool(direct_pool)
+            consultant_ess_pool = _same_month_pool(consultant_ess_pool)
+
+            group_indexes = {
+                s.get("list_index")
+                for s in group_sorted
+                if s.get("list_index") is not None
+            }
+            used_outside_group = set()
+            for other_state in row_states:
+                other_li = other_state.get("list_index")
+                if other_li is None or other_li in group_indexes or other_li >= len(automation_rows):
+                    continue
+                if selected_scope == "subject_wide_ess":
+                    other_subject_norm = (other_state.get("subject_norm") or "").lower()
+                    if not _group_subject_match(other_subject_norm):
+                        continue
+                    other_service_bucket = other_state.get("service_bucket") or _subject_service_bucket(
+                        other_subject_norm,
+                        other_state.get("service_no") or "",
+                    )
+                    if current_service_bucket and other_service_bucket and other_service_bucket != current_service_bucket:
+                        continue
+                else:
+                    other_occ_key = other_state.get("occurrence_key") or _occurrence_group_key(
+                        (other_state.get("subject_norm") or "").lower(),
+                        other_state.get("requester") or "",
+                        other_state.get("service_no") or "",
+                    )
+                    if other_occ_key != current_occ_key:
+                        continue
+                other_a_dt = _parse_time_str(automation_rows[other_li].get("Actual Response Date & Time"))
+                other_a_ist = _to_ist(other_a_dt) if other_a_dt else None
+                if other_a_ist:
+                    used_outside_group.add(other_a_ist.replace(second=0, microsecond=0))
+
+            def _drop_used(pool_in):
+                pool_without_used = []
+                for e in pool_in:
+                    e_ist = _email_ist(e)
+                    if not e_ist:
+                        continue
+                    minute_key = e_ist.replace(second=0, microsecond=0)
+                    if minute_key in used_outside_group:
+                        continue
+                    pool_without_used.append(e)
+                if len(pool_without_used) >= len(group_sorted):
+                    return pool_without_used
+                return list(pool_in)
+
+            reply_pool = _drop_used(reply_pool)
+            acky_pool = _drop_used(acky_pool)
+            ess_pool = _drop_used(ess_pool)
+            ack_pool = _drop_used(ack_pool)
+            direct_pool = _drop_used(direct_pool)
+            consultant_ess_pool = _drop_used(consultant_ess_pool)
+
+            default_pool = reply_pool or acky_pool or consultant_ess_pool or ess_pool
+            if len(default_pool) < len(group_sorted):
+                return None
+
+            pick = default_pool[min(slot_index, len(default_pool) - 1)]
+            pick_ist = _email_ist(pick)
+            if not pick_ist:
+                return None
+
+            return {
+                "occ_key": current_occ_key,
+                "group": group_sorted,
+                "group_size": len(group_sorted),
+                "slot_index": slot_index,
+                "pool": default_pool,
+                "reply_pool": reply_pool,
+                "acky_pool": acky_pool,
+                "ess_pool": ess_pool,
+                "consultant_ess_pool": consultant_ess_pool,
+                "ack_pool": ack_pool,
+                "direct_pool": direct_pool,
+                "pick": pick,
+                "pick_when": pick_ist.replace(second=0, microsecond=0),
+                "lane_kind": "reply",
+                "merged": merged,
+                "notes_l": (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else "",
+                "subject_norm_value": subject_norm_value,
+                "scope": selected_scope,
+            }
+
+        def _shared_occurrence_fill_plan(state, *, quoted_sources=None, c_ist=None):
+            lane_plan = _shared_occurrence_lane_plan(state)
+            if not lane_plan:
+                return None
+
+            def _remember_decision(plan_obj):
+                if not state or not plan_obj:
+                    return plan_obj
+                lane_kind = plan_obj.get("lane_kind") or "reply"
+                lane_when = plan_obj.get("pick_when")
+                slot_index = plan_obj.get("slot_index", 0)
+                fill_style = "all_three_same" if lane_kind == "ess_over_ess" else "lane_guided"
+                confidence = "strong" if lane_kind == "ess_over_ess" else "moderate"
+                decision = {
+                    "owner": "shared_occurrence",
+                    "row_type": lane_kind,
+                    "occurrence_slot": slot_index,
+                    "lane_time": lane_when,
+                    "fill_style": fill_style,
+                    "confidence": confidence,
+                }
+                if lane_when and fill_style == "all_three_same":
+                    decision["triplet"] = (lane_when, lane_when, lane_when)
+                existing = state.get("shared_decision") or {}
+                if (
+                    existing.get("owner") == "shared_occurrence"
+                    and existing.get("row_type") == "ess_over_ess"
+                    and existing.get("fill_style") == "all_three_same"
+                    and existing.get("confidence") == "strong"
+                ):
+                    existing_triplet = existing.get("triplet")
+                    new_triplet = decision.get("triplet")
+                    # Do not let later weaker/local recomputation downgrade a
+                    # previously established strong occurrence-owned ESS lane.
+                    if lane_kind != "ess_over_ess":
+                        return plan_obj
+                    if existing_triplet and new_triplet and existing_triplet != new_triplet:
+                        return plan_obj
+                state["shared_decision"] = decision
+                return plan_obj
+
+            notes_l = lane_plan.get("notes_l", "")
+            subject_norm_value = lane_plan.get("subject_norm_value", "")
+            merged = lane_plan.get("merged") or []
+            row_tokens = _match_tokens(subject_norm_value)
+            group_size = lane_plan.get("group_size", 0)
+            slot_index = lane_plan.get("slot_index", 0)
+
+            def _pick_from(pool_in, lane_kind: str):
+                if not pool_in or len(pool_in) < group_size:
+                    return None
+                pick = pool_in[min(slot_index, len(pool_in) - 1)]
+                pick_ist = _email_ist(pick)
+                if not pick_ist:
+                    return None
+                return _remember_decision({
+                    **lane_plan,
+                    "pool": pool_in,
+                    "pick": pick,
+                    "pick_when": pick_ist.replace(second=0, microsecond=0),
+                    "lane_kind": lane_kind,
+                })
+
+            strong_non_ess_live = False
+            if "requester span(all-ack->ess)" in notes_l and "ess-only; no non-ess request" in notes_l:
+                # Treat non-ESS live evidence as strong only when it can
+                # actually furnish a lane for this repeated family, not merely
+                # because some unrelated older non-ESS reply exists somewhere in
+                # the merged thread history.
+                reply_pool = lane_plan.get("reply_pool") or []
+                ack_pool = lane_plan.get("ack_pool") or []
+                direct_pool = lane_plan.get("direct_pool") or []
+                if slot_index < len(direct_pool):
+                    strong_non_ess_live = True
+                elif (
+                    len(reply_pool) >= max(1, group_size)
+                    and slot_index < len(reply_pool)
+                    and slot_index < len(ack_pool)
+                ):
+                    strong_non_ess_live = True
+
+                strong_non_ess_quoted = False
+                if quoted_sources and c_ist:
+                    ess_email_set = {e.strip().lower() for e in ess_team or []}
+                    day_start = datetime(c_ist.year, c_ist.month, c_ist.day, tzinfo=c_ist.tzinfo)
+                    day_end = day_start + timedelta(days=1)
+                    quoted_non_ess = []
+                    quoted_ess = []
+                    for e in quoted_sources:
+                        for from_line, sent_ist in _extract_quoted_blocks(e, subject_norm_value):
+                            if sent_ist < day_start or sent_ist >= day_end:
+                                continue
+                            addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", from_line, flags=re.I)
+                            if not addr_hits:
+                                continue
+                            emails_l = [em.lower() for em in addr_hits]
+                            if any(em in ess_email_set for em in emails_l):
+                                quoted_ess.append(sent_ist)
+                            else:
+                                quoted_non_ess.append(sent_ist)
+                    if quoted_non_ess and quoted_ess:
+                        quoted_non_ess.sort()
+                        quoted_ess.sort()
+                        valid_pairs = []
+                        seen_ack_minutes = set()
+                        for ack_ist in quoted_ess:
+                            reqs = [r for r in quoted_non_ess if r < ack_ist]
+                            if not reqs:
+                                continue
+                            req_ist = reqs[-1]
+                            if (ack_ist - req_ist) <= timedelta(minutes=16):
+                                ack_minute = ack_ist.replace(second=0, microsecond=0)
+                                if ack_minute in seen_ack_minutes:
+                                    continue
+                                seen_ack_minutes.add(ack_minute)
+                                valid_pairs.append((req_ist, ack_ist))
+                        if slot_index < len(valid_pairs):
+                            strong_non_ess_quoted = True
+
+                if (not strong_non_ess_live) and (not strong_non_ess_quoted):
+                    plan = _pick_from(lane_plan.get("consultant_ess_pool") or [], "ess_over_ess")
+                    if not plan:
+                        plan = _pick_from(lane_plan.get("ess_pool") or [], "ess_over_ess")
+                    if plan:
+                        return plan
+
+            plan = _pick_from(lane_plan.get("reply_pool") or [], "reply")
+            if plan:
+                return plan
+            plan = _pick_from(lane_plan.get("acky_pool") or [], "ess_acky")
+            if plan:
+                return plan
+            plan = _pick_from(lane_plan.get("consultant_ess_pool") or [], "ess_over_ess")
+            if not plan:
+                plan = _pick_from(lane_plan.get("ess_pool") or [], "ess_over_ess")
+            if plan:
+                return plan
+            return _remember_decision(lane_plan)
+
+        def _subject_wide_all_ack_ess_override_plan(state):
+            if not state:
+                return None
+            list_index = state.get("list_index")
+            requester = state.get("requester") or ""
+            subject_norm_value = (state.get("subject_norm") or "").lower()
+            service_no = state.get("service_no") or ""
+            if list_index is None or not requester or not subject_norm_value:
+                return None
+            notes_l = (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else ""
+            if not _is_all_ack_to_ess_notes(notes_l):
+                return None
+
+            current_service_bucket = state.get("service_bucket") or _subject_service_bucket(subject_norm_value, service_no)
+            current_iface_tokens = _interface_tokens(subject_norm_value)
+
+            def _group_subject_match(other_subject_norm: str) -> bool:
+                other_norm = (other_subject_norm or "").lower()
+                if not other_norm:
+                    return False
+                return _fresh_picker_subject_safe(
+                    subject_norm_value,
+                    other_norm,
+                    iface_tokens=current_iface_tokens,
+                    allow_added_inc=True,
+                )
+
+            group_sorted = []
+            group_requesters = set()
+            for s in row_states:
+                other_li = s.get("list_index")
+                if other_li is None or other_li >= len(automation_rows):
+                    continue
+                other_notes_l = (debug_rows[other_li].get("Notes", "") or "").lower() if other_li < len(debug_rows) else ""
+                if not _is_all_ack_to_ess_notes(other_notes_l):
+                    continue
+                other_subject_norm = (s.get("subject_norm") or "").lower()
+                if not _group_subject_match(other_subject_norm):
+                    continue
+                other_service_bucket = s.get("service_bucket") or _subject_service_bucket(
+                    other_subject_norm,
+                    s.get("service_no") or "",
+                )
+                if current_service_bucket and other_service_bucket and other_service_bucket != current_service_bucket:
+                    continue
+                group_sorted.append(s)
+                other_requester = (s.get("requester") or "").strip()
+                if other_requester:
+                    group_requesters.add(other_requester)
+
+            if len(group_sorted) < 2:
+                return None
+
+            group_sorted.sort(key=lambda x: x.get("row_index") or 10**9)
+            slot_index = None
+            for idx, s in enumerate(group_sorted):
+                if s.get("list_index") == list_index:
+                    slot_index = idx
+                    break
+            if slot_index is None:
+                return None
+
+            requester_names = tuple(sorted(group_requesters)) if group_requesters else ((requester,) if requester else tuple())
+            row_tokens = _match_tokens(subject_norm_value)
+
+            def _group_req_match(email_obj):
+                if not requester_names:
+                    return False
+                return any(
+                    _match_requester(email_obj.sender_name, email_obj.sender_email, req_name)
+                    for req_name in requester_names
+                    if req_name
+                )
+
+            def _subject_match_override(email_subject: str) -> bool:
+                e_norm = normalize_subject(email_subject or "")
+                if not subject_norm_value or not e_norm:
+                    return False
+                if subject_norm_value == e_norm:
+                    return True
+                return subject_norm_value in e_norm or e_norm in subject_norm_value
+
+            def _dedupe_group_ess_minutes(items):
+                buckets = {}
+                for item in items:
+                    item_ist = _email_ist(item)
+                    if not item_ist:
+                        continue
+                    minute_key = item_ist.replace(second=0, microsecond=0)
+                    buckets.setdefault(minute_key, []).append(item)
+
+                out = []
+                for minute_key in sorted(buckets):
+                    bucket = buckets[minute_key]
+                    bucket.sort(
+                        key=lambda email_obj: (
+                            0 if _group_req_match(email_obj) else 1,
+                            0 if (_shared_reply_classification(email_obj).get("direct_resolution")) else 1,
+                            0 if (_shared_reply_classification(email_obj).get("real_reply")) else 1,
+                            _email_ist(email_obj) or datetime.max,
+                        )
+                    )
+                    out.append(bucket[0])
+                return out
+
+            consultant_ess_pool = []
+            ess_pool = []
+            for e in emails:
+                e_ist = _email_ist(e)
+                if not e_ist:
+                    continue
+                if not _ess_sender(e):
+                    continue
+                cls = _shared_reply_classification(e)
+                if _system_like_sender(e) or cls.get("thanks_info") or cls.get("nonfinal_followup"):
+                    continue
+                if not _subject_match_override(getattr(e, "subject", "") or ""):
+                    continue
+                ess_pool.append(e)
+                if _group_req_match(e):
+                    consultant_ess_pool.append(e)
+
+            consultant_ess_pool = _dedupe_group_ess_minutes(consultant_ess_pool)
+            ess_pool = _dedupe_group_ess_minutes(ess_pool)
+
+            anchor_li = group_sorted[0].get("list_index")
+            a_dt = _parse_time_str(automation_rows[anchor_li].get("Actual Response Date & Time")) if anchor_li is not None else None
+            a_ist = _to_ist(a_dt) if a_dt else None
+
+            def _same_month_pool(pool_in):
+                if not a_ist:
+                    return list(pool_in)
+                same_month = []
+                for e in pool_in:
+                    e_ist = _email_ist(e)
+                    if e_ist and e_ist.year == a_ist.year and e_ist.month == a_ist.month:
+                        same_month.append(e)
+                if len(same_month) >= len(group_sorted):
+                    return same_month
+                return list(pool_in)
+
+            consultant_ess_pool = _same_month_pool(consultant_ess_pool)
+            ess_pool = _same_month_pool(ess_pool)
+
+            pool = consultant_ess_pool if len(consultant_ess_pool) >= len(group_sorted) else ess_pool
+            if len(pool) < len(group_sorted):
+                return None
+            pick = pool[slot_index]
+            pick_ist = _email_ist(pick)
+            if not pick_ist:
+                return None
+            return {
+                "occ_key": state.get("occurrence_key") or _occurrence_group_key(subject_norm_value, requester, service_no),
+                "group": group_sorted,
+                "group_size": len(group_sorted),
+                "slot_index": slot_index,
+                "pick": pick,
+                "pick_when": pick_ist.replace(second=0, microsecond=0),
+                "lane_kind": "ess_over_ess",
+                "scope": "subject_wide_ess_override",
+                "consultant_ess_pool": consultant_ess_pool,
+                "ess_pool": ess_pool,
+            }
+
         def _system_like_sender(e):
             sender = f"{getattr(e, 'sender_email', '') or ''} {getattr(e, 'sender_name', '') or ''}".lower()
             if not sender.strip():
@@ -3705,6 +4656,66 @@ def main() -> int:
                 "postmaster",
             )
             return any(m in sender for m in markers)
+
+        def _can_use_reply_as_created_source(e, requester_name: str, *, all_same: bool = False) -> bool:
+            if not e:
+                return False
+            if all_same:
+                return True
+            cls = _shared_reply_classification(e)
+            # Outside deliberate all-three-same collapse, do not let an ESS
+            # ack-like mail become the Created anchor.
+            if _ess_sender(e) and (
+                cls.get("ack_like")
+                or cls.get("explicit_ack")
+                or cls.get("short_ess_ack")
+            ):
+                return False
+            return True
+
+        def _reply_choice_rank(e, requester_name: str, *, created_role: bool = False, all_same: bool = False):
+            cls = _shared_reply_classification(e)
+            requester_match = _req_match(e, requester_name)
+            direct_resolution = bool(cls.get("direct_resolution"))
+            real_reply = bool(cls.get("real_reply"))
+            ack_like = bool(cls.get("ack_like") or cls.get("explicit_ack") or cls.get("short_ess_ack"))
+            system_like = _system_like_sender(e)
+            created_ok = _can_use_reply_as_created_source(
+                e,
+                requester_name,
+                all_same=all_same,
+            )
+            return (
+                0 if requester_match else 1,
+                0 if (not created_role or created_ok) else 1,
+                0 if direct_resolution else 1,
+                0 if real_reply else 1,
+                1 if ack_like else 0,
+                1 if system_like else 0,
+                _email_ist(e) or datetime.max,
+            )
+
+        def _dedupe_reply_minutes_prefer_consultant(items, requester_name: str, *, created_role: bool = False, all_same: bool = False):
+            buckets = {}
+            for item in items:
+                item_ist = _email_ist(item)
+                if not item_ist:
+                    continue
+                minute_key = item_ist.replace(second=0, microsecond=0)
+                buckets.setdefault(minute_key, []).append(item)
+            out = []
+            for minute_key in sorted(buckets):
+                bucket = buckets[minute_key]
+                bucket.sort(
+                    key=lambda e: _reply_choice_rank(
+                        e,
+                        requester_name,
+                        created_role=created_role,
+                        all_same=all_same,
+                    )
+                )
+                out.append(bucket[0])
+            return out
 
         def _requester_pool(subject_norm_value, requester_name, center_ist=None, day_window=21):
             center_key = ""
@@ -3777,55 +4788,8 @@ def main() -> int:
             key = id(e)
             if key in _ess_only_short_ack_cache:
                 return _ess_only_short_ack_cache[key]
-            # Heuristic: very short consultant replies are likely acknowledgements.
-            raw = f"{getattr(e, 'body', '') or ''}\n{getattr(e, 'body_html', '') or ''}"
-            if not raw:
-                _ess_only_short_ack_cache[key] = False
-                return False
-            txt = raw
-            txt = re.sub(r"(?is)<style.*?>.*?</style>", " ", txt)
-            txt = re.sub(r"(?is)<script.*?>.*?</script>", " ", txt)
-            txt = re.sub(r"(?i)<\s*br\s*/?>", "\n", txt)
-            txt = re.sub(r"(?i)</\s*(p|div|tr|td|th|li|h[1-6])\s*>", "\n", txt)
-            txt = re.sub(r"(?is)<[^>]+>", " ", txt)
-            txt = html.unescape(txt)
-            lines = [ln.strip() for ln in txt.splitlines() if ln and ln.strip()]
-            if not lines:
-                _ess_only_short_ack_cache[key] = False
-                return False
-            content = " ".join(lines).strip().lower()
-            out = False
-            if len(lines) <= 2 and len(content) <= 140:
-                strong = (
-                    "resolved",
-                    "fixed",
-                    "completed",
-                    "success",
-                    "processed",
-                    "root cause",
-                    "issue was",
-                    "closed",
-                    "done",
-                )
-                if any(w in content for w in strong):
-                    _ess_only_short_ack_cache[key] = False
-                    return False
-                if any(k in content for k in ("attachment", "attached", "snippet", "snippet:", "snippets", "see attached")):
-                    _ess_only_short_ack_cache[key] = False
-                    return False
-                file_words = ("file", "files")
-                file_actions = ("add", "added", "adding", "attach", "attached", "attachment", "resend", "re-sent", "resent", "reupload", "re-upload", "please find")
-                explicit_file_phrases = ("adding more files", "adding one more file")
-                if any(p in content for p in explicit_file_phrases):
-                    _ess_only_short_ack_cache[key] = False
-                    return False
-                if any(w in content for w in file_words) and any(a in content for a in file_actions):
-                    _ess_only_short_ack_cache[key] = False
-                    return False
-                if ("cid:" in raw.lower()) or ("<img" in raw.lower()):
-                    _ess_only_short_ack_cache[key] = False
-                    return False
-                out = True
+            cls = _shared_reply_classification(e)
+            out = bool(cls.get("short_ess_ack"))
             _ess_only_short_ack_cache[key] = out
             return out
 
@@ -3942,6 +4906,13 @@ def main() -> int:
             if not (cand_c_min <= cand_a_min <= cand_r_min):
                 return False
 
+            state = state_by_list_index.get(list_index)
+            if state and state.get("occurrence_locked"):
+                locked_triplet = state.get("occurrence_lock_triplet")
+                if locked_triplet:
+                    return (cand_c_min, cand_a_min, cand_r_min) == tuple(locked_triplet)
+                return False
+
             profile = _rewrite_guard_profile(row_vals, list_index)
             if not profile.get("ordered"):
                 return True
@@ -3969,14 +4940,37 @@ def main() -> int:
             ):
                 return cand_c_min == cur_c_min and cand_a_min == cur_a_min and cand_r_min == cur_r_min
 
+            occurrence_plan = _shared_occurrence_fill_plan(state) if state else None
+            shared_decision = (state or {}).get("shared_decision") if state else None
+            if shared_decision:
+                decision_triplet = shared_decision.get("triplet")
+                if decision_triplet and (cand_c_min, cand_a_min, cand_r_min) != decision_triplet:
+                    confidence = shared_decision.get("confidence") or ""
+                    fill_style = shared_decision.get("fill_style") or ""
+                    row_type = shared_decision.get("row_type") or ""
+                    if confidence == "strong" and fill_style == "all_three_same" and row_type == "ess_over_ess":
+                        if candidate_kind not in {"quoted", "hybrid", "risk"}:
+                            return False
+                        # Stronger proof must move away from the all-three-same
+                        # lane into a proper ordered span, not another collapse.
+                        if cand_c_min == cand_a_min == cand_r_min:
+                            return False
+
             # Do not let all-three collapse owners flatten a row that is already a
-            # proper ordered span.
+            # proper ordered span, except when shared occurrence has explicitly
+            # classified this row as an ESS-over-ESS lane and assigned a unique
+            # occurrence reply for it.
             if (
                 candidate_kind in {"requester_ack", "continuation"}
                 and cand_c_min == cand_a_min == cand_r_min
                 and not profile.get("all_same")
             ):
-                return False
+                if not (
+                    candidate_kind == "occurrence_ess"
+                    and occurrence_plan
+                    and occurrence_plan.get("lane_kind") == "ess_over_ess"
+                ):
+                    return False
 
             # Quoted-style owners should not move a row backward to an older/weaker
             # local episode when the current row already has a valid request->ack
@@ -3992,32 +4986,16 @@ def main() -> int:
             ):
                 return False
 
-            # For repeated same-subject multi-service families, do not allow a
-            # later guard to converge multiple distinct rows onto the exact same
-            # triplet. This is the shared anti-drift rule that prevents one
-            # occurrence lane from stealing another lane's episode.
-            state = state_by_list_index.get(list_index)
-            if state and state.get("multi_service_subject"):
-                subject_norm_value = (state.get("subject_norm") or "").lower()
-                current_occ_key = state.get("occurrence_key") or _occurrence_group_key(
-                    subject_norm_value,
-                    state.get("requester") or "",
-                    state.get("service_no") or "",
-                )
+            # For repeated occurrence-managed families, do not allow a later
+            # guard to converge multiple distinct rows onto the exact same
+            # triplet. This keeps one occurrence lane from stealing another
+            # lane's episode after shared occurrence has already separated them.
+            if occurrence_plan:
                 cand_triplet = (cand_c_min, cand_a_min, cand_r_min)
                 cur_triplet = (cur_c_min, cur_a_min, cur_r_min)
-                for other_li in _subject_family_list_indexes(subject_norm_value):
-                    if other_li == list_index or other_li >= len(automation_rows):
-                        continue
-                    other_state = state_by_list_index.get(other_li)
-                    if not other_state or not other_state.get("multi_service_subject"):
-                        continue
-                    other_occ_key = other_state.get("occurrence_key") or _occurrence_group_key(
-                        (other_state.get("subject_norm") or "").lower(),
-                        other_state.get("requester") or "",
-                        other_state.get("service_no") or "",
-                    )
-                    if other_occ_key == current_occ_key:
+                for other_state in occurrence_plan["group"]:
+                    other_li = other_state.get("list_index")
+                    if other_li is None or other_li == list_index or other_li >= len(automation_rows):
                         continue
                     other_row_vals = automation_rows[other_li]
                     other_c_dt = _parse_time_str(other_row_vals.get("Created Date & Time") or "")
@@ -4036,6 +5014,14 @@ def main() -> int:
             return True
 
         def _occurrence_expected_reply_ist(state):
+            shared_plan = _shared_occurrence_fill_plan(state)
+            if shared_plan:
+                return {
+                    "when": shared_plan["pick_when"],
+                    "slot_index": shared_plan["slot_index"],
+                    "group_size": shared_plan["group_size"],
+                }
+
             requester = state.get("requester") or ""
             service_no = state.get("service_no") or ""
             subject_norm_value = (state.get("subject_norm") or "").lower()
@@ -4044,36 +5030,145 @@ def main() -> int:
             list_index = state.get("list_index")
             if row_group_total < 2 or list_index is None or not requester or not subject_norm_value or not base_thread:
                 return None
-            current_occ_key = state.get("occurrence_key") or _occurrence_group_key(subject_norm_value, requester, service_no)
 
-            def _occurrence_notes_match(notes_l: str) -> bool:
-                return (
-                    "ess-only; no non-ess request" in notes_l
-                    or "requester follow-up" in notes_l
-                    or "esscontinuationguard[" in notes_l
+        def _apply_shared_occurrence_triplet(
+            state,
+            row_vals,
+            list_index,
+            row_idx,
+            note_tag: str,
+        ) -> bool:
+            shared_decision = (state or {}).get("shared_decision") if state else None
+            if not shared_decision:
+                return False
+            if (shared_decision.get("owner") or "") != "shared_occurrence":
+                return False
+            if (shared_decision.get("row_type") or "") != "ess_over_ess":
+                return False
+            if (shared_decision.get("fill_style") or "") != "all_three_same":
+                return False
+            triplet = shared_decision.get("triplet")
+            if not triplet or len(triplet) != 3:
+                return False
+            cand_c_ist, cand_a_ist, cand_r_ist = triplet
+            if not (cand_c_ist and cand_a_ist and cand_r_ist):
+                return False
+            if not _allow_guard_rewrite(
+                row_vals,
+                list_index,
+                cand_c_ist,
+                cand_a_ist,
+                cand_r_ist,
+                note_tag,
+                "occurrence_ess",
+            ):
+                return False
+            t = _format_time(cand_c_ist)
+            if not t:
+                return False
+            row_vals["Created Date & Time"] = t
+            row_vals["Actual Response Date & Time"] = t
+            row_vals["Actual Resolved Date & Time"] = t
+            if row_idx:
+                ws.cell(row_idx, created_col).value = t
+                ws.cell(row_idx, response_col).value = t
+                ws.cell(row_idx, resolved_col).value = t
+            _set_row_fill(row_idx, clear_fill)
+            if list_index < len(debug_rows):
+                who = (
+                    debug_rows[list_index].get("ResolvedSource")
+                    or debug_rows[list_index].get("AckSource")
+                    or debug_rows[list_index].get("CreatedSource")
+                    or "SHARED_OCCURRENCE"
                 )
+                debug_rows[list_index]["CreatedSource"] = who
+                debug_rows[list_index]["AckSource"] = who
+                debug_rows[list_index]["ResolvedSource"] = who
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note_tag}"
+            return True
 
-            group_sorted = []
-            for s in row_states:
-                other_li = s.get("list_index")
-                if other_li is None or other_li >= len(automation_rows):
-                    continue
-                other_occ_key = s.get("occurrence_key") or _occurrence_group_key(
-                    (s.get("subject_norm") or "").lower(),
-                    s.get("requester") or "",
-                    s.get("service_no") or "",
-                )
-                if other_occ_key != current_occ_key:
-                    continue
-                other_notes_l = (debug_rows[other_li].get("Notes", "") or "").lower() if other_li < len(debug_rows) else ""
-                if not _occurrence_notes_match(other_notes_l):
-                    continue
-                group_sorted.append(s)
-
-            if len(group_sorted) < 2:
+        def _current_row_triplet_ist(row_vals):
+            if not row_vals:
                 return None
+            c_dt = _parse_time_str(row_vals.get("Created Date & Time") or "")
+            a_dt = _parse_time_str(row_vals.get("Actual Response Date & Time") or "")
+            r_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time") or "")
+            if not (c_dt and a_dt and r_dt):
+                return None
+            c_ist = _to_ist(c_dt)
+            a_ist = _to_ist(a_dt)
+            r_ist = _to_ist(r_dt)
+            if not (c_ist and a_ist and r_ist):
+                return None
+            return (
+                c_ist.replace(second=0, microsecond=0),
+                a_ist.replace(second=0, microsecond=0),
+                r_ist.replace(second=0, microsecond=0),
+            )
 
-            group_sorted.sort(key=lambda x: x.get("row_index") or 10**9)
+        def _lock_occurrence_row(state, row_vals, list_index, note_tag: str, *, triplet=None) -> bool:
+            if not state or list_index is None:
+                return False
+            triplet = triplet or _current_row_triplet_ist(row_vals)
+            if not triplet or len(triplet) != 3:
+                return False
+            state["occurrence_locked"] = True
+            state["occurrence_lock_triplet"] = tuple(triplet)
+            if list_index < len(debug_rows):
+                notes = debug_rows[list_index].get("Notes", "") or ""
+                if note_tag not in notes:
+                    debug_rows[list_index]["Notes"] = f"{notes}; {note_tag}"
+            return True
+
+        def _apply_occurrence_plan_authoritatively(
+            state,
+            row_vals,
+            list_index,
+            row_idx,
+            shared_occ_plan,
+            note_tag: str,
+        ) -> bool:
+            if not state or not shared_occ_plan:
+                return False
+            lane_kind = shared_occ_plan.get("lane_kind") or ""
+            pick_when = shared_occ_plan.get("pick_when")
+            if lane_kind != "ess_over_ess" or not pick_when:
+                return False
+
+            cand_triplet = (pick_when, pick_when, pick_when)
+            state["shared_decision"] = {
+                "owner": "shared_occurrence",
+                "row_type": "ess_over_ess",
+                "occurrence_slot": shared_occ_plan.get("slot_index", 0),
+                "lane_time": pick_when,
+                "fill_style": "all_three_same",
+                "confidence": "strong",
+                "triplet": cand_triplet,
+            }
+
+            t = _format_time(pick_when)
+            if not t:
+                return False
+            row_vals["Created Date & Time"] = t
+            row_vals["Actual Response Date & Time"] = t
+            row_vals["Actual Resolved Date & Time"] = t
+            if row_idx:
+                ws.cell(row_idx, created_col).value = t
+                ws.cell(row_idx, response_col).value = t
+                ws.cell(row_idx, resolved_col).value = t
+                _set_row_fill(row_idx, clear_fill)
+            if list_index < len(debug_rows):
+                who = (
+                    debug_rows[list_index].get("ResolvedSource")
+                    or debug_rows[list_index].get("AckSource")
+                    or debug_rows[list_index].get("CreatedSource")
+                    or "SHARED_OCCURRENCE"
+                )
+                debug_rows[list_index]["CreatedSource"] = who
+                debug_rows[list_index]["AckSource"] = who
+                debug_rows[list_index]["ResolvedSource"] = who
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note_tag}"
+            return True
             slot_index = None
             for idx, s in enumerate(group_sorted):
                 if s.get("list_index") == list_index:
@@ -4222,21 +5317,29 @@ def main() -> int:
                 requester_value,
                 state.get("service_no") or "",
             )
+            shared_plan = _shared_occurrence_fill_plan(state)
             family_idx, family_total = _subject_family_slot(state)
             multi_service = bool(state.get("multi_service_subject")) and family_total >= 2
-            pick_idx = family_idx if multi_service else max(0, default_idx)
-            total_rows = family_total if multi_service else (
-                state.get("group_total") or _occurrence_group_total(
-                    subject_norm_value,
-                    requester_value,
-                    state.get("service_no") or "",
+            if shared_plan:
+                pick_idx = shared_plan["slot_index"]
+                total_rows = shared_plan["group_size"]
+            else:
+                pick_idx = family_idx if multi_service else max(0, default_idx)
+                total_rows = family_total if multi_service else (
+                    state.get("group_total") or _occurrence_group_total(
+                        subject_norm_value,
+                        requester_value,
+                        state.get("service_no") or "",
+                    )
                 )
-            )
             # For multi-service repeated-subject families, current row times are
             # often exactly the stale values we are trying to escape. In that
             # case, route by shared family slot and avoid reusing the row's
             # current timestamps as an occurrence anchor.
-            if multi_service:
+            if shared_plan:
+                target_ist = shared_plan["pick_when"]
+                target_reply_ist = shared_plan["pick_when"]
+            elif multi_service:
                 target_ist = None
                 target_reply_ist = None
             else:
@@ -4951,7 +6054,7 @@ def main() -> int:
             if not consultant_after:
                 continue
 
-            next_reply = _pick_reply_after_ack(consultant_after, ack_ist)
+            next_reply = _pick_reply_after_ack(consultant_after, ack_ist, requester)
             if not next_reply:
                 continue
             next_str = _format_time(next_reply.sent_time)
@@ -8538,6 +9641,8 @@ def main() -> int:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
                 continue
+            if state.get("occurrence_locked"):
+                continue
 
             row_vals = automation_rows[list_index]
             requester = state.get("requester") or ""
@@ -9558,6 +10663,75 @@ def main() -> int:
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; QuotedPairGap>16m"
 
         _stage_timer_stop("quoted_request_only_tag", quoted_only_tag_started_at, items=len(row_states))
+        occurrence_lock_started_at = _stage_timer_start()
+        occurrence_locked_rows = 0
+        for state in row_states:
+            list_index = state.get("list_index")
+            row_idx = state.get("row_index")
+            if list_index is None or list_index >= len(automation_rows) or not row_idx:
+                continue
+            if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+            if state.get("occurrence_locked"):
+                continue
+
+            row_vals = automation_rows[list_index]
+            notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
+            shared_occ_plan = _shared_occurrence_fill_plan(state)
+            if (
+                (
+                    not shared_occ_plan
+                    or (shared_occ_plan.get("lane_kind") or "") != "ess_over_ess"
+                )
+                and "requester span(all-ack->ess)" in notes_l
+            ):
+                shared_occ_plan = _subject_wide_all_ack_ess_override_plan(state) or shared_occ_plan
+            if not shared_occ_plan:
+                continue
+
+            shared_decision = state.get("shared_decision") or {}
+            locked = False
+            if (
+                (shared_occ_plan.get("lane_kind") or "") == "ess_over_ess"
+                and "requester span(all-ack->ess)" in notes_l
+            ):
+                locked = _apply_occurrence_plan_authoritatively(
+                    state,
+                    row_vals,
+                    list_index,
+                    row_idx,
+                    shared_occ_plan,
+                    "ESSContinuationGuard[AllThreeStrictEssOnly]",
+                )
+                if locked:
+                    decision_triplet = (state.get("shared_decision") or {}).get("triplet")
+                    locked = _lock_occurrence_row(
+                        state,
+                        row_vals,
+                        list_index,
+                        "OccurrenceLocked",
+                        triplet=decision_triplet,
+                        )
+            else:
+                lane_when = shared_occ_plan.get("pick_when") or shared_decision.get("lane_time")
+                current_triplet = _current_row_triplet_ist(row_vals)
+                if current_triplet and lane_when:
+                    if (
+                        current_triplet[1] == lane_when
+                        or current_triplet[2] == lane_when
+                    ):
+                        locked = _lock_occurrence_row(
+                            state,
+                            row_vals,
+                            list_index,
+                            "OccurrenceLocked",
+                            triplet=current_triplet,
+                        )
+
+            if locked:
+                occurrence_locked_rows += 1
+
+        _stage_timer_stop("occurrence_lock_enforcement", occurrence_lock_started_at, items=occurrence_locked_rows)
         # ESS-only strict pass (isolated from blue):
         # Run for ESS-only rows regardless of blue, but only if times are not already equal.
         used_ess_continuation_ess_only = set()
@@ -9571,6 +10745,8 @@ def main() -> int:
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+            if state.get("occurrence_locked"):
                 continue
             notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
             quoted_only = (list_index in quoted_request_only) or ("quotedrequestonly" in notes_l)
@@ -10358,6 +11534,22 @@ def main() -> int:
 
             # Fallback: collapse to consultant reply by occurrence (ESS-only)
             if merged_msgs:
+                shared_occ_plan = _shared_occurrence_fill_plan(state)
+                notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
+                if (
+                    "requester span(all-ack->ess)" in notes_l
+                    and _apply_shared_occurrence_triplet(
+                        state,
+                        row_vals,
+                        list_index,
+                        row_idx,
+                        "ESSContinuationGuard[AllThreeStrictEssOnly]",
+                    )
+                ):
+                    occ_key = (shared_occ_plan or {}).get("occ_key")
+                    if occ_key is not None:
+                        ess_only_reply_index[occ_key] = (shared_occ_plan or {}).get("slot_index", 0) + 1
+                    continue
                 if consultant_msgs:
                     occ_meta = _shared_occurrence_pick(
                         state,
@@ -10380,7 +11572,9 @@ def main() -> int:
                                 if _email_ist(e) else None
                             ),
                         )
-                    if total_rows <= 1:
+                    if shared_occ_plan and shared_occ_plan.get("pick") is not None:
+                        pick = shared_occ_plan["pick"]
+                    elif total_rows <= 1:
                         pick = consultant_msgs[-1]
                     else:
                         # Occurrence-based pick, but keep replies within the same month
@@ -10408,7 +11602,6 @@ def main() -> int:
                                 pick = consultant_msgs[min(pick_idx, len(consultant_msgs) - 1)]
                         else:
                             pick = consultant_msgs[min(pick_idx, len(consultant_msgs) - 1)]
-                    notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
                     allow_acky = "requester span(all-ack->ess)" in notes_l
                     # Validator only: if this looks like ack, do not collapse
                     # unless all requester spans were ack-like.
@@ -10426,6 +11619,11 @@ def main() -> int:
                     if key in used_ess_continuation_ess_only:
                         continue
                     if pick.sent_time:
+                        candidate_kind = (
+                            "occurrence_ess"
+                            if shared_occ_plan and shared_occ_plan.get("lane_kind") == "ess_over_ess"
+                            else "continuation"
+                        )
                         if not _allow_guard_rewrite(
                             row_vals,
                             list_index,
@@ -10433,7 +11631,7 @@ def main() -> int:
                             cand_ist,
                             cand_ist,
                             "ESSContinuationGuard[AllThreeStrictEssOnly]",
-                            "continuation",
+                            candidate_kind,
                         ):
                             continue
                         t = _format_time(pick.sent_time)
@@ -10454,6 +11652,40 @@ def main() -> int:
                             # Advance occurrence index only when we collapse
                             ess_only_reply_index[occ_key] = idx + 1
                             used_ess_continuation_ess_only.add(key)
+                elif shared_occ_plan and shared_occ_plan.get("lane_kind") == "ess_over_ess":
+                    pick = shared_occ_plan.get("pick")
+                    cand_ist = _email_ist(pick) if pick else None
+                    if not cand_ist:
+                        continue
+                    if not _allow_guard_rewrite(
+                        row_vals,
+                        list_index,
+                        cand_ist,
+                        cand_ist,
+                        cand_ist,
+                        "ESSContinuationGuard[AllThreeStrictEssOnly]",
+                        "occurrence_ess",
+                    ):
+                        continue
+                    t = _format_time(pick.sent_time)
+                    if not t:
+                        continue
+                    row_vals["Created Date & Time"] = t
+                    row_vals["Actual Response Date & Time"] = t
+                    row_vals["Actual Resolved Date & Time"] = t
+                    ws.cell(row_idx, created_col).value = t
+                    ws.cell(row_idx, response_col).value = t
+                    ws.cell(row_idx, resolved_col).value = t
+                    _set_row_fill(row_idx, clear_fill)
+                    if list_index < len(debug_rows):
+                        who = pick.sender_email or pick.sender_name
+                        debug_rows[list_index]["CreatedSource"] = who
+                        debug_rows[list_index]["AckSource"] = who
+                        debug_rows[list_index]["ResolvedSource"] = who
+                        debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; ESSContinuationGuard[AllThreeStrictEssOnly]"
+                    occ_key = shared_occ_plan.get("occ_key")
+                    if occ_key is not None:
+                        ess_only_reply_index[occ_key] = shared_occ_plan.get("slot_index", 0) + 1
         _stage_timer_stop("ess_only_strict_pass", ess_only_strict_started_at, items=len(row_states))
         blue_quoted_started_at = _stage_timer_start()
         for state in row_states:
@@ -10918,7 +12150,36 @@ def main() -> int:
             # Blue-only ESS continuation: collapse to unique consultant reply
             # when ESS-only and no non-ESS request exists between first/last replies.
             notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
-            if ("quotedrequestonly" in notes_l) or ("quotedpairgap>16m" in notes_l) or ("quotedrequestonlynopair" in notes_l):
+            shared_occ_plan = _shared_occurrence_fill_plan(
+                state,
+                quoted_sources=quoted_sources,
+                c_ist=c_ist,
+            )
+            if (
+                "requester span(all-ack->ess)" in notes_l
+                and _apply_shared_occurrence_triplet(
+                    state,
+                    row_vals,
+                    list_index,
+                    row_idx,
+                    "ESSContinuationGuard[AllThreeStrictEssOnly]",
+                )
+            ):
+                occ_key = (shared_occ_plan or {}).get("occ_key")
+                if occ_key is not None:
+                    ess_only_reply_index[occ_key] = (shared_occ_plan or {}).get("slot_index", 0) + 1
+                continue
+            allow_occurrence_ess_quoted = bool(
+                shared_occ_plan
+                and shared_occ_plan.get("lane_kind") == "ess_over_ess"
+                and "ess-only; no non-ess request" in notes_l
+                and "requester span(all-ack->ess)" in notes_l
+            )
+            if (
+                ("quotedrequestonly" in notes_l)
+                or ("quotedpairgap>16m" in notes_l)
+                or ("quotedrequestonlynopair" in notes_l)
+            ) and not allow_occurrence_ess_quoted:
                 # Quoted-request-only rows (or invalid quoted gap) are handled separately; do not collapse here.
                 continue
             if (not quoted_pair_applied) and "ess-only; no non-ess request" in notes_l:
@@ -10997,6 +12258,47 @@ def main() -> int:
                         merged_msgs = list(dedup.values())
                         merged_msgs.sort(key=lambda e: e.sent_time if getattr(e, "sent_time", None) else datetime.max)
 
+                        # ESS-only enhanced continuation: run even if row wasn't blue,
+                        # but only when times are not already equal.
+                        force_ess_blue = False
+                        if "ess-only; no non-ess request" in notes_l:
+                            if c_dt and a_dt and r_dt:
+                                force_ess_blue = not (c_dt == a_dt == r_dt)
+
+                        if (
+                            shared_occ_plan
+                            and shared_occ_plan.get("lane_kind") == "ess_over_ess"
+                            and ("ess-only; no non-ess request" in notes_l)
+                            and (force_ess_blue or _row_has_blue_fill(row_idx))
+                        ):
+                            occ_pick = shared_occ_plan.get("pick")
+                            occ_ist = _email_ist(occ_pick) if occ_pick else None
+                            if occ_ist and _allow_guard_rewrite(
+                                row_vals,
+                                list_index,
+                                occ_ist,
+                                occ_ist,
+                                occ_ist,
+                                "ESSContinuationGuard[AllThreeStrictEssOnly]",
+                                "occurrence_ess",
+                            ):
+                                t_occ = _format_time(occ_pick.sent_time)
+                                if t_occ:
+                                    row_vals["Created Date & Time"] = t_occ
+                                    row_vals["Actual Response Date & Time"] = t_occ
+                                    row_vals["Actual Resolved Date & Time"] = t_occ
+                                    ws.cell(row_idx, created_col).value = t_occ
+                                    ws.cell(row_idx, response_col).value = t_occ
+                                    ws.cell(row_idx, resolved_col).value = t_occ
+                                    _set_row_fill(row_idx, clear_fill)
+                                    if list_index < len(debug_rows):
+                                        who = occ_pick.sender_email or occ_pick.sender_name
+                                        debug_rows[list_index]["CreatedSource"] = who
+                                        debug_rows[list_index]["AckSource"] = who
+                                        debug_rows[list_index]["ResolvedSource"] = who
+                                        debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; ESSContinuationGuard[AllThreeStrictEssOnly]"
+                                    continue
+
                         consultant_msgs = []
                         for e in merged_msgs:
                             e_ist = _email_ist(e)
@@ -11030,13 +12332,6 @@ def main() -> int:
                                 latest_ist = cand_ist
                                 used_ess_continuation_blue.add(key)
                                 break
-                            # ESS-only enhanced continuation: run even if row wasn't blue,
-                            # but only when times are not already equal.
-                            force_ess_blue = False
-                            if "ess-only; no non-ess request" in notes_l:
-                                if c_dt and a_dt and r_dt:
-                                    force_ess_blue = not (c_dt == a_dt == r_dt)
-
                             if ("ess-only; no non-ess request" in notes_l) and (force_ess_blue or _row_has_blue_fill(row_idx)):
                                 # Prefer a same-day non-ESS request + ESS ack quoted pair,
                                 # using the latest ack time found in the latest message.
@@ -11538,6 +12833,8 @@ def main() -> int:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
                 continue
+            if state.get("occurrence_locked"):
+                continue
             notes = debug_rows[list_index].get("Notes", "") if list_index < len(debug_rows) else ""
             notes_l = (notes or "").lower()
             if "requester span(all-ack->ess)" not in notes_l:
@@ -11645,6 +12942,8 @@ def main() -> int:
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+            if state.get("occurrence_locked"):
                 continue
 
             notes_now = debug_rows[list_index].get("Notes", "") if list_index < len(debug_rows) else ""
@@ -11809,6 +13108,8 @@ def main() -> int:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
                 continue
+            if state.get("occurrence_locked"):
+                continue
 
             row_vals = automation_rows[list_index]
             precheck = _risk_guard_precheck(state, row_vals, list_index)
@@ -11929,6 +13230,8 @@ def main() -> int:
                     debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; BlueClearedStrict"
 
         for state in row_states:
+            if state.get("occurrence_locked"):
+                continue
             _apply_risk_guard_episode_to_owner(
                 state,
                 lambda notes_l: "quotedrequestonly" in notes_l,
@@ -11955,6 +13258,8 @@ def main() -> int:
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
                 continue
             if state.get("is_dep_req") or state.get("is_dep_succ"):
+                continue
+            if state.get("occurrence_locked"):
                 continue
             notes_now = debug_rows[list_index].get("Notes", "") if list_index < len(debug_rows) else ""
             notes_l_now = (notes_now or "").lower()
@@ -12010,6 +13315,42 @@ def main() -> int:
                     break
             if ess_like_group:
                 group_sorted = sorted(group, key=lambda x: x.get("row_index") or 10**9)
+                shared_group_picks = []
+                for s in group_sorted:
+                    shared_plan = _shared_occurrence_fill_plan(s)
+                    if not shared_plan or shared_plan.get("group_size", 0) < 2:
+                        shared_group_picks = []
+                        break
+                    slot_index = shared_plan.get("slot_index", 0)
+                    pool = shared_plan.get("pool") or []
+                    if slot_index >= len(pool):
+                        shared_group_picks = []
+                        break
+                    shared_group_picks.append((s, pool[slot_index], shared_plan))
+                if len(shared_group_picks) == len(group_sorted):
+                    for s, pick, _shared_plan in shared_group_picks:
+                        li = s.get("list_index")
+                        ri = s.get("row_index")
+                        if li is None or li >= len(automation_rows) or not ri:
+                            continue
+                        t = _format_time(getattr(pick, "sent_time", None))
+                        if not t:
+                            continue
+                        row_vals = automation_rows[li]
+                        row_vals["Created Date & Time"] = t
+                        row_vals["Actual Response Date & Time"] = t
+                        row_vals["Actual Resolved Date & Time"] = t
+                        ws.cell(ri, created_col).value = t
+                        ws.cell(ri, response_col).value = t
+                        ws.cell(ri, resolved_col).value = t
+                        if li < len(debug_rows):
+                            who = pick.sender_email or pick.sender_name
+                            debug_rows[li]["CreatedSource"] = who
+                            debug_rows[li]["AckSource"] = who
+                            debug_rows[li]["ResolvedSource"] = who
+                            debug_rows[li]["Notes"] = f"{debug_rows[li].get('Notes','')}; DistinctOccurrenceMap"
+                    continue
+
                 anchor_state = group_sorted[0]
                 anchor_li = anchor_state.get("list_index")
                 requester = anchor_state.get("requester") or ""
@@ -12257,6 +13598,130 @@ def main() -> int:
                     debug_rows[li]["AckSource"] = who
                     debug_rows[li]["ResolvedSource"] = who
                     debug_rows[li]["Notes"] = f"{debug_rows[li].get('Notes','')}; DuplicateDecollision"
+
+        if workbook_kind == "incident_business":
+            final_occurrence_lock_started_at = _stage_timer_start()
+            final_occurrence_locked_rows = 0
+            for state in row_states:
+                list_index = state.get("list_index")
+                row_idx = state.get("row_index")
+                if list_index is None or list_index >= len(automation_rows) or not row_idx:
+                    continue
+                if state.get("is_dep_req") or state.get("is_dep_succ"):
+                    continue
+
+                notes_l = (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else ""
+                if not _is_all_ack_to_ess_notes(notes_l):
+                    continue
+                if list_index < len(debug_rows):
+                    notes_now = debug_rows[list_index].get("Notes", "") or ""
+                    if "FinalOcc[Start@13593]" not in notes_now:
+                        debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[Start@13593]"
+
+                row_vals = automation_rows[list_index]
+                shared_occ_plan = _subject_wide_all_ack_ess_override_plan(state)
+                if not shared_occ_plan:
+                    shared_occ_plan = _shared_occurrence_fill_plan(state)
+                if not shared_occ_plan or (shared_occ_plan.get("lane_kind") or "") != "ess_over_ess":
+                    if list_index < len(debug_rows):
+                        notes_now = debug_rows[list_index].get("Notes", "") or ""
+                        lane_now = (shared_occ_plan.get("lane_kind") or "") if shared_occ_plan else "NONE"
+                        tag = f"FinalOcc[NoPlan@13600:{lane_now}]"
+                        if tag not in notes_now:
+                            debug_rows[list_index]["Notes"] = f"{notes_now}; {tag}"
+                    continue
+                if list_index < len(debug_rows):
+                    notes_now = debug_rows[list_index].get("Notes", "") or ""
+                    tag = f"FinalOcc[Plan@13600:{shared_occ_plan.get('lane_kind') or 'NONE'}]"
+                    if tag not in notes_now:
+                        debug_rows[list_index]["Notes"] = f"{notes_now}; {tag}"
+
+                pick_when = shared_occ_plan.get("pick_when")
+                if not pick_when:
+                    if list_index < len(debug_rows):
+                        notes_now = debug_rows[list_index].get("Notes", "") or ""
+                        if "FinalOcc[NoPick@13604]" not in notes_now:
+                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[NoPick@13604]"
+                    continue
+                if list_index < len(debug_rows):
+                    notes_now = debug_rows[list_index].get("Notes", "") or ""
+                    pick_tag = f"FinalOcc[Pick@13604:{_format_time(pick_when)}]"
+                    if pick_tag not in notes_now:
+                        debug_rows[list_index]["Notes"] = f"{notes_now}; {pick_tag}"
+                target_triplet = (
+                    pick_when.replace(second=0, microsecond=0),
+                    pick_when.replace(second=0, microsecond=0),
+                    pick_when.replace(second=0, microsecond=0),
+                )
+
+                current_triplet = _current_row_triplet_ist(row_vals)
+                if current_triplet != target_triplet:
+                    if list_index < len(debug_rows):
+                        notes_now = debug_rows[list_index].get("Notes", "") or ""
+                        if "FinalOcc[TripletDiff@13613]" not in notes_now:
+                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[TripletDiff@13613]"
+                    t = _format_time(pick_when)
+                    if not t:
+                        if list_index < len(debug_rows):
+                            notes_now = debug_rows[list_index].get("Notes", "") or ""
+                            if "FinalOcc[FormatFail@13614]" not in notes_now:
+                                debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[FormatFail@13614]"
+                        continue
+
+                    row_vals["Created Date & Time"] = t
+                    row_vals["Actual Response Date & Time"] = t
+                    row_vals["Actual Resolved Date & Time"] = t
+                    ws.cell(row_idx, created_col).value = t
+                    ws.cell(row_idx, response_col).value = t
+                    ws.cell(row_idx, resolved_col).value = t
+                    _set_row_fill(row_idx, clear_fill)
+
+                    state["shared_decision"] = {
+                        "owner": "shared_occurrence",
+                        "row_type": "ess_over_ess",
+                        "occurrence_slot": shared_occ_plan.get("slot_index", 0),
+                        "lane_time": pick_when,
+                        "fill_style": "all_three_same",
+                        "confidence": "strong",
+                        "triplet": target_triplet,
+                    }
+
+                    if list_index < len(debug_rows):
+                        who = (
+                            debug_rows[list_index].get("ResolvedSource")
+                            or debug_rows[list_index].get("AckSource")
+                            or debug_rows[list_index].get("CreatedSource")
+                            or "SHARED_OCCURRENCE"
+                        )
+                        debug_rows[list_index]["CreatedSource"] = who
+                        debug_rows[list_index]["AckSource"] = who
+                        debug_rows[list_index]["ResolvedSource"] = who
+                        notes_now = debug_rows[list_index].get("Notes", "") or ""
+                        if "ESSContinuationGuard[AllThreeStrictEssOnly]" not in notes_now:
+                            debug_rows[list_index]["Notes"] = f"{notes_now}; ESSContinuationGuard[AllThreeStrictEssOnly]"
+                        notes_now = debug_rows[list_index].get("Notes", "") or ""
+                        if "FinalOcc[Wrote@13618]" not in notes_now:
+                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[Wrote@13618]"
+                else:
+                    if list_index < len(debug_rows):
+                        notes_now = debug_rows[list_index].get("Notes", "") or ""
+                        if "FinalOcc[AlreadyTarget@13613]" not in notes_now:
+                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[AlreadyTarget@13613]"
+
+                if _lock_occurrence_row(
+                    state,
+                    row_vals,
+                    list_index,
+                    "OccurrenceLocked",
+                    triplet=target_triplet,
+                ):
+                    if list_index < len(debug_rows):
+                        notes_now = debug_rows[list_index].get("Notes", "") or ""
+                        if "FinalOcc[Locked@13650]" not in notes_now:
+                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[Locked@13650]"
+                    final_occurrence_locked_rows += 1
+
+            _stage_timer_stop("final_occurrence_lock_apply", final_occurrence_lock_started_at, items=final_occurrence_locked_rows)
 
         _stage_timer_stop("risky_and_duplicate_repair_passes", risky_and_duplicate_started_at, items=len(row_states))
         if workbook_kind == "task_business":
@@ -12735,6 +14200,7 @@ def main() -> int:
                     debug_rows[list_index]["Notes"] = f"{notes_now}; BlueClearedFinalValidator"
 
     workbook_timer = time.perf_counter()
+    logger.log("[TRACE] pre_fill_marker reached")
     logger.log(f"[INFO] Starting worksheet fill: {_workbook_label(workbook_kind)} ({template_path.name})")
     fill_started_at = time.perf_counter()
     fill_result = fill_template(
