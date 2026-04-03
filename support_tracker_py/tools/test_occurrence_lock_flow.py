@@ -38,6 +38,11 @@ def _main_line_refs() -> dict[str, int | None]:
         "override_slot_gate": None,
         "override_pool_gate": None,
         "override_pick_gate": None,
+        "apply_shared_occurrence_triplet_def": None,
+        "ess_only_strict_shared_triplet_call": None,
+        "ess_only_strict_authoritative_call": None,
+        "ess_only_strict_manual_occ_pick_branch": None,
+        "ess_only_strict_manual_notes_write": None,
         "final_occurrence_workbook_if": None,
         "final_occurrence_notes_gate": None,
         "final_occurrence_plan_gate": None,
@@ -62,13 +67,40 @@ def _main_line_refs() -> dict[str, int | None]:
                 refs["override_group_size_gate"] = idx
             if refs["override_slot_gate"] is None and "if slot_index is None:" in line:
                 refs["override_slot_gate"] = idx
-            if refs["override_pool_gate"] is None and "if len(pool) < len(group_sorted):" in line:
+            if refs["override_pool_gate"] is None and (
+                "if len(pool) < len(group_sorted):" in line
+                or "if not pool or len(pool) < len(group_sorted):" in line
+            ):
                 refs["override_pool_gate"] = idx
             if refs["override_pick_gate"] is None and "if not pick_ist:" in line:
                 refs["override_pick_gate"] = idx
+            if refs["apply_shared_occurrence_triplet_def"] is None and "def _apply_shared_occurrence_triplet(" in line:
+                refs["apply_shared_occurrence_triplet_def"] = idx
+            if refs["ess_only_strict_shared_triplet_call"] is None and "_apply_shared_occurrence_triplet(" in line and "def _apply_shared_occurrence_triplet(" not in line:
+                refs["ess_only_strict_shared_triplet_call"] = idx
+            if refs["ess_only_strict_authoritative_call"] is None and idx > 11000 and "and _apply_occurrence_plan_authoritatively(" in line:
+                refs["ess_only_strict_authoritative_call"] = idx
+            if (
+                refs["ess_only_strict_manual_occ_pick_branch"] is None
+                and refs["ess_only_strict_authoritative_call"] is not None
+                and idx > refs["ess_only_strict_authoritative_call"]
+                and 'if shared_occ_plan and shared_occ_plan.get("pick") is not None:' in line
+            ):
+                refs["ess_only_strict_manual_occ_pick_branch"] = idx
+            if (
+                refs["ess_only_strict_manual_notes_write"] is None
+                and refs["ess_only_strict_manual_occ_pick_branch"] is not None
+                and idx > refs["ess_only_strict_manual_occ_pick_branch"]
+                and 'ESSContinuationGuard[AllThreeStrictEssOnly]' in line
+                and 'debug_rows[list_index]["Notes"]' in line
+            ):
+                refs["ess_only_strict_manual_notes_write"] = idx
             if refs["final_occurrence_notes_gate"] is None and "if not _is_all_ack_to_ess_notes(notes_l):" in line:
                 refs["final_occurrence_notes_gate"] = idx
-            if refs["final_occurrence_plan_gate"] is None and 'if not shared_occ_plan or (shared_occ_plan.get("lane_kind") or "") != "ess_over_ess":' in line:
+            if refs["final_occurrence_plan_gate"] is None and (
+                'if not shared_occ_plan or (shared_occ_plan.get("lane_kind") or "") != "ess_over_ess":' in line
+                or 'if not shared_occ_plan or not _is_authoritative_occurrence_lane(shared_occ_plan.get("lane_kind") or ""):' in line
+            ):
                 refs["final_occurrence_plan_gate"] = idx
             if refs["final_occurrence_pick_gate"] is None and "if not pick_when:" in line:
                 refs["final_occurrence_pick_gate"] = idx
@@ -297,7 +329,7 @@ def _collect_family_pools(
     family_rows: list[dict],
     all_emails: list[DebugEmail],
     ess_team: list[str],
-) -> tuple[list[DebugEmail], list[DebugEmail], list[DebugEmail], list[DebugEmail], list[DebugEmail]]:
+) -> tuple[list[DebugEmail], list[DebugEmail], list[DebugEmail], list[DebugEmail], list[DebugEmail], list[DebugEmail]]:
     requesters = []
     seen = set()
     for row in family_rows:
@@ -319,13 +351,14 @@ def _collect_family_pools(
     direct_pool = []
     consultant_ess_pool = []
     ess_pool = []
+    occurrence_acky_pool = []
     for email in matched:
         cls = _classify_reply_kind(email)
         is_ess = _is_ess_sender(email, ess_team)
         req_match = _requester_match_any(email, requesters)
-        if is_ess and not (cls.get("thanks_info") or cls.get("nonfinal_followup")):
+        if is_ess and _is_real_ess_progression(email, ess_team):
             ess_pool.append(email)
-        if is_ess and req_match and not (cls.get("thanks_info") or cls.get("nonfinal_followup")):
+        if is_ess and req_match and _is_real_ess_progression(email, ess_team):
             consultant_ess_pool.append(email)
         if req_match and cls.get("real_reply"):
             reply_pool.append(email)
@@ -333,6 +366,8 @@ def _collect_family_pools(
             ack_pool.append(email)
         if req_match and cls.get("direct_resolution"):
             direct_pool.append(email)
+        if _is_occurrence_acky_candidate(email, requesters):
+            occurrence_acky_pool.append(email)
 
     return (
         _minute_dedupe(reply_pool),
@@ -340,7 +375,47 @@ def _collect_family_pools(
         _minute_dedupe(direct_pool),
         _minute_dedupe(consultant_ess_pool),
         _minute_dedupe(ess_pool),
+        _minute_dedupe(occurrence_acky_pool),
     )
+
+
+def _is_ack_like_only(email: DebugEmail) -> bool:
+    cls = _classify_reply_kind(email)
+    is_ack = bool(cls.get("ack_like") or cls.get("explicit_ack") or cls.get("short_ess_ack"))
+    is_substantive = bool(cls.get("real_reply") or cls.get("direct_resolution"))
+    return is_ack and not is_substantive
+
+
+def _is_real_ess_progression(email: DebugEmail, ess_team: list[str]) -> bool:
+    cls = _classify_reply_kind(email)
+    if not _is_ess_sender(email, ess_team):
+        return False
+    if cls.get("thanks_info") or cls.get("nonfinal_followup"):
+        return False
+    if cls.get("direct_resolution") or cls.get("real_reply"):
+        return True
+    return not _is_ack_like_only(email)
+
+
+def _is_occurrence_acky_candidate(email: DebugEmail, requesters: list[str]) -> bool:
+    if not email.sent_time:
+        return False
+    if not _requester_match_any(email, requesters):
+        return False
+    cls = _classify_reply_kind(email)
+    if cls.get("thanks_info") or cls.get("nonfinal_followup"):
+        return False
+    return bool(
+        cls.get("real_reply")
+        or cls.get("direct_resolution")
+        or cls.get("ack_like")
+        or cls.get("explicit_ack")
+        or cls.get("short_ess_ack")
+    )
+
+
+def _lane_is_authoritative_occurrence(lane_kind: str | None) -> bool:
+    return (lane_kind or "") in {"ess_over_ess", "ess_acky_sequence"}
 
 
 def _dedupe_reply_minutes_prefer_consultant(items: list[DebugEmail], requesters: list[str]) -> list[DebugEmail]:
@@ -359,6 +434,7 @@ def _dedupe_reply_minutes_prefer_consultant(items: list[DebugEmail], requesters:
                 0 if _requester_match_any(email, requesters) else 1,
                 0 if (_classify_reply_kind(email).get("direct_resolution")) else 1,
                 0 if (_classify_reply_kind(email).get("real_reply")) else 1,
+                1 if _is_ack_like_only(email) else 0,
                 _to_ist(email.sent_time),
             )
         )
@@ -452,9 +528,7 @@ def _exact_shared_occurrence_plan(
                 continue
             cls = _classify_reply_kind(email)
             if use_ess_pool:
-                if not _is_ess_sender(email, ess_team):
-                    continue
-                if cls.get("thanks_info") or cls.get("nonfinal_followup"):
+                if not _is_real_ess_progression(email, ess_team):
                     continue
             else:
                 if not _group_req_match(email):
@@ -490,12 +564,17 @@ def _exact_shared_occurrence_plan(
         for email in merged:
             if not email.sent_time:
                 continue
-            if not _is_ess_sender(email, ess_team):
-                continue
             if not _group_req_match(email):
                 continue
-            cls = _classify_reply_kind(email)
-            if cls.get("thanks_info") or cls.get("nonfinal_followup"):
+            if not _is_real_ess_progression(email, ess_team):
+                continue
+            out.append(email)
+        return _dedupe_reply_minutes_prefer_consultant(out, group_requesters)
+
+    def _collect_occurrence_acky_pool() -> list[DebugEmail]:
+        out = []
+        for email in merged:
+            if not _is_occurrence_acky_candidate(email, group_requesters):
                 continue
             out.append(email)
         return _dedupe_reply_minutes_prefer_consultant(out, group_requesters)
@@ -506,6 +585,7 @@ def _exact_shared_occurrence_plan(
     ack_pool = _collect_non_ess_ack_pool()
     direct_pool = _collect_direct_pool()
     consultant_ess_pool = _collect_consultant_ess_pool()
+    occurrence_acky_pool = _collect_occurrence_acky_pool()
 
     anchor_row = output_by_line.get(int(group_sorted[0]["_line"]), {})
     anchor_ack = _parse_datetime(_get_col(anchor_row, "Actual Response Date & Time"))
@@ -529,6 +609,7 @@ def _exact_shared_occurrence_plan(
     ack_pool = _same_month_pool(ack_pool)
     direct_pool = _same_month_pool(direct_pool)
     consultant_ess_pool = _same_month_pool(consultant_ess_pool)
+    occurrence_acky_pool = _same_month_pool(occurrence_acky_pool)
 
     default_pool = reply_pool or acky_pool or consultant_ess_pool or ess_pool
     if len(default_pool) < len(group_sorted):
@@ -542,6 +623,7 @@ def _exact_shared_occurrence_plan(
             "acky_pool": acky_pool,
             "consultant_ess_pool": consultant_ess_pool,
             "ess_pool": ess_pool,
+            "occurrence_acky_pool": occurrence_acky_pool,
             "ack_pool": ack_pool,
             "direct_pool": direct_pool,
         }
@@ -580,6 +662,25 @@ def _exact_shared_occurrence_plan(
                     "acky_pool": acky_pool,
                     "consultant_ess_pool": consultant_ess_pool,
                     "ess_pool": ess_pool,
+                    "occurrence_acky_pool": occurrence_acky_pool,
+                    "ack_pool": ack_pool,
+                    "direct_pool": direct_pool,
+                    "strong_non_ess_live": strong_non_ess_live,
+                    **plan,
+                }
+            plan = _pick_from(occurrence_acky_pool, "ess_acky_sequence")
+            if plan:
+                return {
+                    "exists": True,
+                    "scope": selected_scope,
+                    "group_size": len(group_sorted),
+                    "slot_index": slot_index,
+                    "allow_acky": allow_acky,
+                    "reply_pool": reply_pool,
+                    "acky_pool": acky_pool,
+                    "consultant_ess_pool": consultant_ess_pool,
+                    "ess_pool": ess_pool,
+                    "occurrence_acky_pool": occurrence_acky_pool,
                     "ack_pool": ack_pool,
                     "direct_pool": direct_pool,
                     "strong_non_ess_live": strong_non_ess_live,
@@ -616,6 +717,7 @@ def _exact_shared_occurrence_plan(
         "acky_pool": acky_pool,
         "consultant_ess_pool": consultant_ess_pool,
         "ess_pool": ess_pool,
+        "occurrence_acky_pool": occurrence_acky_pool,
         "ack_pool": ack_pool,
         "direct_pool": direct_pool,
         "strong_non_ess_live": strong_non_ess_live,
@@ -635,11 +737,7 @@ def _proposed_locked_triplet(
 
     lane_kind = exact_plan.get("lane_kind") or ""
     pick = exact_plan.get("pick")
-    if (
-        lane_kind == "ess_over_ess"
-        and "requester span(all-ack->ess)" in notes_l
-        and pick is not None
-    ):
+    if _lane_is_authoritative_occurrence(lane_kind) and "requester span(all-ack->ess)" in notes_l and pick is not None:
         t = _fmt(pick.sent_time)
         return f"{t} / {t} / {t}"
 
@@ -684,7 +782,7 @@ def _build_row_flow_summary(
     should_apply_occurrence = bool(
         exact_plan
         and exact_plan.get("exists")
-        and lane_kind == "ess_over_ess"
+        and _lane_is_authoritative_occurrence(lane_kind)
         and "requester span(all-ack->ess)" in notes_l
     )
     should_lock = bool(
@@ -774,7 +872,7 @@ def _runtime_mirror_trace(row: dict, output_by_line: dict[int, dict], exact_plan
 
     override_needed = bool(
         _row_is_all_ack_to_ess(row)
-        and (not shared_occ_plan_exists or lane_kind != "ess_over_ess")
+        and (not shared_occ_plan_exists or not _lane_is_authoritative_occurrence(lane_kind))
     )
     add("override_plan_needed", override_needed, f"lane_kind={lane_kind}")
 
@@ -782,12 +880,12 @@ def _runtime_mirror_trace(row: dict, output_by_line: dict[int, dict], exact_plan
         _row_is_all_ack_to_ess(row)
         and exact_plan
         and exact_plan.get("exists")
-        and lane_kind == "ess_over_ess"
+        and _lane_is_authoritative_occurrence(lane_kind)
     )
     add("override_plan_available", override_available, f"exact_lane_kind={lane_kind}")
 
     enter_occurrence_apply_branch = bool(
-        (lane_kind == "ess_over_ess")
+        _lane_is_authoritative_occurrence(lane_kind)
         and ("requester span(all-ack->ess)" in notes_l)
         and pick is not None
     )
@@ -883,9 +981,15 @@ def _override_function_trace(row: dict, exact_plan: dict | None) -> list[dict]:
         len(exact_plan.get("ess_pool") or []),
         f"group_size={exact_plan.get('group_size')}",
     )
+    add(
+        "override_occurrence_acky_pool_len",
+        len(exact_plan.get("occurrence_acky_pool") or []),
+        f"group_size={exact_plan.get('group_size')}",
+    )
     pool_len = max(
         len(exact_plan.get("consultant_ess_pool") or []),
         len(exact_plan.get("ess_pool") or []),
+        len(exact_plan.get("occurrence_acky_pool") or []),
     )
     add(
         "override_pool_gate",
@@ -901,6 +1005,392 @@ def _override_function_trace(row: dict, exact_plan: dict | None) -> list[dict]:
     return trace
 
 
+def _runtime_style_override_plan(
+    target_row: dict,
+    family_rows: list[dict],
+    output_by_line: dict[int, dict],
+    all_emails: list[DebugEmail],
+    ess_team: list[str],
+):
+    requester = _get_col(target_row, "Requester", "Consultant")
+    subject_norm_value = _family_subject_norm(target_row)
+    if not requester or not subject_norm_value or not _row_is_all_ack_to_ess(target_row):
+        return None
+
+    group_sorted = []
+    group_requesters = set()
+    for row in family_rows:
+        if not _row_is_all_ack_to_ess(row):
+            continue
+        if not _subject_match(subject_norm_value, _family_subject_norm(row)):
+            continue
+        group_sorted.append(row)
+        req = _get_col(row, "Requester", "Consultant")
+        if req:
+            group_requesters.add(req)
+
+    group_sorted.sort(key=lambda r: int(r.get("_line", 10**9)))
+    if len(group_sorted) < 2:
+        return None
+
+    target_line = int(target_row["_line"])
+    slot_index = None
+    for idx, row in enumerate(group_sorted):
+        if int(row["_line"]) == target_line:
+            slot_index = idx
+            break
+    if slot_index is None:
+        return None
+
+    requester_names = tuple(sorted(group_requesters))
+
+    def _group_req_match(email: DebugEmail) -> bool:
+        return _requester_match_any(email, list(requester_names))
+
+    def _subject_match_override(email_subject: str) -> bool:
+        e_norm = normalize_subject(email_subject or "")
+        if not subject_norm_value or not e_norm:
+            return False
+        if subject_norm_value == e_norm:
+            return True
+        return subject_norm_value in e_norm or e_norm in subject_norm_value
+
+    def _dedupe_group_ess_minutes(items: list[DebugEmail]) -> list[DebugEmail]:
+        buckets: dict[datetime, list[DebugEmail]] = {}
+        for item in items:
+            if not item.sent_time:
+                continue
+            minute_key = _to_ist(item.sent_time).replace(second=0, microsecond=0)
+            buckets.setdefault(minute_key, []).append(item)
+
+        out = []
+        for minute_key in sorted(buckets):
+            bucket = buckets[minute_key]
+            bucket.sort(
+                key=lambda email_obj: (
+                    0 if _group_req_match(email_obj) else 1,
+                    0 if (_classify_reply_kind(email_obj).get("direct_resolution")) else 1,
+                    0 if (_classify_reply_kind(email_obj).get("real_reply")) else 1,
+                    _to_ist(email_obj.sent_time),
+                )
+            )
+            out.append(bucket[0])
+        return out
+
+    consultant_ess_pool = []
+    ess_pool = []
+    occurrence_acky_pool = []
+    for email in all_emails:
+        if not email.sent_time:
+            continue
+        if not _subject_match_override(email.subject):
+            continue
+        if _is_real_ess_progression(email, ess_team):
+            ess_pool.append(email)
+            if _group_req_match(email):
+                consultant_ess_pool.append(email)
+        if _is_occurrence_acky_candidate(email, list(requester_names)):
+            occurrence_acky_pool.append(email)
+
+    consultant_ess_pool = _dedupe_group_ess_minutes(consultant_ess_pool)
+    ess_pool = _dedupe_group_ess_minutes(ess_pool)
+    occurrence_acky_pool = _dedupe_group_ess_minutes(occurrence_acky_pool)
+
+    anchor_row = output_by_line.get(int(group_sorted[0]["_line"]), {})
+    anchor_ack = _parse_datetime(_get_col(anchor_row, "Actual Response Date & Time"))
+    anchor_ack_ist = _to_ist(anchor_ack) if anchor_ack else None
+
+    def _same_month_pool(pool_in: list[DebugEmail]) -> list[DebugEmail]:
+        if not anchor_ack_ist:
+            return list(pool_in)
+        same_month = []
+        for email in pool_in:
+            e_ist = _to_ist(email.sent_time) if email.sent_time else None
+            if e_ist and e_ist.year == anchor_ack_ist.year and e_ist.month == anchor_ack_ist.month:
+                same_month.append(email)
+        if len(same_month) >= len(group_sorted):
+            return same_month
+        return list(pool_in)
+
+    consultant_ess_pool = _same_month_pool(consultant_ess_pool)
+    ess_pool = _same_month_pool(ess_pool)
+    occurrence_acky_pool = _same_month_pool(occurrence_acky_pool)
+
+    pool = None
+    pool_name = "<none>"
+    if len(consultant_ess_pool) >= len(group_sorted):
+        pool = consultant_ess_pool
+        pool_name = "consultant_ess_pool"
+    elif len(ess_pool) >= len(group_sorted):
+        pool = ess_pool
+        pool_name = "ess_pool"
+    elif len(occurrence_acky_pool) >= len(group_sorted):
+        pool = occurrence_acky_pool
+        pool_name = "occurrence_acky_pool"
+    if not pool or len(pool) < len(group_sorted):
+        return None
+
+    pick = pool[slot_index]
+    return {
+        "group_sorted": group_sorted,
+        "group_size": len(group_sorted),
+        "slot_index": slot_index,
+        "pick": pick,
+        "pick_when": _fmt(pick.sent_time),
+        "pool_name": pool_name,
+        "pool": pool,
+        "consultant_ess_pool": consultant_ess_pool,
+        "ess_pool": ess_pool,
+        "occurrence_acky_pool": occurrence_acky_pool,
+    }
+
+
+def _fmt_email_minutes(items: list[DebugEmail]) -> list[str]:
+    out = []
+    for item in items:
+        out.append(_fmt(item.sent_time))
+    return out
+
+
+def _pool_slot_for_minute(pool: list[DebugEmail], minute_text: str) -> int | None:
+    if not minute_text or minute_text == "-":
+        return None
+    for idx, item in enumerate(pool, start=1):
+        if _fmt(item.sent_time) == minute_text:
+            return idx
+    return None
+
+
+def _runtime_style_override_trace(
+    row: dict,
+    runtime_plan: dict | None,
+    exact_plan: dict | None,
+    duplicate_pick_lines: dict[str, list[int]],
+) -> list[dict]:
+    trace = []
+
+    def add(step: str, result, detail: str = ""):
+        trace.append({
+            "step": step,
+            "result": result,
+            "detail": detail,
+        })
+
+    add(
+        "runtime_override_entry",
+        _row_is_all_ack_to_ess(row),
+        f"line={row.get('_line')}, requester={_get_col(row, 'Requester', 'Consultant')}",
+    )
+    if not runtime_plan:
+        add("runtime_override_plan_exists", False, "no runtime-style override plan")
+        return trace
+
+    pick_when = runtime_plan.get("pick_when") or "-"
+    exact_pick_when = _fmt((exact_plan or {}).get("pick").sent_time if (exact_plan or {}).get("pick") else None)
+    pool_name = runtime_plan.get("pool_name") or "<none>"
+    consultant_pool = _fmt_email_minutes(runtime_plan.get("consultant_ess_pool") or [])
+    ess_pool = _fmt_email_minutes(runtime_plan.get("ess_pool") or [])
+    occurrence_acky_pool = _fmt_email_minutes(runtime_plan.get("occurrence_acky_pool") or [])
+    chosen_pool = _fmt_email_minutes(runtime_plan.get("pool") or [])
+    duplicate_lines = duplicate_pick_lines.get(pick_when, [])
+
+    add(
+        "runtime_override_plan_exists",
+        True,
+        (
+            f"group_size={runtime_plan.get('group_size')} "
+            f"slot={int(runtime_plan.get('slot_index', -1)) + 1} "
+            f"pool_name={pool_name}"
+        ),
+    )
+    add(
+        "runtime_override_group_lines",
+        True,
+        "lines=" + ",".join(str(int(group_row.get('_line', -1))) for group_row in runtime_plan.get("group_sorted") or []),
+    )
+    add(
+        "runtime_override_consultant_pool",
+        len(consultant_pool),
+        "minutes=" + (" | ".join(consultant_pool) if consultant_pool else "-"),
+    )
+    add(
+        "runtime_override_ess_pool",
+        len(ess_pool),
+        "minutes=" + (" | ".join(ess_pool) if ess_pool else "-"),
+    )
+    add(
+        "runtime_override_occurrence_acky_pool",
+        len(occurrence_acky_pool),
+        "minutes=" + (" | ".join(occurrence_acky_pool) if occurrence_acky_pool else "-"),
+    )
+    add(
+        "runtime_override_chosen_pool",
+        len(chosen_pool),
+        "minutes=" + (" | ".join(chosen_pool) if chosen_pool else "-"),
+    )
+    add(
+        "runtime_override_pick",
+        pick_when,
+        f"exact_pick={exact_pick_when}",
+    )
+    add(
+        "runtime_override_matches_exact",
+        pick_when == exact_pick_when,
+        f"runtime_pick={pick_when}, exact_pick={exact_pick_when}",
+    )
+    add(
+        "runtime_override_unique_pick",
+        len(duplicate_lines) <= 1,
+        (
+            f"pick={pick_when}"
+            if len(duplicate_lines) <= 1
+            else f"pick={pick_when} reused_by_lines={','.join(str(line) for line in duplicate_lines)}"
+        ),
+    )
+    return trace
+
+
+def _strict_ess_pass_trace(
+    row: dict,
+    output_by_line: dict[int, dict],
+    exact_plan: dict | None,
+    runtime_plan: dict | None,
+) -> list[dict]:
+    trace = []
+
+    def add(step: str, result, detail: str = ""):
+        trace.append({
+            "step": step,
+            "result": result,
+            "detail": detail,
+        })
+
+    line = int(row["_line"])
+    notes_l = _get_col(row, "Notes").lower()
+    current_triplet = _fmt_triplet(output_by_line.get(line, {}))
+    current_single = current_triplet.split(" / ")[0] if " / " in current_triplet else current_triplet
+    exact_pick = _fmt((exact_plan or {}).get("pick").sent_time if (exact_plan or {}).get("pick") else None)
+    chosen_pool = (runtime_plan or {}).get("pool") or []
+    exact_slot = int((runtime_plan or {}).get("slot_index", -1)) + 1 if runtime_plan else None
+    current_slot = _pool_slot_for_minute(chosen_pool, current_single)
+    group_sorted = (runtime_plan or {}).get("group_sorted") or []
+
+    prev_line = None
+    prev_output = "-"
+    if group_sorted:
+        for idx, group_row in enumerate(group_sorted):
+            if int(group_row.get("_line", -1)) != line:
+                continue
+            if idx > 0:
+                prev_line = int(group_sorted[idx - 1].get("_line", -1))
+                prev_output = _fmt_triplet(output_by_line.get(prev_line, {}))
+            break
+
+    add(
+        "strict_pass_authoritative_call_site",
+        MAIN_LINE_REFS.get("ess_only_strict_authoritative_call"),
+        (
+            f"call_line={MAIN_LINE_REFS.get('ess_only_strict_authoritative_call')}, "
+            f"manual_pick_branch={MAIN_LINE_REFS.get('ess_only_strict_manual_occ_pick_branch')}, "
+            f"manual_notes_write={MAIN_LINE_REFS.get('ess_only_strict_manual_notes_write')}"
+        ),
+    )
+    add(
+        "strict_pass_row_is_all_ack_ess",
+        _row_is_all_ack_to_ess(row),
+        f"notes_has_all_ack={'requester span(all-ack->ess)' in notes_l}",
+    )
+    add(
+        "strict_pass_exact_pick",
+        exact_pick != "-",
+        f"exact_pick={exact_pick}, current={current_single}",
+    )
+    add(
+        "strict_pass_pool_slot_alignment",
+        current_slot == exact_slot,
+        f"current_slot={current_slot}, exact_slot={exact_slot}",
+    )
+    add(
+        "strict_pass_reuses_earlier_slot",
+        bool(current_slot is not None and exact_slot is not None and current_slot < exact_slot),
+        f"current_slot={current_slot}, exact_slot={exact_slot}",
+    )
+    add(
+        "strict_pass_matches_previous_group_output",
+        bool(prev_line is not None and current_triplet == prev_output),
+        f"prev_line={prev_line}, prev_output={prev_output}",
+    )
+    add(
+        "strict_pass_local_branches_should_target_exact_pick",
+        bool(exact_pick != "-" and current_single != exact_pick),
+        (
+            "both the authoritative strict branch and the manual occ-pick branch "
+            f"would target exact_pick={exact_pick}; current remains {current_single}"
+        ),
+    )
+    return trace
+
+
+def _main_flow_hazard_trace(
+    row: dict,
+    output_by_line: dict[int, dict],
+    exact_plan: dict | None,
+    runtime_plan: dict | None,
+) -> list[dict]:
+    trace = []
+
+    def add(step: str, result, detail: str = ""):
+        trace.append({
+            "step": step,
+            "result": result,
+            "detail": detail,
+        })
+
+    notes_l = _get_col(row, "Notes").lower()
+    current_triplet = _fmt_triplet(output_by_line.get(int(row["_line"]), {}))
+    current_single = current_triplet.split(" / ")[0] if " / " in current_triplet else current_triplet
+    exact_pick = _fmt((exact_plan or {}).get("pick").sent_time if (exact_plan or {}).get("pick") else None)
+    runtime_pick = runtime_plan.get("pick_when") if runtime_plan else "-"
+
+    add(
+        "strict_pass_shared_triplet_call_site",
+        MAIN_LINE_REFS.get("ess_only_strict_shared_triplet_call"),
+        (
+            f"call_line={MAIN_LINE_REFS.get('ess_only_strict_shared_triplet_call')}, "
+            f"helper_line={MAIN_LINE_REFS.get('apply_shared_occurrence_triplet_def')}"
+        ),
+    )
+    add(
+        "row_has_ess_guard_and_lock",
+        ("esscontinuationguard[" in notes_l) and ("occurrencelocked" in notes_l),
+        f"notes_has_guard={'esscontinuationguard[' in notes_l}, notes_has_lock={'occurrencelocked' in notes_l}",
+    )
+    add(
+        "current_output_matches_exact_pick",
+        current_single == exact_pick,
+        f"current={current_single}, exact_pick={exact_pick}",
+    )
+    add(
+        "current_output_matches_runtime_override_pick",
+        current_single == runtime_pick,
+        f"current={current_single}, runtime_pick={runtime_pick}",
+    )
+    add(
+        "shared_decision_carryover_risk",
+        bool(
+            "requester span(all-ack->ess)" in notes_l
+            and "esscontinuationguard[" in notes_l
+            and exact_pick != "-"
+            and current_single != exact_pick
+        ),
+        (
+            "strict ESS continuation path can apply state['shared_decision'] before final pass; "
+            f"current={current_single}, exact_pick={exact_pick}"
+        ),
+    )
+    return trace
+
+
 def _simulate_family(
     family_subject: str,
     family_rows: list[dict],
@@ -908,7 +1398,7 @@ def _simulate_family(
     all_emails: list[DebugEmail],
     ess_team: list[str],
 ) -> None:
-    reply_pool, ack_pool, direct_pool, consultant_ess_pool, ess_pool = _collect_family_pools(
+    reply_pool, ack_pool, direct_pool, consultant_ess_pool, ess_pool, occurrence_acky_pool = _collect_family_pools(
         family_subject,
         family_rows,
         all_emails,
@@ -926,7 +1416,8 @@ def _simulate_family(
     print("SIMULATED OCCURRENCE LOCK")
     print(
         f"reply_pool={len(reply_pool)} ack_pool={len(ack_pool)} direct_pool={len(direct_pool)} "
-        f"consultant_ess_pool={len(consultant_ess_pool)} ess_pool={len(ess_pool)}"
+        f"consultant_ess_pool={len(consultant_ess_pool)} ess_pool={len(ess_pool)} "
+        f"occurrence_acky_pool={len(occurrence_acky_pool)}"
     )
     print(f"special_rows={len(special_rows)} total_rows={len(sorted_rows)} usable_non_ess_lane={usable_non_ess_lane}")
     print("-" * 100)
@@ -962,6 +1453,9 @@ def _simulate_family(
             elif slot_index < len(ess_pool):
                 expected_kind = "ess_over_ess_generic"
                 expected_email = ess_pool[slot_index]
+            elif slot_index < len(occurrence_acky_pool):
+                expected_kind = "ess_acky_sequence"
+                expected_email = occurrence_acky_pool[slot_index]
             else:
                 blocker = "no_special_lane"
         else:
@@ -985,7 +1479,7 @@ def _simulate_family(
 
         expected_when = _fmt(expected_email.sent_time) if expected_email else "-"
         expected_triplet = "-"
-        if expected_email and expected_kind.startswith("ess_over_ess"):
+        if expected_email and (expected_kind.startswith("ess_over_ess") or expected_kind == "ess_acky_sequence"):
             expected_triplet = f"{expected_when} / {expected_when} / {expected_when}"
             would_lock = "requester span(all-ack->ess)" in notes_l
         elif expected_email:
@@ -1041,6 +1535,9 @@ def _simulate_family(
             elif slot_index < len(ess_pool):
                 shared_lane_kind = "ess_over_ess"
                 shared_pick = ess_pool[slot_index]
+            elif slot_index < len(occurrence_acky_pool):
+                shared_lane_kind = "ess_acky_sequence"
+                shared_pick = occurrence_acky_pool[slot_index]
             else:
                 shared_occ_exists = False
                 reason = "no_special_lane"
@@ -1068,7 +1565,7 @@ def _simulate_family(
         notes_has_all_ack = "requester span(all-ack->ess)" in notes_l
         authoritative_apply = bool(
             shared_occ_exists
-            and shared_lane_kind == "ess_over_ess"
+            and _lane_is_authoritative_occurrence(shared_lane_kind)
             and notes_has_all_ack
             and shared_pick is not None
         )
@@ -1118,6 +1615,7 @@ def _simulate_family(
     print("-" * 100)
     print("EXACT PLANNER TRACE")
     exact_plans_by_line: dict[int, dict | None] = {}
+    runtime_override_by_line: dict[int, dict | None] = {}
     for row in sorted_rows:
         line = int(row["_line"])
         current_triplet = _fmt_triplet(output_by_line.get(line, {}))
@@ -1130,6 +1628,13 @@ def _simulate_family(
             ess_team,
         )
         exact_plans_by_line[line] = plan
+        runtime_override_by_line[line] = _runtime_style_override_plan(
+            row,
+            family_rows,
+            output_by_line,
+            all_emails,
+            ess_team,
+        )
         print(f"line={line} requester={_get_col(row, 'Requester', 'Consultant')}")
         print(f"  current_triplet={current_triplet}")
         if not plan or not plan.get('exists'):
@@ -1140,7 +1645,7 @@ def _simulate_family(
         pick_when = _fmt(plan.get("pick").sent_time if plan.get("pick") else None)
         lane_kind = plan.get("lane_kind")
         authoritative_apply = bool(
-            lane_kind == "ess_over_ess"
+            _lane_is_authoritative_occurrence(lane_kind)
             and "requester span(all-ack->ess)" in notes_l
             and plan.get("pick") is not None
         )
@@ -1159,7 +1664,8 @@ def _simulate_family(
             f"reply_pool={len(plan.get('reply_pool') or [])} "
             f"acky_pool={len(plan.get('acky_pool') or [])} "
             f"consultant_ess_pool={len(plan.get('consultant_ess_pool') or [])} "
-            f"ess_pool={len(plan.get('ess_pool') or [])}"
+            f"ess_pool={len(plan.get('ess_pool') or [])} "
+            f"occurrence_acky_pool={len(plan.get('occurrence_acky_pool') or [])}"
         )
         print(
             f"  strong_non_ess_live={plan.get('strong_non_ess_live')} "
@@ -1212,6 +1718,57 @@ def _simulate_family(
         for item in _override_function_trace(
             row,
             exact_plans_by_line.get(line),
+        ):
+            print(f"  step={item['step']} | result={item['result']}")
+            if item["detail"]:
+                print(f"    detail={item['detail']}")
+
+    print("-" * 100)
+    print("RUNTIME-STYLE OVERRIDE TRACE")
+    duplicate_pick_lines: dict[str, list[int]] = {}
+    for line, runtime_plan in runtime_override_by_line.items():
+        if not runtime_plan:
+            continue
+        pick_when = runtime_plan.get("pick_when") or "-"
+        duplicate_pick_lines.setdefault(pick_when, []).append(line)
+    for row in sorted_rows:
+        line = int(row["_line"])
+        print(f"line={line} requester={_get_col(row, 'Requester', 'Consultant')}")
+        for item in _runtime_style_override_trace(
+            row,
+            runtime_override_by_line.get(line),
+            exact_plans_by_line.get(line),
+            duplicate_pick_lines,
+        ):
+            print(f"  step={item['step']} | result={item['result']}")
+            if item["detail"]:
+                print(f"    detail={item['detail']}")
+
+    print("-" * 100)
+    print("MAIN FLOW HAZARD TRACE")
+    for row in sorted_rows:
+        line = int(row["_line"])
+        print(f"line={line} requester={_get_col(row, 'Requester', 'Consultant')}")
+        for item in _main_flow_hazard_trace(
+            row,
+            output_by_line,
+            exact_plans_by_line.get(line),
+            runtime_override_by_line.get(line),
+        ):
+            print(f"  step={item['step']} | result={item['result']}")
+            if item["detail"]:
+                print(f"    detail={item['detail']}")
+
+    print("-" * 100)
+    print("STRICT ESS PASS TRACE")
+    for row in sorted_rows:
+        line = int(row["_line"])
+        print(f"line={line} requester={_get_col(row, 'Requester', 'Consultant')}")
+        for item in _strict_ess_pass_trace(
+            row,
+            output_by_line,
+            exact_plans_by_line.get(line),
+            runtime_override_by_line.get(line),
         ):
             print(f"  step={item['step']} | result={item['result']}")
             if item["detail"]:

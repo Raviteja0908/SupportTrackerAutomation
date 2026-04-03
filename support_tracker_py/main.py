@@ -3468,6 +3468,27 @@ def main() -> int:
                 "service_bucket": _subject_service_bucket(subject_norm, service_no),
                 "multi_service_subject": _subject_has_multiple_service_nos(subject_norm),
                 "occurrence_key": group_key,
+                "occurrence_family_subject_norm": normalize_subject(_subject_for_description(description or "")) or subject_norm,
+                "occurrence_initial_notes_l": (f"{debug.notes}; Match={match_note}" or "").lower(),
+                "occurrence_initial_all_ack_family": (
+                    "requester span(all-ack->ess)" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                    and "ess-only; no non-ess request" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                ),
+                "occurrence_initial_family_candidate": (
+                    (
+                        "requester span(all-ack->ess)" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                        and "ess-only; no non-ess request" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                    )
+                    or (
+                        "ess-only; no non-ess request" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                        and "ackwindowguard" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                        and (
+                            "dateanchoroccurrence" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                            or "quotedrequestonly" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                            or "quotedrequestonlynopair" in (f"{debug.notes}; Match={match_note}" or "").lower()
+                        )
+                    )
+                ),
                 "subject_norm": subject_norm,
                 "date_tokens": date_tokens,
                 "explicit_marker": explicit_marker,
@@ -3952,9 +3973,52 @@ def main() -> int:
                 and "ess-only; no non-ess request" in notes_l
             )
 
+        def _is_occurrence_all_ack_family_candidate_notes(notes_l: str) -> bool:
+            notes_l = (notes_l or "").lower()
+            if _is_all_ack_to_ess_notes(notes_l):
+                return True
+            return (
+                "ess-only; no non-ess request" in notes_l
+                and "ackwindowguard" in notes_l
+                and (
+                    "dateanchoroccurrence" in notes_l
+                    or "quotedrequestonly" in notes_l
+                    or "quotedrequestonlynopair" in notes_l
+                )
+            )
+
+        def _state_occurrence_notes_l(state) -> str:
+            return (state.get("occurrence_initial_notes_l") or "").lower() if state else ""
+
+        def _state_occurrence_family_subject_norm(state) -> str:
+            if not state:
+                return ""
+            return (
+                state.get("occurrence_family_subject_norm")
+                or state.get("subject_norm")
+                or ""
+            ).lower()
+
+        def _state_is_all_ack_to_ess(state) -> bool:
+            if not state:
+                return False
+            if state.get("occurrence_initial_all_ack_family"):
+                return True
+            return _is_all_ack_to_ess_notes(_state_occurrence_notes_l(state))
+
+        def _state_is_occurrence_family_candidate(state) -> bool:
+            if not state:
+                return False
+            if state.get("occurrence_initial_family_candidate"):
+                return True
+            return _is_occurrence_all_ack_family_candidate_notes(_state_occurrence_notes_l(state))
+
+        def _is_authoritative_occurrence_lane(lane_kind: str) -> bool:
+            return (lane_kind or "") in {"ess_over_ess", "ess_acky_sequence"}
+
         def _shared_occurrence_lane_plan(state):
             requester = state.get("requester") or ""
-            subject_norm_value = (state.get("subject_norm") or "").lower()
+            subject_norm_value = _state_occurrence_family_subject_norm(state)
             service_no = state.get("service_no") or ""
             list_index = state.get("list_index")
             row_group_total = state.get("group_total") or 0
@@ -3962,8 +4026,8 @@ def main() -> int:
                 return None
 
             current_occ_key = state.get("occurrence_key") or _occurrence_group_key(subject_norm_value, requester, service_no)
-            current_notes_l = (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else ""
-            current_is_all_ack_to_ess = _is_all_ack_to_ess_notes(current_notes_l)
+            current_notes_l = _state_occurrence_notes_l(state)
+            current_is_all_ack_to_ess = _state_is_all_ack_to_ess(state)
             current_service_bucket = state.get("service_bucket") or _subject_service_bucket(subject_norm_value, service_no)
             current_iface_tokens = _interface_tokens(subject_norm_value)
 
@@ -3986,13 +4050,13 @@ def main() -> int:
                     other_li = s.get("list_index")
                     if other_li is None or other_li >= len(automation_rows):
                         continue
-                    other_notes_l = (debug_rows[other_li].get("Notes", "") or "").lower() if other_li < len(debug_rows) else ""
+                    other_notes_l = _state_occurrence_notes_l(s)
                     if not _is_occurrence_managed_notes(other_notes_l):
                         continue
                     if subject_wide:
-                        if current_is_all_ack_to_ess and not _is_all_ack_to_ess_notes(other_notes_l):
+                        if current_is_all_ack_to_ess and not _state_is_occurrence_family_candidate(s):
                             continue
-                        other_subject_norm = (s.get("subject_norm") or "").lower()
+                        other_subject_norm = _state_occurrence_family_subject_norm(s)
                         if not _group_subject_match(other_subject_norm):
                             continue
                         other_service_bucket = s.get("service_bucket") or _subject_service_bucket(
@@ -4349,8 +4413,8 @@ def main() -> int:
                 lane_kind = plan_obj.get("lane_kind") or "reply"
                 lane_when = plan_obj.get("pick_when")
                 slot_index = plan_obj.get("slot_index", 0)
-                fill_style = "all_three_same" if lane_kind == "ess_over_ess" else "lane_guided"
-                confidence = "strong" if lane_kind == "ess_over_ess" else "moderate"
+                fill_style = "all_three_same" if _is_authoritative_occurrence_lane(lane_kind) else "lane_guided"
+                confidence = "strong" if _is_authoritative_occurrence_lane(lane_kind) else "moderate"
                 decision = {
                     "owner": "shared_occurrence",
                     "row_type": lane_kind,
@@ -4364,7 +4428,7 @@ def main() -> int:
                 existing = state.get("shared_decision") or {}
                 if (
                     existing.get("owner") == "shared_occurrence"
-                    and existing.get("row_type") == "ess_over_ess"
+                    and _is_authoritative_occurrence_lane(existing.get("row_type") or "")
                     and existing.get("fill_style") == "all_three_same"
                     and existing.get("confidence") == "strong"
                 ):
@@ -4372,7 +4436,7 @@ def main() -> int:
                     new_triplet = decision.get("triplet")
                     # Do not let later weaker/local recomputation downgrade a
                     # previously established strong occurrence-owned ESS lane.
-                    if lane_kind != "ess_over_ess":
+                    if not _is_authoritative_occurrence_lane(lane_kind):
                         return plan_obj
                     if existing_triplet and new_triplet and existing_triplet != new_triplet:
                         return plan_obj
@@ -4477,32 +4541,63 @@ def main() -> int:
                 return plan
             return _remember_decision(lane_plan)
 
-        def _subject_wide_all_ack_ess_override_plan(state):
+        _all_ack_ess_assignment_cache = {}
+
+        def _is_occurrence_acky_candidate(e, requester_names) -> bool:
+            e_ist = _email_ist(e)
+            if not e_ist:
+                return False
+            if not requester_names:
+                return False
+            if not any(
+                _match_requester(e.sender_name, e.sender_email, req_name)
+                for req_name in requester_names
+                if req_name
+            ):
+                return False
+            cls = _shared_reply_classification(e)
+            if _system_like_sender(e) or cls.get("thanks_info") or cls.get("nonfinal_followup"):
+                return False
+            return bool(
+                cls.get("real_reply")
+                or cls.get("direct_resolution")
+                or cls.get("ack_like")
+                or cls.get("explicit_ack")
+                or cls.get("short_ess_ack")
+            )
+
+        def _subject_wide_all_ack_ess_assignment_map(state):
             if not state:
-                return None
+                return {}
             list_index = state.get("list_index")
             requester = state.get("requester") or ""
-            subject_norm_value = (state.get("subject_norm") or "").lower()
+            subject_norm_value = _state_occurrence_family_subject_norm(state)
             service_no = state.get("service_no") or ""
             if list_index is None or not requester or not subject_norm_value:
-                return None
-            notes_l = (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else ""
-            if not _is_all_ack_to_ess_notes(notes_l):
-                return None
+                return {}
 
-            current_service_bucket = state.get("service_bucket") or _subject_service_bucket(subject_norm_value, service_no)
-            current_iface_tokens = _interface_tokens(subject_norm_value)
+            def _add_override_debug(tag: str):
+                if list_index is None or list_index >= len(debug_rows):
+                    return
+                notes_now = debug_rows[list_index].get("Notes", "") or ""
+                if tag not in notes_now:
+                    debug_rows[list_index]["Notes"] = f"{notes_now}; {tag}"
 
-            def _group_subject_match(other_subject_norm: str) -> bool:
-                other_norm = (other_subject_norm or "").lower()
-                if not other_norm:
+            notes_l = _state_occurrence_notes_l(state)
+            if not _state_is_all_ack_to_ess(state):
+                return {}
+            _add_override_debug("OverrideMap[Start]")
+
+            def _family_subject_norm(other_state) -> str:
+                return _state_occurrence_family_subject_norm(other_state)
+
+            def _group_subject_match(other_state) -> bool:
+                other_norm = _family_subject_norm(other_state)
+                if not subject_norm_value or not other_norm:
                     return False
-                return _fresh_picker_subject_safe(
-                    subject_norm_value,
-                    other_norm,
-                    iface_tokens=current_iface_tokens,
-                    allow_added_inc=True,
-                )
+                if subject_norm_value == other_norm:
+                    return True
+                return subject_norm_value in other_norm or other_norm in subject_norm_value
 
             group_sorted = []
             group_requesters = set()
@@ -4510,17 +4605,9 @@ def main() -> int:
                 other_li = s.get("list_index")
                 if other_li is None or other_li >= len(automation_rows):
                     continue
-                other_notes_l = (debug_rows[other_li].get("Notes", "") or "").lower() if other_li < len(debug_rows) else ""
-                if not _is_all_ack_to_ess_notes(other_notes_l):
+                if not _state_is_occurrence_family_candidate(s):
                     continue
-                other_subject_norm = (s.get("subject_norm") or "").lower()
-                if not _group_subject_match(other_subject_norm):
-                    continue
-                other_service_bucket = s.get("service_bucket") or _subject_service_bucket(
-                    other_subject_norm,
-                    s.get("service_no") or "",
-                )
-                if current_service_bucket and other_service_bucket and other_service_bucket != current_service_bucket:
+                if not _group_subject_match(s):
                     continue
                 group_sorted.append(s)
                 other_requester = (s.get("requester") or "").strip()
@@ -4528,19 +4615,49 @@ def main() -> int:
                     group_requesters.add(other_requester)
 
             if len(group_sorted) < 2:
-                return None
+                fallback_group = []
+                fallback_requesters = set()
+                for s in row_states:
+                    other_li = s.get("list_index")
+                    if other_li is None or other_li >= len(automation_rows):
+                        continue
+                    if s.get("is_dep_req") or s.get("is_dep_succ"):
+                        continue
+                    if not _group_subject_match(s):
+                        continue
+                    other_subject_norm = _family_subject_norm(s)
+                    other_service_bucket = s.get("service_bucket") or _subject_service_bucket(
+                        other_subject_norm,
+                        s.get("service_no") or "",
+                    )
+                    if current_service_bucket and other_service_bucket and other_service_bucket != current_service_bucket:
+                        continue
+                    fallback_group.append(s)
+                    other_requester = (s.get("requester") or "").strip()
+                    if other_requester:
+                        fallback_requesters.add(other_requester)
+                if len(fallback_group) >= 2:
+                    group_sorted = fallback_group
+                    group_requesters = fallback_requesters
+                    _add_override_debug(f"OverrideMap[FallbackGroup={len(group_sorted)}]")
+
+            if len(group_sorted) < 2:
+                _add_override_debug(f"OverrideMap[Group<{len(group_sorted)}]")
+                return {}
 
             group_sorted.sort(key=lambda x: x.get("row_index") or 10**9)
-            slot_index = None
-            for idx, s in enumerate(group_sorted):
-                if s.get("list_index") == list_index:
-                    slot_index = idx
-                    break
-            if slot_index is None:
-                return None
+            _add_override_debug(f"OverrideMap[Group={len(group_sorted)}]")
+            cache_key = (
+                tuple(s.get("list_index") for s in group_sorted),
+                subject_norm_value,
+            )
+            cached = _all_ack_ess_assignment_cache.get(cache_key)
+            if cached is not None:
+                _add_override_debug(f"OverrideMap[Cached={len(cached)}]")
+                return cached
 
             requester_names = tuple(sorted(group_requesters)) if group_requesters else ((requester,) if requester else tuple())
-            row_tokens = _match_tokens(subject_norm_value)
+            current_iface_tokens = _interface_tokens(subject_norm_value)
 
             def _group_req_match(email_obj):
                 if not requester_names:
@@ -4555,9 +4672,12 @@ def main() -> int:
                 e_norm = normalize_subject(email_subject or "")
                 if not subject_norm_value or not e_norm:
                     return False
-                if subject_norm_value == e_norm:
-                    return True
-                return subject_norm_value in e_norm or e_norm in subject_norm_value
+                return _fresh_picker_subject_safe(
+                    subject_norm_value,
+                    e_norm,
+                    iface_tokens=current_iface_tokens,
+                    allow_added_inc=True,
+                )
 
             def _dedupe_group_ess_minutes(items):
                 buckets = {}
@@ -4584,23 +4704,28 @@ def main() -> int:
 
             consultant_ess_pool = []
             ess_pool = []
+            occurrence_acky_pool = []
             for e in emails:
                 e_ist = _email_ist(e)
                 if not e_ist:
                     continue
-                if not _ess_sender(e):
-                    continue
-                cls = _shared_reply_classification(e)
-                if _system_like_sender(e) or cls.get("thanks_info") or cls.get("nonfinal_followup"):
-                    continue
                 if not _subject_match_override(getattr(e, "subject", "") or ""):
                     continue
-                ess_pool.append(e)
-                if _group_req_match(e):
-                    consultant_ess_pool.append(e)
+                cls = _shared_reply_classification(e)
+                if _ess_sender(e):
+                    if _system_like_sender(e) or cls.get("thanks_info") or cls.get("nonfinal_followup"):
+                        continue
+                    ess_pool.append(e)
+                    if _group_req_match(e):
+                        consultant_ess_pool.append(e)
+                if _is_occurrence_acky_candidate(e, requester_names):
+                    occurrence_acky_pool.append(e)
 
             consultant_ess_pool = _dedupe_group_ess_minutes(consultant_ess_pool)
             ess_pool = _dedupe_group_ess_minutes(ess_pool)
+            occurrence_acky_pool = _dedupe_group_ess_minutes(occurrence_acky_pool)
+            _add_override_debug(f"OverrideMap[Pools={len(consultant_ess_pool)}/{len(ess_pool)}]")
+            _add_override_debug(f"OverrideMap[AckySeq={len(occurrence_acky_pool)}]")
 
             anchor_li = group_sorted[0].get("list_index")
             a_dt = _parse_time_str(automation_rows[anchor_li].get("Actual Response Date & Time")) if anchor_li is not None else None
@@ -4620,26 +4745,76 @@ def main() -> int:
 
             consultant_ess_pool = _same_month_pool(consultant_ess_pool)
             ess_pool = _same_month_pool(ess_pool)
+            occurrence_acky_pool = _same_month_pool(occurrence_acky_pool)
 
-            pool = consultant_ess_pool if len(consultant_ess_pool) >= len(group_sorted) else ess_pool
-            if len(pool) < len(group_sorted):
+            pool = None
+            lane_kind = ""
+            if len(consultant_ess_pool) >= len(group_sorted):
+                pool = consultant_ess_pool
+                lane_kind = "ess_over_ess"
+            elif len(ess_pool) >= len(group_sorted):
+                pool = ess_pool
+                lane_kind = "ess_over_ess"
+            elif len(occurrence_acky_pool) >= len(group_sorted):
+                pool = occurrence_acky_pool
+                lane_kind = "ess_acky_sequence"
+            if not pool or len(pool) < len(group_sorted):
+                _add_override_debug(f"OverrideMap[PoolShort={len(pool or [])}/{len(group_sorted)}]")
+                _all_ack_ess_assignment_cache[cache_key] = {}
+                return {}
+
+            assignment_map = {}
+            occ_key_default = state.get("occurrence_key") or _occurrence_group_key(subject_norm_value, requester, service_no)
+            for slot_index, slot_state in enumerate(group_sorted):
+                slot_list_index = slot_state.get("list_index")
+                if slot_list_index is None:
+                    continue
+                pick = pool[slot_index]
+                pick_ist = _email_ist(pick)
+                if not pick_ist:
+                    continue
+                assignment_map[slot_list_index] = {
+                    "occ_key": slot_state.get("occurrence_key") or occ_key_default,
+                    "group": group_sorted,
+                    "group_size": len(group_sorted),
+                    "slot_index": slot_index,
+                    "pick": pick,
+                    "pick_when": pick_ist.replace(second=0, microsecond=0),
+                    "lane_kind": lane_kind,
+                    "scope": "subject_wide_ess_override",
+                    "pool": pool,
+                    "consultant_ess_pool": consultant_ess_pool,
+                    "ess_pool": ess_pool,
+                    "occurrence_acky_pool": occurrence_acky_pool,
+                }
+            _add_override_debug(f"OverrideMap[Assigned={len(assignment_map)}]")
+            _all_ack_ess_assignment_cache[cache_key] = assignment_map
+            return assignment_map
+
+        def _subject_wide_all_ack_ess_override_plan(state):
+            if not state:
                 return None
-            pick = pool[slot_index]
-            pick_ist = _email_ist(pick)
-            if not pick_ist:
+            list_index = state.get("list_index")
+            if list_index is None:
                 return None
-            return {
-                "occ_key": state.get("occurrence_key") or _occurrence_group_key(subject_norm_value, requester, service_no),
-                "group": group_sorted,
-                "group_size": len(group_sorted),
-                "slot_index": slot_index,
-                "pick": pick,
-                "pick_when": pick_ist.replace(second=0, microsecond=0),
-                "lane_kind": "ess_over_ess",
-                "scope": "subject_wide_ess_override",
-                "consultant_ess_pool": consultant_ess_pool,
-                "ess_pool": ess_pool,
-            }
+            assignment_map = _subject_wide_all_ack_ess_assignment_map(state)
+            if list_index is not None and list_index < len(debug_rows):
+                notes_now = debug_rows[list_index].get("Notes", "") or ""
+                tag = f"OverridePlan[Hit={int(list_index in assignment_map)}]"
+                if tag not in notes_now:
+                    debug_rows[list_index]["Notes"] = f"{notes_now}; {tag}"
+            return assignment_map.get(list_index)
+
+        def _preferred_shared_occurrence_plan(state, *, quoted_sources=None, c_ist=None, require_override_for_all_ack: bool = False):
+            if not state:
+                return None
+            if _state_is_all_ack_to_ess(state):
+                override_plan = _subject_wide_all_ack_ess_override_plan(state)
+                if override_plan:
+                    return override_plan
+                if require_override_for_all_ack:
+                    return None
+            return _shared_occurrence_fill_plan(state, quoted_sources=quoted_sources, c_ist=c_ist)
 
         def _system_like_sender(e):
             sender = f"{getattr(e, 'sender_email', '') or ''} {getattr(e, 'sender_name', '') or ''}".lower()
@@ -4940,7 +5115,7 @@ def main() -> int:
             ):
                 return cand_c_min == cur_c_min and cand_a_min == cur_a_min and cand_r_min == cur_r_min
 
-            occurrence_plan = _shared_occurrence_fill_plan(state) if state else None
+            occurrence_plan = _preferred_shared_occurrence_plan(state) if state else None
             shared_decision = (state or {}).get("shared_decision") if state else None
             if shared_decision:
                 decision_triplet = shared_decision.get("triplet")
@@ -4948,7 +5123,7 @@ def main() -> int:
                     confidence = shared_decision.get("confidence") or ""
                     fill_style = shared_decision.get("fill_style") or ""
                     row_type = shared_decision.get("row_type") or ""
-                    if confidence == "strong" and fill_style == "all_three_same" and row_type == "ess_over_ess":
+                    if confidence == "strong" and fill_style == "all_three_same" and _is_authoritative_occurrence_lane(row_type):
                         if candidate_kind not in {"quoted", "hybrid", "risk"}:
                             return False
                         # Stronger proof must move away from the all-three-same
@@ -4968,7 +5143,7 @@ def main() -> int:
                 if not (
                     candidate_kind == "occurrence_ess"
                     and occurrence_plan
-                    and occurrence_plan.get("lane_kind") == "ess_over_ess"
+                    and _is_authoritative_occurrence_lane(occurrence_plan.get("lane_kind") or "")
                 ):
                     return False
 
@@ -5014,7 +5189,7 @@ def main() -> int:
             return True
 
         def _occurrence_expected_reply_ist(state):
-            shared_plan = _shared_occurrence_fill_plan(state)
+            shared_plan = _preferred_shared_occurrence_plan(state)
             if shared_plan:
                 return {
                     "when": shared_plan["pick_when"],
@@ -5030,145 +5205,36 @@ def main() -> int:
             list_index = state.get("list_index")
             if row_group_total < 2 or list_index is None or not requester or not subject_norm_value or not base_thread:
                 return None
+            current_occ_key = state.get("occurrence_key") or _occurrence_group_key(subject_norm_value, requester, service_no)
 
-        def _apply_shared_occurrence_triplet(
-            state,
-            row_vals,
-            list_index,
-            row_idx,
-            note_tag: str,
-        ) -> bool:
-            shared_decision = (state or {}).get("shared_decision") if state else None
-            if not shared_decision:
-                return False
-            if (shared_decision.get("owner") or "") != "shared_occurrence":
-                return False
-            if (shared_decision.get("row_type") or "") != "ess_over_ess":
-                return False
-            if (shared_decision.get("fill_style") or "") != "all_three_same":
-                return False
-            triplet = shared_decision.get("triplet")
-            if not triplet or len(triplet) != 3:
-                return False
-            cand_c_ist, cand_a_ist, cand_r_ist = triplet
-            if not (cand_c_ist and cand_a_ist and cand_r_ist):
-                return False
-            if not _allow_guard_rewrite(
-                row_vals,
-                list_index,
-                cand_c_ist,
-                cand_a_ist,
-                cand_r_ist,
-                note_tag,
-                "occurrence_ess",
-            ):
-                return False
-            t = _format_time(cand_c_ist)
-            if not t:
-                return False
-            row_vals["Created Date & Time"] = t
-            row_vals["Actual Response Date & Time"] = t
-            row_vals["Actual Resolved Date & Time"] = t
-            if row_idx:
-                ws.cell(row_idx, created_col).value = t
-                ws.cell(row_idx, response_col).value = t
-                ws.cell(row_idx, resolved_col).value = t
-            _set_row_fill(row_idx, clear_fill)
-            if list_index < len(debug_rows):
-                who = (
-                    debug_rows[list_index].get("ResolvedSource")
-                    or debug_rows[list_index].get("AckSource")
-                    or debug_rows[list_index].get("CreatedSource")
-                    or "SHARED_OCCURRENCE"
+            def _occurrence_notes_match(notes_l: str) -> bool:
+                return (
+                    "ess-only; no non-ess request" in notes_l
+                    or "requester follow-up" in notes_l
+                    or "esscontinuationguard[" in notes_l
                 )
-                debug_rows[list_index]["CreatedSource"] = who
-                debug_rows[list_index]["AckSource"] = who
-                debug_rows[list_index]["ResolvedSource"] = who
-                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note_tag}"
-            return True
 
-        def _current_row_triplet_ist(row_vals):
-            if not row_vals:
-                return None
-            c_dt = _parse_time_str(row_vals.get("Created Date & Time") or "")
-            a_dt = _parse_time_str(row_vals.get("Actual Response Date & Time") or "")
-            r_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time") or "")
-            if not (c_dt and a_dt and r_dt):
-                return None
-            c_ist = _to_ist(c_dt)
-            a_ist = _to_ist(a_dt)
-            r_ist = _to_ist(r_dt)
-            if not (c_ist and a_ist and r_ist):
-                return None
-            return (
-                c_ist.replace(second=0, microsecond=0),
-                a_ist.replace(second=0, microsecond=0),
-                r_ist.replace(second=0, microsecond=0),
-            )
-
-        def _lock_occurrence_row(state, row_vals, list_index, note_tag: str, *, triplet=None) -> bool:
-            if not state or list_index is None:
-                return False
-            triplet = triplet or _current_row_triplet_ist(row_vals)
-            if not triplet or len(triplet) != 3:
-                return False
-            state["occurrence_locked"] = True
-            state["occurrence_lock_triplet"] = tuple(triplet)
-            if list_index < len(debug_rows):
-                notes = debug_rows[list_index].get("Notes", "") or ""
-                if note_tag not in notes:
-                    debug_rows[list_index]["Notes"] = f"{notes}; {note_tag}"
-            return True
-
-        def _apply_occurrence_plan_authoritatively(
-            state,
-            row_vals,
-            list_index,
-            row_idx,
-            shared_occ_plan,
-            note_tag: str,
-        ) -> bool:
-            if not state or not shared_occ_plan:
-                return False
-            lane_kind = shared_occ_plan.get("lane_kind") or ""
-            pick_when = shared_occ_plan.get("pick_when")
-            if lane_kind != "ess_over_ess" or not pick_when:
-                return False
-
-            cand_triplet = (pick_when, pick_when, pick_when)
-            state["shared_decision"] = {
-                "owner": "shared_occurrence",
-                "row_type": "ess_over_ess",
-                "occurrence_slot": shared_occ_plan.get("slot_index", 0),
-                "lane_time": pick_when,
-                "fill_style": "all_three_same",
-                "confidence": "strong",
-                "triplet": cand_triplet,
-            }
-
-            t = _format_time(pick_when)
-            if not t:
-                return False
-            row_vals["Created Date & Time"] = t
-            row_vals["Actual Response Date & Time"] = t
-            row_vals["Actual Resolved Date & Time"] = t
-            if row_idx:
-                ws.cell(row_idx, created_col).value = t
-                ws.cell(row_idx, response_col).value = t
-                ws.cell(row_idx, resolved_col).value = t
-                _set_row_fill(row_idx, clear_fill)
-            if list_index < len(debug_rows):
-                who = (
-                    debug_rows[list_index].get("ResolvedSource")
-                    or debug_rows[list_index].get("AckSource")
-                    or debug_rows[list_index].get("CreatedSource")
-                    or "SHARED_OCCURRENCE"
+            group_sorted = []
+            for s in row_states:
+                other_li = s.get("list_index")
+                if other_li is None or other_li >= len(automation_rows):
+                    continue
+                other_occ_key = s.get("occurrence_key") or _occurrence_group_key(
+                    (s.get("subject_norm") or "").lower(),
+                    s.get("requester") or "",
+                    s.get("service_no") or "",
                 )
-                debug_rows[list_index]["CreatedSource"] = who
-                debug_rows[list_index]["AckSource"] = who
-                debug_rows[list_index]["ResolvedSource"] = who
-                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note_tag}"
-            return True
+                if other_occ_key != current_occ_key:
+                    continue
+                other_notes_l = (debug_rows[other_li].get("Notes", "") or "").lower() if other_li < len(debug_rows) else ""
+                if not _occurrence_notes_match(other_notes_l):
+                    continue
+                group_sorted.append(s)
+
+            if len(group_sorted) < 2:
+                return None
+
+            group_sorted.sort(key=lambda x: x.get("row_index") or 10**9)
             slot_index = None
             for idx, s in enumerate(group_sorted):
                 if s.get("list_index") == list_index:
@@ -5267,6 +5333,145 @@ def main() -> int:
                 "group_size": len(group_sorted),
             }
 
+        def _apply_shared_occurrence_triplet(
+            state,
+            row_vals,
+            list_index,
+            row_idx,
+            note_tag: str,
+        ) -> bool:
+            shared_decision = (state or {}).get("shared_decision") if state else None
+            if not shared_decision:
+                return False
+            if (shared_decision.get("owner") or "") != "shared_occurrence":
+                return False
+            if not _is_authoritative_occurrence_lane((shared_decision.get("row_type") or "")):
+                return False
+            if (shared_decision.get("fill_style") or "") != "all_three_same":
+                return False
+            triplet = shared_decision.get("triplet")
+            if not triplet or len(triplet) != 3:
+                return False
+            cand_c_ist, cand_a_ist, cand_r_ist = triplet
+            if not (cand_c_ist and cand_a_ist and cand_r_ist):
+                return False
+            if not _allow_guard_rewrite(
+                row_vals,
+                list_index,
+                cand_c_ist,
+                cand_a_ist,
+                cand_r_ist,
+                note_tag,
+                "occurrence_ess",
+            ):
+                return False
+            t = _format_time(cand_c_ist)
+            if not t:
+                return False
+            row_vals["Created Date & Time"] = t
+            row_vals["Actual Response Date & Time"] = t
+            row_vals["Actual Resolved Date & Time"] = t
+            if row_idx:
+                ws.cell(row_idx, created_col).value = t
+                ws.cell(row_idx, response_col).value = t
+                ws.cell(row_idx, resolved_col).value = t
+            _set_row_fill(row_idx, clear_fill)
+            if list_index < len(debug_rows):
+                who = (
+                    debug_rows[list_index].get("ResolvedSource")
+                    or debug_rows[list_index].get("AckSource")
+                    or debug_rows[list_index].get("CreatedSource")
+                    or "SHARED_OCCURRENCE"
+                )
+                debug_rows[list_index]["CreatedSource"] = who
+                debug_rows[list_index]["AckSource"] = who
+                debug_rows[list_index]["ResolvedSource"] = who
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note_tag}"
+            return True
+
+        def _current_row_triplet_ist(row_vals):
+            if not row_vals:
+                return None
+            c_dt = _parse_time_str(row_vals.get("Created Date & Time") or "")
+            a_dt = _parse_time_str(row_vals.get("Actual Response Date & Time") or "")
+            r_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time") or "")
+            if not (c_dt and a_dt and r_dt):
+                return None
+            c_ist = _to_ist(c_dt)
+            a_ist = _to_ist(a_dt)
+            r_ist = _to_ist(r_dt)
+            if not (c_ist and a_ist and r_ist):
+                return None
+            return (
+                c_ist.replace(second=0, microsecond=0),
+                a_ist.replace(second=0, microsecond=0),
+                r_ist.replace(second=0, microsecond=0),
+            )
+
+        def _lock_occurrence_row(state, row_vals, list_index, note_tag: str, *, triplet=None) -> bool:
+            if not state or list_index is None:
+                return False
+            triplet = triplet or _current_row_triplet_ist(row_vals)
+            if not triplet or len(triplet) != 3:
+                return False
+            state["occurrence_locked"] = True
+            state["occurrence_lock_triplet"] = tuple(triplet)
+            if list_index < len(debug_rows):
+                notes = debug_rows[list_index].get("Notes", "") or ""
+                if note_tag not in notes:
+                    debug_rows[list_index]["Notes"] = f"{notes}; {note_tag}"
+            return True
+
+        def _apply_occurrence_plan_authoritatively(
+            state,
+            row_vals,
+            list_index,
+            row_idx,
+            shared_occ_plan,
+            note_tag: str,
+        ) -> bool:
+            if not state or not shared_occ_plan:
+                return False
+            lane_kind = shared_occ_plan.get("lane_kind") or ""
+            pick_when = shared_occ_plan.get("pick_when")
+            if not _is_authoritative_occurrence_lane(lane_kind) or not pick_when:
+                return False
+
+            cand_triplet = (pick_when, pick_when, pick_when)
+            state["shared_decision"] = {
+                "owner": "shared_occurrence",
+                "row_type": lane_kind,
+                "occurrence_slot": shared_occ_plan.get("slot_index", 0),
+                "lane_time": pick_when,
+                "fill_style": "all_three_same",
+                "confidence": "strong",
+                "triplet": cand_triplet,
+            }
+
+            t = _format_time(pick_when)
+            if not t:
+                return False
+            row_vals["Created Date & Time"] = t
+            row_vals["Actual Response Date & Time"] = t
+            row_vals["Actual Resolved Date & Time"] = t
+            if row_idx:
+                ws.cell(row_idx, created_col).value = t
+                ws.cell(row_idx, response_col).value = t
+                ws.cell(row_idx, resolved_col).value = t
+                _set_row_fill(row_idx, clear_fill)
+            if list_index < len(debug_rows):
+                who = (
+                    debug_rows[list_index].get("ResolvedSource")
+                    or debug_rows[list_index].get("AckSource")
+                    or debug_rows[list_index].get("CreatedSource")
+                    or "SHARED_OCCURRENCE"
+                )
+                debug_rows[list_index]["CreatedSource"] = who
+                debug_rows[list_index]["AckSource"] = who
+                debug_rows[list_index]["ResolvedSource"] = who
+                debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note_tag}"
+            return True
+
         _subject_family_slot_cache = {}
 
         def _subject_family_slot(state):
@@ -5317,7 +5522,7 @@ def main() -> int:
                 requester_value,
                 state.get("service_no") or "",
             )
-            shared_plan = _shared_occurrence_fill_plan(state)
+            shared_plan = _preferred_shared_occurrence_plan(state)
             family_idx, family_total = _subject_family_slot(state)
             multi_service = bool(state.get("multi_service_subject")) and family_total >= 2
             if shared_plan:
@@ -10677,22 +10882,14 @@ def main() -> int:
 
             row_vals = automation_rows[list_index]
             notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
-            shared_occ_plan = _shared_occurrence_fill_plan(state)
-            if (
-                (
-                    not shared_occ_plan
-                    or (shared_occ_plan.get("lane_kind") or "") != "ess_over_ess"
-                )
-                and "requester span(all-ack->ess)" in notes_l
-            ):
-                shared_occ_plan = _subject_wide_all_ack_ess_override_plan(state) or shared_occ_plan
+            shared_occ_plan = _preferred_shared_occurrence_plan(state, require_override_for_all_ack=True)
             if not shared_occ_plan:
                 continue
 
             shared_decision = state.get("shared_decision") or {}
             locked = False
             if (
-                (shared_occ_plan.get("lane_kind") or "") == "ess_over_ess"
+                _is_authoritative_occurrence_lane(shared_occ_plan.get("lane_kind") or "")
                 and "requester span(all-ack->ess)" in notes_l
             ):
                 locked = _apply_occurrence_plan_authoritatively(
@@ -11534,15 +11731,16 @@ def main() -> int:
 
             # Fallback: collapse to consultant reply by occurrence (ESS-only)
             if merged_msgs:
-                shared_occ_plan = _shared_occurrence_fill_plan(state)
                 notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
+                shared_occ_plan = _preferred_shared_occurrence_plan(state, require_override_for_all_ack=True)
                 if (
                     "requester span(all-ack->ess)" in notes_l
-                    and _apply_shared_occurrence_triplet(
+                    and _apply_occurrence_plan_authoritatively(
                         state,
                         row_vals,
                         list_index,
                         row_idx,
+                        shared_occ_plan,
                         "ESSContinuationGuard[AllThreeStrictEssOnly]",
                     )
                 ):
@@ -11621,7 +11819,7 @@ def main() -> int:
                     if pick.sent_time:
                         candidate_kind = (
                             "occurrence_ess"
-                            if shared_occ_plan and shared_occ_plan.get("lane_kind") == "ess_over_ess"
+                            if shared_occ_plan and _is_authoritative_occurrence_lane(shared_occ_plan.get("lane_kind") or "")
                             else "continuation"
                         )
                         if not _allow_guard_rewrite(
@@ -11652,7 +11850,7 @@ def main() -> int:
                             # Advance occurrence index only when we collapse
                             ess_only_reply_index[occ_key] = idx + 1
                             used_ess_continuation_ess_only.add(key)
-                elif shared_occ_plan and shared_occ_plan.get("lane_kind") == "ess_over_ess":
+                elif shared_occ_plan and _is_authoritative_occurrence_lane(shared_occ_plan.get("lane_kind") or ""):
                     pick = shared_occ_plan.get("pick")
                     cand_ist = _email_ist(pick) if pick else None
                     if not cand_ist:
@@ -12150,18 +12348,20 @@ def main() -> int:
             # Blue-only ESS continuation: collapse to unique consultant reply
             # when ESS-only and no non-ESS request exists between first/last replies.
             notes_l = (debug_rows[list_index].get("Notes") or "").lower() if list_index < len(debug_rows) else ""
-            shared_occ_plan = _shared_occurrence_fill_plan(
+            shared_occ_plan = _preferred_shared_occurrence_plan(
                 state,
                 quoted_sources=quoted_sources,
                 c_ist=c_ist,
+                require_override_for_all_ack=True,
             )
             if (
                 "requester span(all-ack->ess)" in notes_l
-                and _apply_shared_occurrence_triplet(
+                and _apply_occurrence_plan_authoritatively(
                     state,
                     row_vals,
                     list_index,
                     row_idx,
+                    shared_occ_plan,
                     "ESSContinuationGuard[AllThreeStrictEssOnly]",
                 )
             ):
@@ -12171,7 +12371,7 @@ def main() -> int:
                 continue
             allow_occurrence_ess_quoted = bool(
                 shared_occ_plan
-                and shared_occ_plan.get("lane_kind") == "ess_over_ess"
+                and _is_authoritative_occurrence_lane(shared_occ_plan.get("lane_kind") or "")
                 and "ess-only; no non-ess request" in notes_l
                 and "requester span(all-ack->ess)" in notes_l
             )
@@ -12267,7 +12467,7 @@ def main() -> int:
 
                         if (
                             shared_occ_plan
-                            and shared_occ_plan.get("lane_kind") == "ess_over_ess"
+                            and _is_authoritative_occurrence_lane(shared_occ_plan.get("lane_kind") or "")
                             and ("ess-only; no non-ess request" in notes_l)
                             and (force_ess_blue or _row_has_blue_fill(row_idx))
                         ):
@@ -13317,7 +13517,7 @@ def main() -> int:
                 group_sorted = sorted(group, key=lambda x: x.get("row_index") or 10**9)
                 shared_group_picks = []
                 for s in group_sorted:
-                    shared_plan = _shared_occurrence_fill_plan(s)
+                    shared_plan = _preferred_shared_occurrence_plan(s, require_override_for_all_ack=True)
                     if not shared_plan or shared_plan.get("group_size", 0) < 2:
                         shared_group_picks = []
                         break
@@ -13619,10 +13819,8 @@ def main() -> int:
                         debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[Start@13593]"
 
                 row_vals = automation_rows[list_index]
-                shared_occ_plan = _subject_wide_all_ack_ess_override_plan(state)
-                if not shared_occ_plan:
-                    shared_occ_plan = _shared_occurrence_fill_plan(state)
-                if not shared_occ_plan or (shared_occ_plan.get("lane_kind") or "") != "ess_over_ess":
+                shared_occ_plan = _preferred_shared_occurrence_plan(state, require_override_for_all_ack=True)
+                if not shared_occ_plan or not _is_authoritative_occurrence_lane(shared_occ_plan.get("lane_kind") or ""):
                     if list_index < len(debug_rows):
                         notes_now = debug_rows[list_index].get("Notes", "") or ""
                         lane_now = (shared_occ_plan.get("lane_kind") or "") if shared_occ_plan else "NONE"
@@ -13678,7 +13876,7 @@ def main() -> int:
 
                     state["shared_decision"] = {
                         "owner": "shared_occurrence",
-                        "row_type": "ess_over_ess",
+                        "row_type": shared_occ_plan.get("lane_kind") or "ess_over_ess",
                         "occurrence_slot": shared_occ_plan.get("slot_index", 0),
                         "lane_time": pick_when,
                         "fill_style": "all_three_same",
