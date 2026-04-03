@@ -4573,20 +4573,13 @@ def main() -> int:
             requester = state.get("requester") or ""
             subject_norm_value = _state_occurrence_family_subject_norm(state)
             service_no = state.get("service_no") or ""
+            current_service_bucket = state.get("service_bucket") or _subject_service_bucket(subject_norm_value, service_no)
             if list_index is None or not requester or not subject_norm_value:
                 return {}
-
-            def _add_override_debug(tag: str):
-                if list_index is None or list_index >= len(debug_rows):
-                    return
-                notes_now = debug_rows[list_index].get("Notes", "") or ""
-                if tag not in notes_now:
-                    debug_rows[list_index]["Notes"] = f"{notes_now}; {tag}"
 
             notes_l = _state_occurrence_notes_l(state)
             if not _state_is_all_ack_to_ess(state):
                 return {}
-            _add_override_debug("OverrideMap[Start]")
 
             def _family_subject_norm(other_state) -> str:
                 return _state_occurrence_family_subject_norm(other_state)
@@ -4639,21 +4632,17 @@ def main() -> int:
                 if len(fallback_group) >= 2:
                     group_sorted = fallback_group
                     group_requesters = fallback_requesters
-                    _add_override_debug(f"OverrideMap[FallbackGroup={len(group_sorted)}]")
 
             if len(group_sorted) < 2:
-                _add_override_debug(f"OverrideMap[Group<{len(group_sorted)}]")
                 return {}
 
             group_sorted.sort(key=lambda x: x.get("row_index") or 10**9)
-            _add_override_debug(f"OverrideMap[Group={len(group_sorted)}]")
             cache_key = (
                 tuple(s.get("list_index") for s in group_sorted),
                 subject_norm_value,
             )
             cached = _all_ack_ess_assignment_cache.get(cache_key)
             if cached is not None:
-                _add_override_debug(f"OverrideMap[Cached={len(cached)}]")
                 return cached
 
             requester_names = tuple(sorted(group_requesters)) if group_requesters else ((requester,) if requester else tuple())
@@ -4724,8 +4713,6 @@ def main() -> int:
             consultant_ess_pool = _dedupe_group_ess_minutes(consultant_ess_pool)
             ess_pool = _dedupe_group_ess_minutes(ess_pool)
             occurrence_acky_pool = _dedupe_group_ess_minutes(occurrence_acky_pool)
-            _add_override_debug(f"OverrideMap[Pools={len(consultant_ess_pool)}/{len(ess_pool)}]")
-            _add_override_debug(f"OverrideMap[AckySeq={len(occurrence_acky_pool)}]")
 
             anchor_li = group_sorted[0].get("list_index")
             a_dt = _parse_time_str(automation_rows[anchor_li].get("Actual Response Date & Time")) if anchor_li is not None else None
@@ -4759,7 +4746,6 @@ def main() -> int:
                 pool = occurrence_acky_pool
                 lane_kind = "ess_acky_sequence"
             if not pool or len(pool) < len(group_sorted):
-                _add_override_debug(f"OverrideMap[PoolShort={len(pool or [])}/{len(group_sorted)}]")
                 _all_ack_ess_assignment_cache[cache_key] = {}
                 return {}
 
@@ -4787,7 +4773,6 @@ def main() -> int:
                     "ess_pool": ess_pool,
                     "occurrence_acky_pool": occurrence_acky_pool,
                 }
-            _add_override_debug(f"OverrideMap[Assigned={len(assignment_map)}]")
             _all_ack_ess_assignment_cache[cache_key] = assignment_map
             return assignment_map
 
@@ -4798,11 +4783,6 @@ def main() -> int:
             if list_index is None:
                 return None
             assignment_map = _subject_wide_all_ack_ess_assignment_map(state)
-            if list_index is not None and list_index < len(debug_rows):
-                notes_now = debug_rows[list_index].get("Notes", "") or ""
-                tag = f"OverridePlan[Hit={int(list_index in assignment_map)}]"
-                if tag not in notes_now:
-                    debug_rows[list_index]["Notes"] = f"{notes_now}; {tag}"
             return assignment_map.get(list_index)
 
         def _preferred_shared_occurrence_plan(state, *, quoted_sources=None, c_ist=None, require_override_for_all_ack: bool = False):
@@ -10365,6 +10345,9 @@ def main() -> int:
 
         quoted_only_tag_started_at = _stage_timer_start()
         relaxed_quoted_block_cache = {}
+        quoted_request_context_cache = {}
+        quoted_pair_analysis_cache = {}
+        quoted_hybrid_analysis_cache = {}
 
         def _get_relaxed_quoted_blocks_cached(msg):
             key = id(msg)
@@ -10426,6 +10409,56 @@ def main() -> int:
                     out.append(e)
             return out
 
+        def _quoted_request_row_context(subject_norm_value, base_thread, requester_name, ref_ist, row_tokens, row_id_tokens):
+            ref_day = ""
+            if ref_ist:
+                try:
+                    ref_day = ref_ist.date().isoformat()
+                except Exception:
+                    ref_day = ""
+            ctx_key = (
+                subject_norm_value or "",
+                requester_name or "",
+                ref_day,
+                tuple(sorted(row_id_tokens)) if row_id_tokens else (),
+            )
+            cached = quoted_request_context_cache.get(ctx_key)
+            if cached is not None:
+                return cached
+
+            thread = _expanded_thread(
+                subject_norm_value,
+                base_thread,
+                requester_name,
+                include_non_ess=True,
+                reference_ist=ref_ist,
+            )
+            thread = thread or []
+            merged_msgs = list(thread)
+            merged_ids = {id(e) for e in merged_msgs}
+
+            extra_any = _requester_pool(subject_norm_value, "", ref_ist, day_window=30) or []
+            if extra_any:
+                for e in extra_any:
+                    if id(e) in merged_ids:
+                        continue
+                    if not _row_subject_match_email(e, subject_norm_value, row_tokens, row_id_tokens):
+                        continue
+                    merged_msgs.append(e)
+                    merged_ids.add(id(e))
+
+            has_live_non_ess = False
+            for e in merged_msgs:
+                if not _req_match(e, requester_name):
+                    continue
+                if not _ess_sender(e):
+                    has_live_non_ess = True
+                    break
+
+            out = (merged_msgs, has_live_non_ess)
+            quoted_request_context_cache[ctx_key] = out
+            return out
+
         for state in row_states:
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
@@ -10446,36 +10479,6 @@ def main() -> int:
             a_dt = _parse_time_str(automation_rows[list_index].get("Actual Response Date & Time"))
             r_dt = _parse_time_str(automation_rows[list_index].get("Actual Resolved Date & Time"))
             ref_ist = _to_ist(r_dt) if r_dt else (_to_ist(a_dt) if a_dt else _to_ist(c_dt) if c_dt else None)
-            thread = _expanded_thread(
-                subject_norm,
-                base_thread,
-                requester,
-                include_non_ess=True,
-                reference_ist=ref_ist,
-            )
-            thread = thread or []
-            merged_msgs = list(thread)
-            extra_any = _requester_pool(subject_norm, "", ref_ist, day_window=30) or []
-            if extra_any:
-                row_tokens = _match_tokens(subject_norm)
-                for e in extra_any:
-                    s_norm = _subject_norm_cached(getattr(e, "subject", "") or "")
-                    s_tokens = _match_tokens(s_norm)
-                    score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
-                    contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
-                    if score < 0.45 and not contains:
-                        continue
-                    merged_msgs.append(e)
-
-            has_live_non_ess = False
-            for e in merged_msgs:
-                if not _req_match(e, requester):
-                    continue
-                if not _ess_sender(e):
-                    has_live_non_ess = True
-                    break
-            if has_live_non_ess:
-                continue
 
             # Tag only when a real quoted non-ESS request + ESS ack pair exists.
             # Keep strict ack gap for validity; if a wider gap exists, mark blue.
@@ -10488,6 +10491,16 @@ def main() -> int:
                 if not desc_text:
                     desc_text = state.get("description") or ""
                 row_id_tokens = _id_like_tokens(desc_text or "")
+            merged_msgs, has_live_non_ess = _quoted_request_row_context(
+                subject_norm,
+                base_thread,
+                requester,
+                ref_ist,
+                row_tokens,
+                row_id_tokens,
+            )
+            if has_live_non_ess:
+                continue
             # If row has ID tokens, add ID-matching emails into merged_msgs
             # so quoted-request-only sees the right message without full scan.
             if row_id_tokens:
@@ -10503,92 +10516,43 @@ def main() -> int:
                         continue
                     merged_msgs.append(e)
                     merged_ids.add(id(e))
-            has_pair = False
-            has_wide_pair = False
-            latest_quoted_req = None
-            quoted_non_ess_all = []
-            for msg in merged_msgs:
-                msg_subj = normalize_subject(getattr(msg, "subject", "") or "")
-                q_non_ess = []
-                q_ess = []
-                quoted_blocks = _get_quoted_blocks_with_subject_cached(msg)
-                if not quoted_blocks:
-                    # Fallback to raw EML parse when EmailRecord body lacks quoted headers.
-                    quoted_blocks = _get_quoted_blocks_from_eml_path(getattr(msg, "path", ""))
-                if not quoted_blocks:
-                    # Fallback to relaxed parser when strict quoted headers are absent.
-                    quoted_blocks = _get_relaxed_quoted_blocks_cached(msg)
-                for from_line, sent_ist, q_subj in quoted_blocks:
-                    if row_id_tokens:
-                        if q_subj:
-                            q_norm = normalize_subject(q_subj or "")
-                            q_ids = _id_like_tokens(q_norm)
-                            if not q_ids or row_id_tokens.isdisjoint(q_ids):
-                                continue
-                        else:
-                            # If quoted subject is missing, allow only if ID appears in raw message.
-                            if not _row_id_in_raw(msg, row_id_tokens):
-                                continue
-                    elif row_tokens:
-                        if not q_subj:
-                            continue
-                        q_norm = normalize_subject(q_subj or "")
-                        q_tokens = _match_tokens(q_norm)
-                        score = _token_overlap_score(row_tokens, q_tokens) if q_tokens else 0.0
-                        contains = bool(subject_norm and q_norm and (subject_norm in q_norm or q_norm in subject_norm))
-                        if score < 0.45 and not contains:
-                            continue
-                    addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", from_line, flags=re.I)
-                    if not addr_hits:
-                        # Name-only From: treat as ESS only if it robustly matches ESS tokens.
-                        is_ess_name = _ess_name_only(from_line)
-                        if is_ess_name:
-                            q_ess.append(sent_ist)
-                        else:
-                            q_non_ess.append(sent_ist)
-                            quoted_non_ess_all.append(sent_ist)
-                        continue
-                    emails_l = [em.lower() for em in addr_hits]
-                    domains_l = [em.split("@", 1)[-1] for em in emails_l if "@" in em]
-                    if any(em in ess_email_set for em in emails_l) or any(d in ess_domain_set for d in domains_l):
-                        q_ess.append(sent_ist)
-                    else:
-                        q_non_ess.append(sent_ist)
-                        quoted_non_ess_all.append(sent_ist)
-                if q_non_ess:
-                    latest_q = max(q_non_ess)
-                    if (latest_quoted_req is None) or (latest_q > latest_quoted_req):
-                        latest_quoted_req = latest_q
-                if q_non_ess and q_ess:
-                    q_non_ess.sort()
-                    q_ess.sort()
-                    for ack_ist in q_ess:
-                        reqs = [
-                            r
-                            for r in q_non_ess
-                            if r < ack_ist
-                            and abs((ack_ist.date() - r.date()).days) <= quoted_day_slack
-                        ]
-                        if not reqs:
-                            continue
-                        req_ist = _best_req_before_ack(reqs, ack_ist)
-                        gap = ack_ist - req_ist
-                        if gap <= timedelta(minutes=quoted_gap_mins):
-                            has_pair = True
-                            break
-                        else:
-                            has_wide_pair = True
-                if has_pair:
-                    break
-            # Relaxed fallback: if no pair found, allow "From"/"Sent" without colon,
-            # but only when ID tokens exist and appear in the message.
-            if (not has_pair) and row_id_tokens:
+            quoted_pair_key = (
+                tuple(id(e) for e in merged_msgs),
+                subject_norm,
+                tuple(sorted(row_id_tokens)) if row_id_tokens else (),
+            )
+            cached_pair_analysis = quoted_pair_analysis_cache.get(quoted_pair_key)
+            if cached_pair_analysis is None:
+                has_pair = False
+                has_wide_pair = False
+                latest_quoted_req = None
+                quoted_non_ess_all = []
                 for msg in merged_msgs:
-                    if not _row_id_in_raw(msg, row_id_tokens):
-                        continue
                     q_non_ess = []
                     q_ess = []
-                    for from_line, sent_ist, _q_subj in _get_relaxed_quoted_blocks_cached(msg):
+                    quoted_blocks = _get_quoted_blocks_with_subject_cached(msg)
+                    if not quoted_blocks:
+                        quoted_blocks = _get_quoted_blocks_from_eml_path(getattr(msg, "path", ""))
+                    if not quoted_blocks:
+                        quoted_blocks = _get_relaxed_quoted_blocks_cached(msg)
+                    for from_line, sent_ist, q_subj in quoted_blocks:
+                        if row_id_tokens:
+                            if q_subj:
+                                q_norm = normalize_subject(q_subj or "")
+                                q_ids = _id_like_tokens(q_norm)
+                                if not q_ids or row_id_tokens.isdisjoint(q_ids):
+                                    continue
+                            elif not _row_id_in_raw(msg, row_id_tokens):
+                                continue
+                        elif row_tokens:
+                            if not q_subj:
+                                continue
+                            q_norm = normalize_subject(q_subj or "")
+                            q_tokens = _match_tokens(q_norm)
+                            score = _token_overlap_score(row_tokens, q_tokens) if q_tokens else 0.0
+                            contains = bool(subject_norm and q_norm and (subject_norm in q_norm or q_norm in subject_norm))
+                            if score < 0.45 and not contains:
+                                continue
                         addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", from_line, flags=re.I)
                         if not addr_hits:
                             if _ess_name_only(from_line):
@@ -10612,7 +10576,10 @@ def main() -> int:
                         q_non_ess.sort()
                         q_ess.sort()
                         for ack_ist in q_ess:
-                            reqs = [r for r in q_non_ess if r < ack_ist and abs((ack_ist.date() - r.date()).days) <= quoted_day_slack]
+                            reqs = [
+                                r for r in q_non_ess
+                                if r < ack_ist and abs((ack_ist.date() - r.date()).days) <= quoted_day_slack
+                            ]
                             if not reqs:
                                 continue
                             req_ist = _best_req_before_ack(reqs, ack_ist)
@@ -10620,236 +10587,270 @@ def main() -> int:
                             if gap <= timedelta(minutes=quoted_gap_mins):
                                 has_pair = True
                                 break
-                            else:
-                                has_wide_pair = True
+                            has_wide_pair = True
                     if has_pair:
                         break
-            # Raw-ID scan fallback: if still no pair, scan raw EMLs that contain the ID token.
-            if (not has_pair) and row_id_tokens:
-                raw_paths = _find_eml_paths_by_id(row_id_tokens)
-                for path in raw_paths:
-                    quoted_summaries = _get_quoted_summaries_from_eml_path(path)
-                    if not quoted_summaries:
-                        continue
-                    q_non_ess = []
-                    q_ess = []
-                    for sent_ist, q_norm, q_ids, q_tokens, is_ess in quoted_summaries:
-                        if not _quoted_subject_confirms_row(
-                            q_norm,
-                            q_ids,
-                            q_tokens,
-                            subject_norm,
-                            row_tokens,
-                            row_id_tokens,
-                        ):
+                if (not has_pair) and row_id_tokens:
+                    for msg in merged_msgs:
+                        if not _row_id_in_raw(msg, row_id_tokens):
                             continue
-                        if is_ess:
-                            q_ess.append(sent_ist)
-                        else:
-                            q_non_ess.append(sent_ist)
-                            quoted_non_ess_all.append(sent_ist)
-                    if q_non_ess:
-                        latest_q = max(q_non_ess)
-                        if (latest_quoted_req is None) or (latest_q > latest_quoted_req):
-                            latest_quoted_req = latest_q
-                    if q_non_ess and q_ess:
-                        q_non_ess.sort()
-                        q_ess.sort()
-                        for ack_ist in q_ess:
-                            reqs = [r for r in q_non_ess if r < ack_ist and abs((ack_ist.date() - r.date()).days) <= quoted_day_slack]
-                            if not reqs:
+                        q_non_ess = []
+                        q_ess = []
+                        for from_line, sent_ist, _q_subj in _get_relaxed_quoted_blocks_cached(msg):
+                            addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", from_line, flags=re.I)
+                            if not addr_hits:
+                                if _ess_name_only(from_line):
+                                    q_ess.append(sent_ist)
+                                else:
+                                    q_non_ess.append(sent_ist)
+                                    quoted_non_ess_all.append(sent_ist)
                                 continue
-                            req_ist = _best_req_before_ack(reqs, ack_ist)
-                            gap = ack_ist - req_ist
-                            if gap <= timedelta(minutes=quoted_gap_mins):
-                                has_pair = True
-                                break
+                            emails_l = [em.lower() for em in addr_hits]
+                            domains_l = [em.split("@", 1)[-1] for em in emails_l if "@" in em]
+                            if any(em in ess_email_set for em in emails_l) or any(d in ess_domain_set for d in domains_l):
+                                q_ess.append(sent_ist)
                             else:
+                                q_non_ess.append(sent_ist)
+                                quoted_non_ess_all.append(sent_ist)
+                        if q_non_ess:
+                            latest_q = max(q_non_ess)
+                            if (latest_quoted_req is None) or (latest_q > latest_quoted_req):
+                                latest_quoted_req = latest_q
+                        if q_non_ess and q_ess:
+                            q_non_ess.sort()
+                            q_ess.sort()
+                            for ack_ist in q_ess:
+                                reqs = [r for r in q_non_ess if r < ack_ist and abs((ack_ist.date() - r.date()).days) <= quoted_day_slack]
+                                if not reqs:
+                                    continue
+                                req_ist = _best_req_before_ack(reqs, ack_ist)
+                                gap = ack_ist - req_ist
+                                if gap <= timedelta(minutes=quoted_gap_mins):
+                                    has_pair = True
+                                    break
                                 has_wide_pair = True
-                    if has_pair:
-                        break
+                        if has_pair:
+                            break
+                if (not has_pair) and row_id_tokens:
+                    raw_paths = _find_eml_paths_by_id(row_id_tokens)
+                    for path in raw_paths:
+                        quoted_summaries = _get_quoted_summaries_from_eml_path(path)
+                        if not quoted_summaries:
+                            continue
+                        q_non_ess = []
+                        q_ess = []
+                        for sent_ist, q_norm, q_ids, q_tokens, is_ess in quoted_summaries:
+                            if not _quoted_subject_confirms_row(
+                                q_norm,
+                                q_ids,
+                                q_tokens,
+                                subject_norm,
+                                row_tokens,
+                                row_id_tokens,
+                            ):
+                                continue
+                            if is_ess:
+                                q_ess.append(sent_ist)
+                            else:
+                                q_non_ess.append(sent_ist)
+                                quoted_non_ess_all.append(sent_ist)
+                        if q_non_ess:
+                            latest_q = max(q_non_ess)
+                            if (latest_quoted_req is None) or (latest_q > latest_quoted_req):
+                                latest_quoted_req = latest_q
+                        if q_non_ess and q_ess:
+                            q_non_ess.sort()
+                            q_ess.sort()
+                            for ack_ist in q_ess:
+                                reqs = [r for r in q_non_ess if r < ack_ist and abs((ack_ist.date() - r.date()).days) <= quoted_day_slack]
+                                if not reqs:
+                                    continue
+                                req_ist = _best_req_before_ack(reqs, ack_ist)
+                                gap = ack_ist - req_ist
+                                if gap <= timedelta(minutes=quoted_gap_mins):
+                                    has_pair = True
+                                    break
+                                has_wide_pair = True
+                        if has_pair:
+                            break
+                cached_pair_analysis = (has_pair, has_wide_pair, latest_quoted_req, tuple(quoted_non_ess_all))
+                quoted_pair_analysis_cache[quoted_pair_key] = cached_pair_analysis
+            else:
+                has_pair, has_wide_pair, latest_quoted_req, quoted_non_ess_all = cached_pair_analysis
+                quoted_non_ess_all = list(quoted_non_ess_all)
             # Hybrid: quoted request + live ESS reply within ack window.
             hybrid_pair = None
             if (not has_pair) and quoted_non_ess_all:
-                live_ack = None
-                live_req = latest_quoted_req
-                live_req_src = "PARSED_FROM_QUOTED_REQUEST"
-                live_req_debug = "quoted"
-                live_candidates = []
-                quoted_candidates_all = sorted(
-                    {
-                        q
-                        for q in quoted_non_ess_all
-                        if q is not None
-                    }
-                )
                 occ_meta = _shared_occurrence_pick(
                     state,
                     subject_norm_value=subject_norm,
                     requester_value=requester,
-                    current_created_ist=c_ist if 'c_ist' in locals() else None,
-                    current_ack_ist=a_ist if 'a_ist' in locals() else None,
-                    current_resolved_ist=r_ist if 'r_ist' in locals() else None,
+                    current_created_ist=None,
+                    current_ack_ist=None,
+                    current_resolved_ist=None,
                     default_idx=0,
                 )
-                total_rows_for_subject = occ_meta["total_rows"]
-                reply_led_candidate = None
-                if total_rows_for_subject <= 1:
-                    resolved_candidates = []
-                    for cand in merged_msgs:
-                        cand_ist = _email_ist(cand)
-                        if not cand_ist:
-                            continue
-                        if not _req_match(cand, requester):
-                            continue
-                        if _ack_like(cand) or _ack_like_text_fallback(cand) or _ess_only_short_ack(cand):
-                            continue
-                        if not _row_subject_match_email(cand, subject_norm, row_tokens, row_id_tokens):
-                            continue
-                        resolved_candidates.append(cand)
-                    resolved_candidates.sort(key=lambda e: e.sent_time)
-                    if resolved_candidates:
-                        target_reply = resolved_candidates[-1]
-                        target_reply_ist = _email_ist(target_reply)
-                        best_reply_led = None
-                        best_reply_led_score = None
-                        if target_reply_ist:
-                            for ack_msg in merged_msgs:
-                                ack_ist = _email_ist(ack_msg)
-                                if not ack_ist or ack_ist >= target_reply_ist:
-                                    continue
-                                if (target_reply_ist - ack_ist) > timedelta(hours=48):
-                                    continue
-                                if not _ess_sender(ack_msg):
-                                    continue
-                                if not _row_subject_match_email(ack_msg, subject_norm, row_tokens, row_id_tokens):
-                                    continue
-
-                                quoted_req_candidates = [
-                                    q for q in quoted_candidates_all
-                                    if q < ack_ist and (ack_ist - q) <= timedelta(minutes=quoted_gap_mins)
-                                ]
-                                quoted_req = _best_req_before_ack(quoted_req_candidates, ack_ist) if quoted_req_candidates else None
-
-                                live_non_ess_candidates = []
-                                for cand in merged_msgs:
-                                    cand_ist = _email_ist(cand)
-                                    if not cand_ist or cand_ist >= ack_ist:
-                                        continue
-                                    if (ack_ist - cand_ist) > timedelta(minutes=quoted_gap_mins):
-                                        continue
-                                    if _ess_sender(cand) or _system_like_sender(cand):
-                                        continue
-                                    if not _row_subject_match_email(cand, subject_norm, row_tokens, row_id_tokens):
-                                        continue
-                                    live_non_ess_candidates.append((cand_ist, cand))
-                                live_non_ess_req = None
-                                if live_non_ess_candidates:
-                                    live_req_times = [t for t, _ in live_non_ess_candidates]
-                                    chosen_live_req_ist = _best_req_before_ack(live_req_times, ack_ist)
-                                    if chosen_live_req_ist:
-                                        for cand_ist, cand in live_non_ess_candidates:
-                                            if cand_ist == chosen_live_req_ist:
-                                                live_non_ess_req = cand
-                                                break
-
-                                chosen_req = None
-                                chosen_req_src = None
-                                chosen_mode = None
-                                if live_non_ess_req and _email_ist(live_non_ess_req):
-                                    chosen_req = _email_ist(live_non_ess_req)
-                                    chosen_req_src = live_non_ess_req.sender_email or live_non_ess_req.sender_name
-                                    chosen_mode = "reply-led-live-non-ess"
-                                elif quoted_req:
-                                    chosen_req = quoted_req
-                                    chosen_req_src = "PARSED_FROM_QUOTED_REQUEST"
-                                    chosen_mode = "reply-led-quoted"
-
-                                if not chosen_req:
-                                    continue
-
-                                score = (
-                                    abs((target_reply_ist - ack_ist).total_seconds()),
-                                    0 if chosen_mode == "reply-led-live-non-ess" else 1,
-                                    abs((ack_ist - chosen_req).total_seconds()),
-                                )
-                                if best_reply_led_score is None or score < best_reply_led_score:
-                                    best_reply_led_score = score
-                                    best_reply_led = (chosen_req, ack_ist, chosen_req_src, chosen_mode, target_reply_ist)
-
-                        if best_reply_led:
-                            live_req, live_ack, live_req_src, live_req_debug, target_reply_ist = best_reply_led
-                            reply_led_candidate = (live_ack, target_reply, live_req)
-                            live_candidates.append(reply_led_candidate)
-                if reply_led_candidate is None:
-                    for e in merged_msgs:
-                        if not _req_match(e, requester):
-                            continue
-                        if not _ess_sender(e):
-                            continue
-                        e_ist = _email_ist(e)
-                        if not e_ist:
-                            continue
-                        req_candidates = [
-                            q for q in quoted_candidates_all
-                            if q < e_ist and (e_ist - q) <= timedelta(minutes=quoted_gap_mins)
-                        ]
-                        if not req_candidates:
-                            continue
-                        # Hybrid drift fix:
-                        # if a quoted request lands in the same display-minute as the
-                        # live ack, prefer an earlier valid request in the same 16m
-                        # window when available. This avoids reusing the ack-side
-                        # timestamp as the request anchor in mixed quoted/live cases.
-                        strict_req_candidates = [
-                            q for q in req_candidates
-                            if q.replace(second=0, microsecond=0) != e_ist.replace(second=0, microsecond=0)
-                        ]
-                        chosen_req = max(strict_req_candidates or req_candidates)
-                        live_candidates.append((e_ist, e, chosen_req))
-                if live_candidates:
-                    if reply_led_candidate is not None:
-                        live_candidates = [reply_led_candidate]
-                    else:
-                        live_candidates.sort(key=lambda x: x[0])
-                    live_ack, live_ack_msg, chosen_req = live_candidates[0]
-                    live_req = chosen_req
-                    if not live_req_debug.startswith("reply-led"):
-                        live_req_src = "PARSED_FROM_QUOTED_REQUEST"
-                        live_req_debug = "quoted-window-before-ack"
-                    # Prefer a real live non-ESS request before the chosen live ack
-                    # when it forms the same <=16 minute request->ack episode.
-                    live_non_ess_req = None
-                    for cand in merged_msgs:
-                        cand_ist = _email_ist(cand)
-                        if not cand_ist:
-                            continue
-                        if cand_ist >= live_ack:
-                            continue
-                        if (live_ack - cand_ist) > timedelta(minutes=quoted_gap_mins):
-                            continue
-                        if _ess_sender(cand):
-                            continue
-                        if _system_like_sender(cand):
-                            continue
-                        if row_id_tokens:
-                            s_norm = _subject_norm_cached(getattr(cand, "subject", "") or "")
-                            s_ids = _id_like_tokens(s_norm)
-                            if (not s_ids) or row_id_tokens.isdisjoint(s_ids):
+                quoted_hybrid_key = quoted_pair_key + (
+                    requester,
+                    int(occ_meta.get("total_rows") or 0),
+                )
+                cached_hybrid_analysis = quoted_hybrid_analysis_cache.get(quoted_hybrid_key)
+                if cached_hybrid_analysis is None:
+                    live_ack = None
+                    live_req = latest_quoted_req
+                    live_req_src = "PARSED_FROM_QUOTED_REQUEST"
+                    live_req_debug = "quoted"
+                    live_candidates = []
+                    quoted_candidates_all = sorted({q for q in quoted_non_ess_all if q is not None})
+                    total_rows_for_subject = occ_meta["total_rows"]
+                    reply_led_candidate = None
+                    if total_rows_for_subject <= 1:
+                        resolved_candidates = []
+                        for cand in merged_msgs:
+                            cand_ist = _email_ist(cand)
+                            if not cand_ist:
                                 continue
-                        elif row_tokens:
-                            s_norm = _subject_norm_cached(getattr(cand, "subject", "") or "")
-                            s_tokens = _match_tokens(s_norm)
-                            score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
-                            contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
-                            if score < 0.45 and not contains:
+                            if not _req_match(cand, requester):
                                 continue
-                        if (live_non_ess_req is None) or (cand_ist > _email_ist(live_non_ess_req)):
-                            live_non_ess_req = cand
-                    if (not live_req_debug.startswith("reply-led")) and live_non_ess_req and _email_ist(live_non_ess_req):
-                        live_req = _email_ist(live_non_ess_req)
-                        live_req_src = live_non_ess_req.sender_email or live_non_ess_req.sender_name
-                        live_req_debug = "live-non-ess"
+                            if _ack_like(cand) or _ack_like_text_fallback(cand) or _ess_only_short_ack(cand):
+                                continue
+                            if not _row_subject_match_email(cand, subject_norm, row_tokens, row_id_tokens):
+                                continue
+                            resolved_candidates.append(cand)
+                        resolved_candidates.sort(key=lambda e: e.sent_time)
+                        if resolved_candidates:
+                            target_reply = resolved_candidates[-1]
+                            target_reply_ist = _email_ist(target_reply)
+                            best_reply_led = None
+                            best_reply_led_score = None
+                            if target_reply_ist:
+                                for ack_msg in merged_msgs:
+                                    ack_ist = _email_ist(ack_msg)
+                                    if not ack_ist or ack_ist >= target_reply_ist:
+                                        continue
+                                    if (target_reply_ist - ack_ist) > timedelta(hours=48):
+                                        continue
+                                    if not _ess_sender(ack_msg):
+                                        continue
+                                    if not _row_subject_match_email(ack_msg, subject_norm, row_tokens, row_id_tokens):
+                                        continue
+
+                                    quoted_req_candidates = [
+                                        q for q in quoted_candidates_all
+                                        if q < ack_ist and (ack_ist - q) <= timedelta(minutes=quoted_gap_mins)
+                                    ]
+                                    quoted_req = _best_req_before_ack(quoted_req_candidates, ack_ist) if quoted_req_candidates else None
+
+                                    live_non_ess_candidates = []
+                                    for cand in merged_msgs:
+                                        cand_ist = _email_ist(cand)
+                                        if not cand_ist or cand_ist >= ack_ist:
+                                            continue
+                                        if (ack_ist - cand_ist) > timedelta(minutes=quoted_gap_mins):
+                                            continue
+                                        if _ess_sender(cand) or _system_like_sender(cand):
+                                            continue
+                                        if not _row_subject_match_email(cand, subject_norm, row_tokens, row_id_tokens):
+                                            continue
+                                        live_non_ess_candidates.append((cand_ist, cand))
+                                    live_non_ess_req = None
+                                    if live_non_ess_candidates:
+                                        live_req_times = [t for t, _ in live_non_ess_candidates]
+                                        chosen_live_req_ist = _best_req_before_ack(live_req_times, ack_ist)
+                                        if chosen_live_req_ist:
+                                            for cand_ist, cand in live_non_ess_candidates:
+                                                if cand_ist == chosen_live_req_ist:
+                                                    live_non_ess_req = cand
+                                                    break
+
+                                    chosen_req = None
+                                    chosen_req_src = None
+                                    chosen_mode = None
+                                    if live_non_ess_req and _email_ist(live_non_ess_req):
+                                        chosen_req = _email_ist(live_non_ess_req)
+                                        chosen_req_src = live_non_ess_req.sender_email or live_non_ess_req.sender_name
+                                        chosen_mode = "reply-led-live-non-ess"
+                                    elif quoted_req:
+                                        chosen_req = quoted_req
+                                        chosen_req_src = "PARSED_FROM_QUOTED_REQUEST"
+                                        chosen_mode = "reply-led-quoted"
+
+                                    if not chosen_req:
+                                        continue
+
+                                    score = (
+                                        abs((target_reply_ist - ack_ist).total_seconds()),
+                                        0 if chosen_mode == "reply-led-live-non-ess" else 1,
+                                        abs((ack_ist - chosen_req).total_seconds()),
+                                    )
+                                    if best_reply_led_score is None or score < best_reply_led_score:
+                                        best_reply_led_score = score
+                                        best_reply_led = (chosen_req, ack_ist, chosen_req_src, chosen_mode)
+
+                            if best_reply_led:
+                                live_req, live_ack, live_req_src, live_req_debug = best_reply_led
+                                reply_led_candidate = (live_ack, target_reply, live_req)
+                                live_candidates.append(reply_led_candidate)
+                    if reply_led_candidate is None:
+                        for e in merged_msgs:
+                            if not _req_match(e, requester):
+                                continue
+                            if not _ess_sender(e):
+                                continue
+                            e_ist = _email_ist(e)
+                            if not e_ist:
+                                continue
+                            req_candidates = [
+                                q for q in quoted_candidates_all
+                                if q < e_ist and (e_ist - q) <= timedelta(minutes=quoted_gap_mins)
+                            ]
+                            if not req_candidates:
+                                continue
+                            strict_req_candidates = [
+                                q for q in req_candidates
+                                if q.replace(second=0, microsecond=0) != e_ist.replace(second=0, microsecond=0)
+                            ]
+                            chosen_req = max(strict_req_candidates or req_candidates)
+                            live_candidates.append((e_ist, e, chosen_req))
+                    if live_candidates:
+                        if reply_led_candidate is not None:
+                            live_candidates = [reply_led_candidate]
+                        else:
+                            live_candidates.sort(key=lambda x: x[0])
+                        live_ack, live_ack_msg, chosen_req = live_candidates[0]
+                        live_req = chosen_req
+                        if not live_req_debug.startswith("reply-led"):
+                            live_req_src = "PARSED_FROM_QUOTED_REQUEST"
+                            live_req_debug = "quoted-window-before-ack"
+                        live_non_ess_req = None
+                        for cand in merged_msgs:
+                            cand_ist = _email_ist(cand)
+                            if not cand_ist:
+                                continue
+                            if cand_ist >= live_ack:
+                                continue
+                            if (live_ack - cand_ist) > timedelta(minutes=quoted_gap_mins):
+                                continue
+                            if _ess_sender(cand) or _system_like_sender(cand):
+                                continue
+                            if not _row_subject_match_email(cand, subject_norm, row_tokens, row_id_tokens):
+                                continue
+                            if (live_non_ess_req is None) or (cand_ist > _email_ist(live_non_ess_req)):
+                                live_non_ess_req = cand
+                        if (not live_req_debug.startswith("reply-led")) and live_non_ess_req and _email_ist(live_non_ess_req):
+                            live_req = _email_ist(live_non_ess_req)
+                            live_req_src = live_non_ess_req.sender_email or live_non_ess_req.sender_name
+                            live_req_debug = "live-non-ess"
+                    cached_hybrid_analysis = (
+                        bool(live_ack),
+                        live_req,
+                        live_ack,
+                        live_req_src,
+                        live_req_debug,
+                    )
+                    quoted_hybrid_analysis_cache[quoted_hybrid_key] = cached_hybrid_analysis
+                else:
+                    has_hybrid_pair, live_req, live_ack, live_req_src, live_req_debug = cached_hybrid_analysis
                 if live_ack:
                     has_pair = True
                     hybrid_pair = (live_req, live_ack)
@@ -13813,39 +13814,14 @@ def main() -> int:
                 notes_l = (debug_rows[list_index].get("Notes", "") or "").lower() if list_index < len(debug_rows) else ""
                 if not _is_all_ack_to_ess_notes(notes_l):
                     continue
-                if list_index < len(debug_rows):
-                    notes_now = debug_rows[list_index].get("Notes", "") or ""
-                    if "FinalOcc[Start@13593]" not in notes_now:
-                        debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[Start@13593]"
-
                 row_vals = automation_rows[list_index]
                 shared_occ_plan = _preferred_shared_occurrence_plan(state, require_override_for_all_ack=True)
                 if not shared_occ_plan or not _is_authoritative_occurrence_lane(shared_occ_plan.get("lane_kind") or ""):
-                    if list_index < len(debug_rows):
-                        notes_now = debug_rows[list_index].get("Notes", "") or ""
-                        lane_now = (shared_occ_plan.get("lane_kind") or "") if shared_occ_plan else "NONE"
-                        tag = f"FinalOcc[NoPlan@13600:{lane_now}]"
-                        if tag not in notes_now:
-                            debug_rows[list_index]["Notes"] = f"{notes_now}; {tag}"
                     continue
-                if list_index < len(debug_rows):
-                    notes_now = debug_rows[list_index].get("Notes", "") or ""
-                    tag = f"FinalOcc[Plan@13600:{shared_occ_plan.get('lane_kind') or 'NONE'}]"
-                    if tag not in notes_now:
-                        debug_rows[list_index]["Notes"] = f"{notes_now}; {tag}"
 
                 pick_when = shared_occ_plan.get("pick_when")
                 if not pick_when:
-                    if list_index < len(debug_rows):
-                        notes_now = debug_rows[list_index].get("Notes", "") or ""
-                        if "FinalOcc[NoPick@13604]" not in notes_now:
-                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[NoPick@13604]"
                     continue
-                if list_index < len(debug_rows):
-                    notes_now = debug_rows[list_index].get("Notes", "") or ""
-                    pick_tag = f"FinalOcc[Pick@13604:{_format_time(pick_when)}]"
-                    if pick_tag not in notes_now:
-                        debug_rows[list_index]["Notes"] = f"{notes_now}; {pick_tag}"
                 target_triplet = (
                     pick_when.replace(second=0, microsecond=0),
                     pick_when.replace(second=0, microsecond=0),
@@ -13854,16 +13830,8 @@ def main() -> int:
 
                 current_triplet = _current_row_triplet_ist(row_vals)
                 if current_triplet != target_triplet:
-                    if list_index < len(debug_rows):
-                        notes_now = debug_rows[list_index].get("Notes", "") or ""
-                        if "FinalOcc[TripletDiff@13613]" not in notes_now:
-                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[TripletDiff@13613]"
                     t = _format_time(pick_when)
                     if not t:
-                        if list_index < len(debug_rows):
-                            notes_now = debug_rows[list_index].get("Notes", "") or ""
-                            if "FinalOcc[FormatFail@13614]" not in notes_now:
-                                debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[FormatFail@13614]"
                         continue
 
                     row_vals["Created Date & Time"] = t
@@ -13897,14 +13865,6 @@ def main() -> int:
                         notes_now = debug_rows[list_index].get("Notes", "") or ""
                         if "ESSContinuationGuard[AllThreeStrictEssOnly]" not in notes_now:
                             debug_rows[list_index]["Notes"] = f"{notes_now}; ESSContinuationGuard[AllThreeStrictEssOnly]"
-                        notes_now = debug_rows[list_index].get("Notes", "") or ""
-                        if "FinalOcc[Wrote@13618]" not in notes_now:
-                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[Wrote@13618]"
-                else:
-                    if list_index < len(debug_rows):
-                        notes_now = debug_rows[list_index].get("Notes", "") or ""
-                        if "FinalOcc[AlreadyTarget@13613]" not in notes_now:
-                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[AlreadyTarget@13613]"
 
                 if _lock_occurrence_row(
                     state,
@@ -13913,10 +13873,6 @@ def main() -> int:
                     "OccurrenceLocked",
                     triplet=target_triplet,
                 ):
-                    if list_index < len(debug_rows):
-                        notes_now = debug_rows[list_index].get("Notes", "") or ""
-                        if "FinalOcc[Locked@13650]" not in notes_now:
-                            debug_rows[list_index]["Notes"] = f"{notes_now}; FinalOcc[Locked@13650]"
                     final_occurrence_locked_rows += 1
 
             _stage_timer_stop("final_occurrence_lock_apply", final_occurrence_lock_started_at, items=final_occurrence_locked_rows)
