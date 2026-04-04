@@ -546,18 +546,25 @@ def main() -> int:
             return True
         if not _strong_identity_overlap(subj_norm, key_norm):
             return False
+        # Interface hints are only supporting signals. If the row subject itself
+        # does not explicitly carry interface tokens, do not let inferred hints
+        # become a hard rejection gate.
         subj_iface_set = _interface_tokens(subj_norm)
-        if not subj_iface_set and iface_tokens:
-            subj_iface_set = set(iface_tokens)
+        row_has_explicit_iface = bool(subj_iface_set)
+        hinted_iface_set = set(iface_tokens) if iface_tokens else set()
         key_iface_set = _interface_tokens(key_norm)
-        if subj_iface_set and key_iface_set and subj_iface_set.isdisjoint(key_iface_set):
+        if row_has_explicit_iface and key_iface_set and subj_iface_set.isdisjoint(key_iface_set):
             return False
         similarity = _subject_family_similarity(subj_norm, key_norm)
         if similarity >= 0.55:
             return True
         shared_num = _sig_num_tokens(subj_norm) & _sig_num_tokens(key_norm)
         shared_part = _part_tokens(subj_norm) & _part_tokens(key_norm)
-        shared_iface = subj_iface_set & key_iface_set if subj_iface_set and key_iface_set else set()
+        shared_iface = set()
+        if row_has_explicit_iface and key_iface_set:
+            shared_iface = subj_iface_set & key_iface_set
+        elif hinted_iface_set and key_iface_set:
+            shared_iface = hinted_iface_set & key_iface_set
         shared_id = _id_like_tokens(subj_norm) & _id_like_tokens(key_norm)
         return similarity >= 0.35 and bool(shared_num or shared_part or shared_iface or shared_id)
 
@@ -4911,29 +4918,44 @@ def main() -> int:
             cache_key = (
                 id(e),
                 subject_norm_value or "",
+                tuple(sorted(row_tokens)) if row_tokens else (),
                 tuple(sorted(row_id_tokens)) if row_id_tokens else (),
             )
             cached = _row_subject_match_cache.get(cache_key)
             if cached is not None:
                 return cached
             s_norm = _subject_norm_cached(getattr(e, "subject", "") or "")
+            score = _token_overlap_score(row_tokens, _match_tokens(s_norm)) if row_tokens else 0.0
+            contains = bool(subject_norm_value and s_norm and (subject_norm_value in s_norm or s_norm in subject_norm_value))
             if row_id_tokens:
                 s_ids = _id_token_cache.get(s_norm)
                 if s_ids is None:
                     s_ids = _id_like_tokens(s_norm)
                     _id_token_cache[s_norm] = s_ids
-                if s_ids and not row_id_tokens.isdisjoint(s_ids):
+                has_id_overlap = bool(s_ids and not row_id_tokens.isdisjoint(s_ids))
+                if not has_id_overlap:
+                    has_id_overlap = _subject_has_id_token(getattr(e, "subject", "") or "", row_id_tokens)
+                if not has_id_overlap:
+                    _row_subject_match_cache[cache_key] = False
+                    return False
+                if not row_tokens:
                     _row_subject_match_cache[cache_key] = True
                     return True
-                out = _subject_has_id_token(getattr(e, "subject", "") or "", row_id_tokens)
+                out = (
+                    score >= 0.45
+                    or contains
+                    or _fresh_picker_subject_safe(
+                        subject_norm_value,
+                        s_norm,
+                        iface_tokens=_interface_tokens(subject_norm_value),
+                        allow_added_inc=True,
+                    )
+                )
                 _row_subject_match_cache[cache_key] = out
                 return out
             if not row_tokens:
                 _row_subject_match_cache[cache_key] = True
                 return True
-            s_tokens = _match_tokens(s_norm)
-            score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
-            contains = bool(subject_norm_value and s_norm and (subject_norm_value in s_norm or s_norm in subject_norm_value))
             out = score >= 0.45 or contains
             _row_subject_match_cache[cache_key] = out
             return out
@@ -10152,7 +10174,8 @@ def main() -> int:
             row_id_tokens_set: set,
         ) -> bool:
             if row_id_tokens_set:
-                if not q_ids or row_id_tokens_set.isdisjoint(q_ids):
+                has_id_overlap = bool(q_ids and not row_id_tokens_set.isdisjoint(q_ids))
+                if not has_id_overlap:
                     return False
             if not row_tokens:
                 return True
@@ -10162,7 +10185,14 @@ def main() -> int:
                 and q_norm
                 and (subject_norm_value in q_norm or q_norm in subject_norm_value)
             )
-            return score >= 0.45 or contains
+            if score >= 0.45 or contains:
+                return True
+            return _fresh_picker_subject_safe(
+                subject_norm_value,
+                q_norm,
+                iface_tokens=_interface_tokens(subject_norm_value),
+                allow_added_inc=True,
+            )
 
         def _get_quoted_summaries_from_eml_path(path: str):
             if not path:
@@ -10506,12 +10536,8 @@ def main() -> int:
             if row_id_tokens:
                 merged_ids = {id(e) for e in merged_msgs}
                 for e in _find_emails_by_id(row_id_tokens):
-                    s_norm = _subject_norm_cached(getattr(e, "subject", "") or "")
-                    s_ids = _id_like_tokens(s_norm)
-                    if not s_ids or row_id_tokens.isdisjoint(s_ids):
-                        # Fallback: raw subject contains the ID token (when normalization stripped it)
-                        if not _subject_has_id_token(getattr(e, "subject", "") or "", row_id_tokens):
-                            continue
+                    if not _row_subject_match_email(e, subject_norm, row_tokens, row_id_tokens):
+                        continue
                     if id(e) in merged_ids:
                         continue
                     merged_msgs.append(e)
@@ -10935,6 +10961,15 @@ def main() -> int:
         used_ess_continuation_ess_only = set()
         ess_only_reply_index = {}
         ess_only_reply_month_gate = {}
+        ess_email_set = {e.strip().lower() for e in ess_team or []}
+        ess_domain_set = {"invenio-solutions.com", "inveniolsi.com"}
+        ess_name_tokens = set()
+        for em in ess_email_set:
+            if "@" in em:
+                local = em.split("@", 1)[0]
+                for tok in re.split(r"[._\\-]+", local):
+                    if len(tok) >= 3:
+                        ess_name_tokens.add(tok.lower())
 
         ess_only_strict_started_at = _stage_timer_start()
         for state in row_states:
@@ -10968,40 +11003,6 @@ def main() -> int:
             subject_norm = (state.get("subject_norm") or "").lower()
             base_thread = state.get("thread") or []
             ref_ist = _to_ist(r_dt) if r_dt else (_to_ist(a_dt) if a_dt else _to_ist(c_dt) if c_dt else None)
-            thread = _expanded_thread(
-                subject_norm,
-                base_thread,
-                requester,
-                include_non_ess=True,
-                reference_ist=ref_ist,
-            )
-            thread = thread or []
-            merged_msgs = list(thread)
-            extra_any = _requester_pool(subject_norm, "", ref_ist, day_window=30) or []
-            if extra_any:
-                row_tokens = _match_tokens(subject_norm)
-                for e in extra_any:
-                    s_norm = _subject_norm_cached(getattr(e, "subject", "") or "")
-                    s_tokens = _match_tokens(s_norm)
-                    score = _token_overlap_score(row_tokens, s_tokens) if s_tokens else 0.0
-                    contains = bool(subject_norm and s_norm and (subject_norm in s_norm or s_norm in subject_norm))
-                    if score < 0.45 and not contains:
-                        continue
-                    merged_msgs.append(e)
-
-            # Try quoted non-ESS request + ESS ack (same-day, <=16m).
-            quoted_gap_mins = 16
-            quoted_day_slack = 0
-            ess_email_set = {e.strip().lower() for e in ess_team or []}
-            # Treat known ESS domains as ESS in quoted headers (safe, ESS-only).
-            ess_domain_set = {"invenio-solutions.com", "inveniolsi.com"}
-            ess_name_tokens = set()
-            for em in ess_email_set:
-                if "@" in em:
-                    local = em.split("@", 1)[0]
-                    for tok in re.split(r"[._\\-]+", local):
-                        if len(tok) >= 3:
-                            ess_name_tokens.add(tok.lower())
             row_tokens = _match_tokens(subject_norm)
             row_id_tokens = _id_like_tokens(subject_norm)
             if not row_id_tokens:
@@ -11009,6 +11010,18 @@ def main() -> int:
                 if not desc_text:
                     desc_text = state.get("description") or ""
                 row_id_tokens = _id_like_tokens(desc_text)
+            merged_msgs, _ = _quoted_request_row_context(
+                subject_norm,
+                base_thread,
+                requester,
+                ref_ist,
+                row_tokens,
+                row_id_tokens,
+            )
+
+            # Try quoted non-ESS request + ESS ack (same-day, <=16m).
+            quoted_gap_mins = 16
+            quoted_day_slack = 0
             parent_ess_cache = {}
             def _parent_sender_info(msg):
                 key = id(msg)
@@ -11124,10 +11137,8 @@ def main() -> int:
             id_match_msgs = []
             if row_id_tokens:
                 merged_ids = {id(e) for e in merged_msgs}
-                for e in emails:
-                    s_norm = _subject_norm_cached(getattr(e, "subject", "") or "")
-                    s_ids = _id_like_tokens(s_norm)
-                    if not s_ids or row_id_tokens.isdisjoint(s_ids):
+                for e in _find_emails_by_id(row_id_tokens):
+                    if not _row_subject_match_email(e, subject_norm, row_tokens, row_id_tokens):
                         continue
                     id_match_msgs.append(e)
                     if id(e) not in merged_ids:
@@ -11445,7 +11456,8 @@ def main() -> int:
                                     )
                                 else:
                                     reply_matches.sort(key=lambda e: _email_ist(e))
-                                reply_pick = reply_matches[min(quoted_pick_idx, len(reply_matches) - 1)]
+                                if quoted_pick_idx < len(reply_matches):
+                                    reply_pick = reply_matches[quoted_pick_idx]
                         else:
                             reply_pick = reply_matches[0]
                     if reply_pick:
@@ -11474,8 +11486,16 @@ def main() -> int:
                                     if _email_ist(p[2]) else None
                                 ),
                             )
-                        pick_idx = 0 if total_rows <= 1 else (quoted_pick_idx if quoted_pick_idx < len(candidate_pairs_with_reply) else 0)
-                        pair_req, pair_ack, pair_reply = candidate_pairs_with_reply[pick_idx]
+                        if total_rows <= 1:
+                            pick_idx = 0
+                        elif quoted_pick_idx < len(candidate_pairs_with_reply):
+                            pick_idx = quoted_pick_idx
+                        else:
+                            pick_idx = None
+                        if pick_idx is None:
+                            pair_req, pair_ack, pair_reply = None, None, None
+                        else:
+                            pair_req, pair_ack, pair_reply = candidate_pairs_with_reply[pick_idx]
                     else:
                         if quoted_pick_idx < len(consultant_msgs):
                             target_ist = _email_ist(consultant_msgs[quoted_pick_idx])
@@ -11511,7 +11531,7 @@ def main() -> int:
                             direct_replies.append(e)
                         if direct_replies:
                             if len(direct_replies) <= 1:
-                                direct_reply_candidate = direct_replies[0]
+                                direct_reply_candidate = direct_replies[0] if quoted_pick_idx == 0 else None
                             else:
                                 if multi_service_subject:
                                     direct_replies = _dedupe_multi_service_lanes(
@@ -11530,7 +11550,11 @@ def main() -> int:
                                     )
                                     direct_reply_candidate = direct_replies[0]
                                 else:
-                                    direct_reply_candidate = direct_replies[min(quoted_pick_idx, len(direct_replies) - 1)]
+                                    direct_reply_candidate = (
+                                        direct_replies[quoted_pick_idx]
+                                        if quoted_pick_idx < len(direct_replies)
+                                        else None
+                                    )
                             direct_gap = _email_ist(direct_reply_candidate) - latest_quoted_req if direct_reply_candidate else None
                             if direct_gap and direct_gap <= timedelta(minutes=16):
                                 pair_req, pair_ack, pair_reply = (
@@ -11574,9 +11598,12 @@ def main() -> int:
                         )
                         direct_reply_candidate = direct_replies[0]
                     else:
-                        direct_reply_candidate = direct_replies[min(quoted_pick_idx, len(direct_replies) - 1)] if len(direct_replies) > 1 else direct_replies[0]
+                        if len(direct_replies) == 1:
+                            direct_reply_candidate = direct_replies[0] if quoted_pick_idx == 0 else None
+                        else:
+                            direct_reply_candidate = direct_replies[quoted_pick_idx] if quoted_pick_idx < len(direct_replies) else None
                     direct_gap = _email_ist(direct_reply_candidate) - latest_quoted_req
-                    if direct_gap <= timedelta(minutes=16):
+                    if direct_reply_candidate and direct_gap <= timedelta(minutes=16):
                         pair_req = latest_quoted_req
                         pair_ack = _email_ist(direct_reply_candidate)
                         pair_reply = direct_reply_candidate
