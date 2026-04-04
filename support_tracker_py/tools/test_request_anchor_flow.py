@@ -19,6 +19,11 @@ from src.rules.time_resolver import (
     _to_ist,
 )
 
+try:
+    from dateutil.parser import parse as _dateutil_parse
+except Exception:
+    _dateutil_parse = None
+
 
 @dataclass
 class DebugEmail:
@@ -29,6 +34,19 @@ class DebugEmail:
     body: str
     body_html: str
     path: Path
+
+
+@dataclass
+class QuotedHeaderCandidate:
+    from_line: str
+    quoted_ist: datetime
+    quoted_subj: str
+    raw_sent: str
+    normalized_sent: str
+    has_am_pm: bool
+    am_or_pm: str
+    is_ambiguous: bool
+    header_lines: tuple[str, ...]
 
 
 def _read_json_list(path: Path) -> list[str]:
@@ -201,12 +219,109 @@ def _parse_quoted_sent_time(sent_line: str) -> datetime | None:
     if not sent_line:
         return None
     text = re.sub(r"(?i)^sent\s*:\s*", "", sent_line).strip()
-    for candidate in (text, text.replace(" at ", " "), re.sub(r"\s+", " ", text)):
+    text = re.sub(r"(?i)^(mon|tue|wed|thu|fri|sat|sun)\w*,?\s*", "", text).strip()
+    text = re.sub(r"\(.*?\)", " ", text).strip()
+    text = re.sub(r"(?i)(\d)(am|pm)\b", r"\1 \2", text)
+    text = re.sub(r"(?i)\b(a\.m\.|p\.m\.)\b", lambda m: m.group(1).replace(".", "").upper(), text)
+    normalized = " ".join(text.replace(",", " ").replace(" at ", " ").split())
+    candidates = []
+    for candidate in (text, normalized):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    fmts = [
+        "%d %B %Y %H:%M:%S",
+        "%d %B %Y %H:%M",
+        "%d %b %Y %H:%M:%S",
+        "%d %b %Y %H:%M",
+        "%B %d %Y %H:%M:%S",
+        "%B %d %Y %H:%M",
+        "%b %d %Y %H:%M:%S",
+        "%b %d %Y %H:%M",
+        "%d %B %Y %I:%M:%S %p",
+        "%d %B %Y %I:%M %p",
+        "%d %b %Y %I:%M:%S %p",
+        "%d %b %Y %I:%M %p",
+        "%B %d %Y %I:%M:%S %p",
+        "%B %d %Y %I:%M %p",
+        "%b %d %Y %I:%M:%S %p",
+        "%b %d %Y %I:%M %p",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d-%m-%Y %I:%M:%S %p",
+        "%d-%m-%Y %I:%M %p",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y %I:%M:%S %p",
+        "%d.%m.%Y %I:%M %p",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %I:%M:%S %p",
+        "%d/%m/%Y %I:%M %p",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %I:%M:%S %p",
+        "%Y-%m-%d %I:%M %p",
+    ]
+    for candidate in candidates:
         try:
             return parsedate_to_datetime(candidate)
         except Exception:
-            continue
+            pass
+        for fmt in fmts:
+            try:
+                return datetime.strptime(candidate, fmt)
+            except Exception:
+                continue
     return None
+
+
+def _normalize_quoted_sent_text(sent_line: str) -> str:
+    text = re.sub(r"(?i)^sent\s*:\s*", "", sent_line or "").strip()
+    text = re.sub(r"(?i)^(mon|tue|wed|thu|fri|sat|sun)\w*,?\s*", "", text).strip()
+    text = re.sub(r"\(.*?\)", " ", text).strip()
+    text = re.sub(r"(?i)(\d)(am|pm)\b", r"\1 \2", text)
+    text = re.sub(r"(?i)\b(a\.m\.|p\.m\.)\b", lambda m: m.group(1).replace(".", "").upper(), text)
+    return " ".join(text.replace(",", " ").replace(" at ", " ").split())
+
+
+def _parse_quoted_sent_time_strict(sent_line: str) -> datetime | None:
+    if not sent_line:
+        return None
+    normalized = _normalize_quoted_sent_text(sent_line)
+    candidates = []
+    for candidate in (sent_line, normalized):
+        candidate = candidate.strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        if _dateutil_parse is not None:
+            try:
+                return _dateutil_parse(candidate, fuzzy=False, dayfirst=True)
+            except Exception:
+                pass
+        try:
+            return parsedate_to_datetime(candidate)
+        except Exception:
+            pass
+    return _parse_quoted_sent_time(sent_line)
+
+
+def _quoted_sent_metadata(sent_line: str) -> tuple[str, bool, str, bool]:
+    raw_sent = (sent_line or "").strip()
+    normalized_sent = _normalize_quoted_sent_text(raw_sent)
+    meridiem_match = re.search(r"(?i)\b(am|pm|a\.m\.|p\.m\.)\b", raw_sent)
+    am_or_pm = ""
+    has_am_pm = False
+    if meridiem_match:
+        token = meridiem_match.group(1).lower().replace(".", "")
+        am_or_pm = "pm" if token == "pm" else "am"
+        has_am_pm = True
+    time_match = re.search(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b", normalized_sent)
+    is_ambiguous = False
+    if time_match:
+        hour = int(time_match.group(1))
+        is_ambiguous = (1 <= hour <= 12) and (not has_am_pm)
+    return normalized_sent, has_am_pm, am_or_pm, is_ambiguous
 
 
 def _ess_name_only(from_line: str, ess_team: list[str]) -> bool:
@@ -280,6 +395,14 @@ def _extract_quoted_blocks_with_subject(email: DebugEmail) -> list[tuple[str, da
                 subj_line = lines[j]
             if sent_line and subj_line:
                 break
+        if sent_line:
+            sent_low = sent_line.lower()
+            if (" am" not in sent_low) and (" pm" not in sent_low):
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    extra = (lines[j] or "").strip()
+                    if re.fullmatch(r"(?i)(am|pm|a\.m\.|p\.m\.)", extra):
+                        sent_line = f"{sent_line} {extra}"
+                        break
         if not sent_line:
             continue
         sent_dt = _parse_quoted_sent_time(sent_line)
@@ -317,6 +440,14 @@ def _extract_quoted_blocks_relaxed(email: DebugEmail) -> list[tuple[str, datetim
                 subj_line = lines[j]
             if sent_line:
                 break
+        if sent_line:
+            sent_low = sent_line.lower()
+            if (" am" not in sent_low) and (" pm" not in sent_low):
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    extra = (lines[j] or "").strip()
+                    if re.fullmatch(r"(?i)(am|pm|a\.m\.|p\.m\.)", extra):
+                        sent_line = f"{sent_line} {extra}"
+                        break
         if not sent_line:
             continue
         sent_dt = _parse_quoted_sent_time(sent_line)
@@ -324,6 +455,76 @@ def _extract_quoted_blocks_relaxed(email: DebugEmail) -> list[tuple[str, datetim
             continue
         subj_text = re.sub(r"(?i)^(subject|objet)\s*:?", "", subj_line).strip() if subj_line else ""
         blocks.append((from_line, _to_ist(sent_dt), subj_text))
+    return blocks
+
+
+def _extract_quoted_blocks_header_bounded(email: DebugEmail) -> list[QuotedHeaderCandidate]:
+    lines = _clean_message_text(email)
+    if not lines:
+        return []
+
+    def _append_meridiem(sent_line: str, start_idx: int) -> str:
+        sent_low = sent_line.lower()
+        if (" am" in sent_low) or (" pm" in sent_low):
+            return sent_line
+        for j in range(start_idx + 1, min(start_idx + 4, len(lines))):
+            extra = (lines[j] or "").strip()
+            if re.fullmatch(r"(?i)(am|pm|a\.m\.|p\.m\.)", extra):
+                return f"{sent_line} {extra}"
+        return sent_line
+
+    blocks: list[QuotedHeaderCandidate] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        low = line.lower()
+        if "from:" not in low and not re.search(r"(?i)\bfrom\b\s*:?", line):
+            i += 1
+            continue
+
+        from_line = ""
+        sent_line = ""
+        subj_line = ""
+        header_end = i
+        for j in range(i, min(i + 12, len(lines))):
+            cur = (lines[j] or "").strip()
+            cur_low = cur.lower()
+            if j > i and ("from:" in cur_low or re.match(r"(?i)^[-_]{3,}$", cur)):
+                break
+            if (not from_line) and re.search(r"(?i)\bfrom\b\s*:", cur):
+                from_line = re.sub(r"(?i)^.*?\bfrom\b\s*:\s*", "", cur).strip()
+                cut = re.search(r"(?i)\b(sent|to|cc|subject|objet)\b\s*:", from_line)
+                if cut:
+                    from_line = from_line[: cut.start()].strip()
+            if (not sent_line) and re.search(r"(?i)\bsent\b\s*:", cur):
+                sent_line = cur
+            if (not subj_line) and re.search(r"(?i)\b(subject|objet)\b\s*:", cur):
+                subj_line = cur
+            header_end = j
+            if from_line and sent_line and subj_line:
+                break
+
+        if sent_line:
+            sent_line = _append_meridiem(sent_line, header_end)
+            sent_dt = _parse_quoted_sent_time_strict(sent_line)
+            if sent_dt:
+                subj_text = re.sub(r"(?i)^(subject|objet)\s*:\s*", "", subj_line).strip() if subj_line else ""
+                normalized_sent, has_am_pm, am_or_pm, is_ambiguous = _quoted_sent_metadata(sent_line)
+                header_lines = tuple((lines[k] or "").strip() for k in range(i, min(header_end + 1, len(lines))))
+                blocks.append(
+                    QuotedHeaderCandidate(
+                        from_line=from_line,
+                        quoted_ist=_to_ist(sent_dt),
+                        quoted_subj=subj_text,
+                        raw_sent=sent_line.strip(),
+                        normalized_sent=normalized_sent,
+                        has_am_pm=has_am_pm,
+                        am_or_pm=am_or_pm,
+                        is_ambiguous=is_ambiguous,
+                        header_lines=header_lines,
+                    )
+                )
+        i = max(i + 1, header_end + 1)
     return blocks
 
 
@@ -355,6 +556,108 @@ def _best_before(candidates: list[tuple[datetime, object]], upper_ist: datetime,
         return None
     strict = [entry for entry in usable if entry[0].replace(second=0, microsecond=0) != upper_ist.replace(second=0, microsecond=0)]
     return strict[-1] if strict else usable[-1]
+
+
+def _subject_variant_score(row_subject: str, candidate_subject: str) -> int:
+    row_norm = normalize_subject(row_subject or "")
+    candidate_norm = normalize_subject(candidate_subject or "")
+    row_match = normalize_subject_for_match(row_norm)
+    candidate_match = normalize_subject_for_match(candidate_norm)
+    if not row_match or not candidate_match:
+        return 0
+    if row_match == candidate_match:
+        return 100
+    if row_match in candidate_match or candidate_match in row_match:
+        return 85
+    row_tokens = _match_tokens(row_match)
+    candidate_tokens = _match_tokens(candidate_match)
+    if not row_tokens or not candidate_tokens:
+        return 0
+    inter = len(row_tokens & candidate_tokens)
+    if inter <= 0:
+        return 0
+    extra = len(candidate_tokens - row_tokens)
+    missing = len(row_tokens - candidate_tokens)
+    return max(0, inter * 14 - extra * 8 - missing * 6)
+
+
+def _reply_anchored_preferred_episode(
+    row: dict,
+    live_requests: list[tuple[datetime, DebugEmail]],
+    quoted_requests: list[tuple[datetime, tuple[DebugEmail, str, str]]],
+    strict_quoted_requests: list[tuple[datetime, tuple[DebugEmail, QuotedHeaderCandidate]]],
+    reply_candidates: list[tuple[datetime, DebugEmail]],
+) -> dict | None:
+    requester = _get_col(row, "Requester", "Consultant")
+    row_subject = _family_subject_norm(row)
+    row_tokens = _match_tokens(row_subject)
+    row_id_tokens = _id_like_tokens(row_subject)
+    eligible_replies = []
+    for reply_ist, reply_email in reply_candidates:
+        if requester and not _match_requester(reply_email.sender_name, reply_email.sender_email, requester):
+            continue
+        if not _row_subject_match(row_subject, row_tokens, row_id_tokens, reply_email.subject):
+            continue
+        reply_subject_score = _subject_variant_score(row_subject, reply_email.subject)
+        eligible_replies.append((reply_ist, reply_email, reply_subject_score))
+    if not eligible_replies:
+        return None
+
+    best_episode = None
+    best_score = None
+    for reply_ist, reply_email, reply_subject_score in eligible_replies:
+        request_options = []
+        for req_ist, req_email in live_requests:
+            if req_ist >= reply_ist or (reply_ist - req_ist) > timedelta(hours=48):
+                continue
+            subject_score = _subject_variant_score(row_subject, req_email.subject)
+            if subject_score < 60:
+                continue
+            gap_seconds = int((reply_ist - req_ist).total_seconds())
+            request_options.append(
+                ((subject_score, 3, -gap_seconds, int(req_ist.timestamp())), "live", (req_ist, req_email))
+            )
+        for req_ist, payload in strict_quoted_requests:
+            source_email, header_candidate = payload
+            if req_ist >= reply_ist or (reply_ist - req_ist) > timedelta(hours=48):
+                continue
+            subject_score = _subject_variant_score(row_subject, header_candidate.quoted_subj or source_email.subject)
+            if subject_score < 60:
+                continue
+            gap_seconds = int((reply_ist - req_ist).total_seconds())
+            amp_bonus = 1 if header_candidate.has_am_pm else 0
+            request_options.append(
+                ((subject_score, 2, amp_bonus, -gap_seconds, int(req_ist.timestamp())), "quoted-strict", (req_ist, payload))
+            )
+        for req_ist, payload in quoted_requests:
+            source_email, from_line, quoted_subj = payload
+            if req_ist >= reply_ist or (reply_ist - req_ist) > timedelta(hours=48):
+                continue
+            subject_score = _subject_variant_score(row_subject, quoted_subj or source_email.subject)
+            if subject_score < 60:
+                continue
+            gap_seconds = int((reply_ist - req_ist).total_seconds())
+            request_options.append(
+                ((subject_score, 1, -gap_seconds, int(req_ist.timestamp())), "quoted", (req_ist, payload))
+            )
+        if not request_options:
+            continue
+        best_request = max(request_options, key=lambda item: item[0])
+        episode = {
+            "request": best_request[2],
+            "request_kind": f"{best_request[1]}-reply-anchored",
+            "ack": (reply_ist, reply_email),
+            "resolved": (reply_ist, reply_email),
+        }
+        episode_score = (
+            reply_subject_score,
+            best_request[0],
+            int(reply_ist.timestamp()),
+        )
+        if best_score is None or episode_score > best_score:
+            best_score = episode_score
+            best_episode = episode
+    return best_episode
 
 
 def _find_family_rows(debug_rows: list[dict]) -> dict[str, list[dict]]:
@@ -417,6 +720,7 @@ def _simulate_family(
 ) -> None:
     live_requests: list[tuple[datetime, DebugEmail]] = []
     quoted_requests: list[tuple[datetime, tuple[DebugEmail, str, str]]] = []
+    strict_quoted_requests: list[tuple[datetime, tuple[DebugEmail, QuotedHeaderCandidate]]] = []
     ack_candidates: list[tuple[datetime, DebugEmail]] = []
     reply_candidates: list[tuple[datetime, DebugEmail]] = []
 
@@ -456,12 +760,37 @@ def _simulate_family(
                 continue
             quoted_requests.append((quoted_ist, (email, from_line, quoted_subj)))
 
+        strict_blocks = _extract_quoted_blocks_header_bounded(email)
+        for header_candidate in strict_blocks:
+            from_line = header_candidate.from_line
+            quoted_ist = header_candidate.quoted_ist
+            quoted_subj = header_candidate.quoted_subj
+            if quoted_ist >= email_ist:
+                continue
+            if (email_ist - quoted_ist) > timedelta(hours=48):
+                continue
+            quoted_norm = normalize_subject(quoted_subj or quoted_subj or "")
+            if quoted_subj and not _row_subject_match(family_rows[0] and _family_subject_norm(family_rows[0]) or "", _match_tokens(_family_subject_norm(family_rows[0]) if family_rows else ""), _id_like_tokens(_family_subject_norm(family_rows[0]) if family_rows else ""), quoted_subj):
+                continue
+            addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", from_line, flags=re.I)
+            emails_l = [addr.lower() for addr in addr_hits]
+            domains_l = [addr.split("@", 1)[-1] for addr in emails_l if "@" in addr]
+            is_quoted_ess = False
+            if emails_l:
+                is_quoted_ess = any(_is_ess_sender(DebugEmail("", "", addr, None, "", "", Path()), ess_team) for addr in emails_l)
+            else:
+                is_quoted_ess = _ess_name_only(from_line, ess_team)
+            if is_quoted_ess or any(domain.endswith("invenio-solutions.com") for domain in domains_l):
+                continue
+            strict_quoted_requests.append((quoted_ist, (email, header_candidate)))
+
     live_requests = _minute_dedupe(live_requests)
     quoted_requests = _minute_dedupe(quoted_requests)
+    strict_quoted_requests = _minute_dedupe(strict_quoted_requests)
     ack_candidates = _minute_dedupe(ack_candidates)
     reply_candidates = _minute_dedupe(reply_candidates)
 
-    print(f"live_request_count={len(live_requests)} quoted_request_count={len(quoted_requests)} ack_candidate_count={len(ack_candidates)} reply_candidate_count={len(reply_candidates)}")
+    print(f"live_request_count={len(live_requests)} quoted_request_count={len(quoted_requests)} strict_quoted_request_count={len(strict_quoted_requests)} ack_candidate_count={len(ack_candidates)} reply_candidate_count={len(reply_candidates)}")
     print("-" * 100)
     print("LIVE REQUEST CANDIDATES")
     if not live_requests:
@@ -477,6 +806,26 @@ def _simulate_family(
         print(f"  {idx}. {_fmt(when)} | from_line={from_line}")
         if quoted_subj:
             print(f"     quoted_subj={quoted_subj}")
+        print(f"     found_in={source_email.subject}")
+    print("-" * 100)
+    print("STRICT HEADER QUOTED REQUEST CANDIDATES")
+    if not strict_quoted_requests:
+        print("  <empty>")
+    for idx, (when, payload) in enumerate(strict_quoted_requests, start=1):
+        source_email, header_candidate = payload
+        print(
+            f"  {idx}. {_fmt(when)} | from_line={header_candidate.from_line} | "
+            f"raw_sent={header_candidate.raw_sent or '<empty>'}"
+        )
+        print(
+            f"     normalized_sent={header_candidate.normalized_sent or '<empty>'} | "
+            f"has_am_pm={header_candidate.has_am_pm} | am_or_pm={header_candidate.am_or_pm or '-'} | "
+            f"ambiguous={header_candidate.is_ambiguous}"
+        )
+        if header_candidate.header_lines:
+            print("     header_lines=" + " || ".join(header_candidate.header_lines))
+        if header_candidate.quoted_subj:
+            print(f"     quoted_subj={header_candidate.quoted_subj}")
         print(f"     found_in={source_email.subject}")
     print("-" * 100)
     print("ACK CANDIDATES")
@@ -528,6 +877,75 @@ def _simulate_family(
         seen.add(key)
         unique_episodes.append(episode)
 
+    strict_episodes = []
+    for ack_ist, ack_email in ack_candidates:
+        req_pick = _best_before(live_requests, ack_ist, timedelta(minutes=16))
+        req_kind = "live"
+        if not req_pick:
+            req_pick = _best_before([(when, payload) for when, payload in strict_quoted_requests], ack_ist, timedelta(minutes=16))
+            req_kind = "quoted-strict"
+        if not req_pick:
+            continue
+        reply_after = [
+            (reply_ist, reply_email)
+            for reply_ist, reply_email in reply_candidates
+            if reply_ist > ack_ist and (reply_ist - ack_ist) <= timedelta(hours=48)
+        ]
+        resolved_pick = reply_after[0] if reply_after else (ack_ist, ack_email)
+        strict_episodes.append(
+            {
+                "request": req_pick,
+                "request_kind": req_kind,
+                "ack": (ack_ist, ack_email),
+                "resolved": resolved_pick,
+            }
+        )
+    unique_strict_episodes = []
+    strict_seen = set()
+    for episode in strict_episodes:
+        key = (
+            episode["request"][0].replace(second=0, microsecond=0),
+            episode["ack"][0].replace(second=0, microsecond=0),
+            episode["resolved"][0].replace(second=0, microsecond=0),
+        )
+        if key in strict_seen:
+            continue
+        strict_seen.add(key)
+        unique_strict_episodes.append(episode)
+
+    blue_direct_episodes = []
+    for reply_ist, reply_email in reply_candidates:
+        req_pick = _best_before(live_requests, reply_ist, timedelta(hours=48))
+        req_kind = "live-blue"
+        if not req_pick:
+            req_pick = _best_before([(when, payload) for when, payload in quoted_requests], reply_ist, timedelta(hours=48))
+            req_kind = "quoted-blue"
+        if not req_pick:
+            continue
+        gap = reply_ist - req_pick[0]
+        if gap <= timedelta(minutes=16):
+            continue
+        blue_direct_episodes.append(
+            {
+                "request": req_pick,
+                "request_kind": req_kind,
+                "ack": (reply_ist, reply_email),
+                "resolved": (reply_ist, reply_email),
+            }
+        )
+
+    blue_seen = set()
+    for episode in blue_direct_episodes:
+        key = (
+            episode["request"][0].replace(second=0, microsecond=0),
+            episode["ack"][0].replace(second=0, microsecond=0),
+            episode["resolved"][0].replace(second=0, microsecond=0),
+        )
+        if key in seen or key in blue_seen:
+            continue
+        blue_seen.add(key)
+        unique_episodes.append(episode)
+
     print("-" * 100)
     print("SIMULATED EPISODES")
     if not unique_episodes:
@@ -549,6 +967,86 @@ def _simulate_family(
             print(f"    req_found_in={source_email.subject}")
         print(f"    ack_from={ack_email.sender_email or ack_email.sender_name}")
         print(f"    resolved_from={res_email.sender_email or res_email.sender_name}")
+
+    print("-" * 100)
+    print("STRICT HEADER SIMULATED EPISODES")
+    if not unique_strict_episodes:
+        print("  <empty>")
+    for idx, episode in enumerate(unique_strict_episodes, start=1):
+        req_ist, req_email = episode["request"]
+        ack_ist, ack_email = episode["ack"]
+        res_ist, res_email = episode["resolved"]
+        print(
+            f"  episode={idx} | req={_fmt(req_ist)} | ack={_fmt(ack_ist)} | resolved={_fmt(res_ist)} | req_kind={episode['request_kind']}"
+        )
+        if episode["request_kind"] == "live":
+            print(f"    req_from={req_email.sender_email or req_email.sender_name}")
+        else:
+            source_email, header_candidate = req_email
+            print(f"    req_from_line={header_candidate.from_line}")
+            print(
+                f"    req_raw_sent={header_candidate.raw_sent or '<empty>'} | "
+                f"normalized={header_candidate.normalized_sent or '<empty>'} | "
+                f"has_am_pm={header_candidate.has_am_pm} | am_or_pm={header_candidate.am_or_pm or '-'} | "
+                f"ambiguous={header_candidate.is_ambiguous}"
+            )
+            if header_candidate.quoted_subj:
+                print(f"    req_quoted_subj={header_candidate.quoted_subj}")
+            print(f"    req_found_in={source_email.subject}")
+        print(f"    ack_from={ack_email.sender_email or ack_email.sender_name}")
+        print(f"    resolved_from={res_email.sender_email or res_email.sender_name}")
+
+    print("-" * 100)
+    print("REPLY-ANCHORED PREFERRED EPISODES")
+    found_preferred = False
+    for row in sorted(family_rows, key=lambda r: int(r.get("_line", 10**9))):
+        preferred = _reply_anchored_preferred_episode(
+            row,
+            live_requests,
+            quoted_requests,
+            strict_quoted_requests,
+            reply_candidates,
+        )
+        print(
+            f"  line={row.get('_line')} | requester={_get_col(row, 'Requester', 'Consultant')} | "
+            f"desc={_get_col(row, 'Description')}"
+        )
+        if not preferred:
+            print("    preferred=no reply-anchored episode found")
+            continue
+        found_preferred = True
+        req_ist, req_email = preferred["request"]
+        ack_ist, ack_email = preferred["ack"]
+        res_ist, res_email = preferred["resolved"]
+        print(
+            f"    preferred={_fmt(req_ist)} / {_fmt(ack_ist)} / {_fmt(res_ist)} | "
+            f"req_kind={preferred['request_kind']}"
+        )
+        if preferred["request_kind"].startswith("live"):
+            print(f"    req_from={req_email.sender_email or req_email.sender_name}")
+            print(f"    req_subject={req_email.subject}")
+        elif preferred["request_kind"].startswith("quoted-strict"):
+            source_email, header_candidate = req_email
+            print(f"    req_from_line={header_candidate.from_line}")
+            print(
+                f"    req_raw_sent={header_candidate.raw_sent or '<empty>'} | "
+                f"normalized={header_candidate.normalized_sent or '<empty>'} | "
+                f"has_am_pm={header_candidate.has_am_pm} | am_or_pm={header_candidate.am_or_pm or '-'} | "
+                f"ambiguous={header_candidate.is_ambiguous}"
+            )
+            if header_candidate.quoted_subj:
+                print(f"    req_quoted_subj={header_candidate.quoted_subj}")
+            print(f"    req_found_in={source_email.subject}")
+        else:
+            source_email, from_line, quoted_subj = req_email
+            print(f"    req_from_line={from_line}")
+            if quoted_subj:
+                print(f"    req_quoted_subj={quoted_subj}")
+            print(f"    req_found_in={source_email.subject}")
+        print(f"    reply_from={ack_email.sender_email or ack_email.sender_name}")
+        print(f"    reply_subject={ack_email.subject}")
+    if not found_preferred:
+        print("  <empty>")
 
     print("-" * 100)
     print("ROW SLOT SIMULATION")
