@@ -179,6 +179,9 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
 
     if post_process:
         post_process(ws, col_map, header_row)
+        resolved_unknowns = _clear_filled_yellow_rows(ws, col_map, header_row, yellow_fill)
+        if resolved_unknowns:
+            unknown = max(0, unknown - resolved_unknowns)
 
     _normalize_datetime_cells(ws, col_map, header_row)
 
@@ -327,6 +330,31 @@ def _write_comment(ws, row, comments_col, text):
 def _mark_row(ws, row, fill):
     for col in range(1, ws.max_column + 1):
         ws.cell(row, col).fill = fill
+
+
+def _fill_matches(cell_fill, target_fill) -> bool:
+    if not cell_fill or not target_fill:
+        return False
+    if str(getattr(cell_fill, "fill_type", "") or "") != str(getattr(target_fill, "fill_type", "") or ""):
+        return False
+    cell_rgb = str(getattr(getattr(cell_fill, "start_color", None), "rgb", "") or "").upper()
+    target_rgb = str(getattr(getattr(target_fill, "start_color", None), "rgb", "") or "").upper()
+    return bool(cell_rgb and target_rgb and cell_rgb == target_rgb)
+
+
+def _clear_filled_yellow_rows(ws, col_map, header_row, yellow_fill):
+    cleared = 0
+    clear_fill = PatternFill(fill_type=None)
+    for row in range(header_row + 1, ws.max_row + 1):
+        if not _fill_matches(ws.cell(row, 1).fill, yellow_fill):
+            continue
+        current_values = _build_row_context(ws, row, col_map)
+        required_missing, _reason = _is_unknown(current_values)
+        if required_missing:
+            continue
+        _mark_row(ws, row, clear_fill)
+        cleared += 1
+    return cleared
 
 
 def _is_unknown(resolved_values):

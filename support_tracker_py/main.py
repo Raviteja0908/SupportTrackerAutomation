@@ -291,12 +291,29 @@ def main() -> int:
     debug_rows = []
     same_time_rows = []
     row_states = []
+    _match_tokens_cache = {}
+    _interface_tokens_cache = {}
+    _inc_tokens_cache = {}
+    _sig_num_tokens_cache = {}
+    _part_tokens_cache = {}
+    _subject_for_match_cache = {}
+    _subject_family_similarity_cache = {}
+    _same_subject_family_cache = {}
+    _strong_identity_overlap_cache = {}
+    _fresh_picker_subject_safe_cache = {}
 
     def _match_tokens(text: str):
+        key = text or ""
+        cached = _match_tokens_cache.get(key)
+        if cached is not None:
+            return cached
         if not text:
-            return set()
-        t = re.sub(r"[^a-z0-9]+", " ", text.lower())
-        return {p for p in t.split() if p}
+            out = set()
+        else:
+            t = re.sub(r"[^a-z0-9]+", " ", text.lower())
+            out = {p for p in t.split() if p}
+        _match_tokens_cache[key] = out
+        return out
 
     def _id_like_tokens(text: str) -> set:
         if not text:
@@ -334,16 +351,22 @@ def main() -> int:
         return core.lower()
 
     def _part_tokens(text: str):
+        key = text or ""
+        cached = _part_tokens_cache.get(key)
+        if cached is not None:
+            return cached
         if not text:
-            return set()
-        t = text.lower()
-        tokens = set()
-        for m in re.findall(r"\bpt\s*\d+\b", t):
-            tokens.add(m.replace(" ", ""))
-        for m in re.findall(r"\bpart\s*\d+\b", t):
-            tokens.add(m.replace(" ", ""))
-        for m in re.findall(r"\bpt\d+\b", t):
-            tokens.add(m)
+            tokens = set()
+        else:
+            t = text.lower()
+            tokens = set()
+            for m in re.findall(r"\bpt\s*\d+\b", t):
+                tokens.add(m.replace(" ", ""))
+            for m in re.findall(r"\bpart\s*\d+\b", t):
+                tokens.add(m.replace(" ", ""))
+            for m in re.findall(r"\bpt\d+\b", t):
+                tokens.add(m)
+        _part_tokens_cache[key] = tokens
         return tokens
 
     def _extract_dr_ids(text: str):
@@ -470,57 +493,107 @@ def main() -> int:
         return (m.group(1).lower() if m else "")
 
     def _interface_tokens(text: str) -> set:
+        key = text or ""
+        cached = _interface_tokens_cache.get(key)
+        if cached is not None:
+            return cached
         if not text:
-            return set()
-        # Find all interface-like tokens anywhere in the subject
-        tokens = re.findall(r"\b[a-z]{1,5}\d{2,}\b", text, flags=re.IGNORECASE)
-        return {t.lower() for t in tokens}
+            out = set()
+        else:
+            tokens = re.findall(r"\b[a-z]{1,5}\d{2,}\b", text, flags=re.IGNORECASE)
+            out = {t.lower() for t in tokens}
+        _interface_tokens_cache[key] = out
+        return out
 
     def _inc_tokens(text: str) -> set:
+        key = text or ""
+        cached = _inc_tokens_cache.get(key)
+        if cached is not None:
+            return cached
         if not text:
-            return set()
-        # Incident tokens like INC2385330
-        tokens = re.findall(r"\binc\d{6,}\b", text, flags=re.IGNORECASE)
-        return {t.lower() for t in tokens}
+            out = set()
+        else:
+            tokens = re.findall(r"\binc\d{6,}\b", text, flags=re.IGNORECASE)
+            out = {t.lower() for t in tokens}
+        _inc_tokens_cache[key] = out
+        return out
 
     def _sig_num_tokens(text: str) -> set:
         """Return significant numeric tokens for disambiguation (exclude years)."""
+        key = text or ""
+        cached = _sig_num_tokens_cache.get(key)
+        if cached is not None:
+            return cached
         if not text:
-            return set()
-        out = set()
-        for n in re.findall(r"\b\d{3,5}\b", text):
-            try:
-                iv = int(n)
-            except Exception:
-                continue
-            if 1900 <= iv <= 2099:
-                continue
-            out.add(n)
+            out = set()
+        else:
+            out = set()
+            for n in re.findall(r"\b\d{3,5}\b", text):
+                try:
+                    iv = int(n)
+                except Exception:
+                    continue
+                if 1900 <= iv <= 2099:
+                    continue
+                out.add(n)
+        _sig_num_tokens_cache[key] = out
+        return out
+
+    def _normalize_subject_for_match_cached(text: str) -> str:
+        key = text or ""
+        cached = _subject_for_match_cache.get(key)
+        if cached is not None:
+            return cached
+        out = normalize_subject_for_match(key)
+        _subject_for_match_cache[key] = out
         return out
 
     def _subject_family_similarity(a: str, b: str) -> float:
-        a_norm = normalize_subject_for_match(a or "")
-        b_norm = normalize_subject_for_match(b or "")
+        cache_key = (a or "", b or "")
+        cached = _subject_family_similarity_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        a_norm = _normalize_subject_for_match_cached(a or "")
+        b_norm = _normalize_subject_for_match_cached(b or "")
         a_tokens = _match_tokens(a_norm)
         b_tokens = _match_tokens(b_norm)
         if not a_tokens or not b_tokens:
-            return 0.0
-        return _token_overlap_score(a_tokens, b_tokens)
+            out = 0.0
+        else:
+            out = _token_overlap_score(a_tokens, b_tokens)
+        _subject_family_similarity_cache[cache_key] = out
+        _subject_family_similarity_cache[(cache_key[1], cache_key[0])] = out
+        return out
 
     def _same_subject_family(a: str, b: str) -> bool:
-        a_norm = normalize_subject_for_match(a or "")
-        b_norm = normalize_subject_for_match(b or "")
+        cache_key = (a or "", b or "")
+        cached = _same_subject_family_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        a_norm = _normalize_subject_for_match_cached(a or "")
+        b_norm = _normalize_subject_for_match_cached(b or "")
         if not a_norm or not b_norm:
-            return False
-        if a_norm == b_norm:
-            return True
-        if (a_norm in b_norm or b_norm in a_norm) and _subject_family_similarity(a_norm, b_norm) >= 0.45:
-            return True
-        return False
+            out = False
+        elif a_norm == b_norm:
+            out = True
+        elif (a_norm in b_norm or b_norm in a_norm) and _subject_family_similarity(a_norm, b_norm) >= 0.45:
+            out = True
+        else:
+            out = False
+        _same_subject_family_cache[cache_key] = out
+        _same_subject_family_cache[(cache_key[1], cache_key[0])] = out
+        return out
 
     def _strong_identity_overlap(a: str, b: str) -> bool:
+        cache_key = (a or "", b or "")
+        cached = _strong_identity_overlap_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if not a or not b:
-            return False
+            out = False
+            _strong_identity_overlap_cache[cache_key] = out
+            _strong_identity_overlap_cache[(cache_key[1], cache_key[0])] = out
+            return out
         signal_pairs = (
             (_inc_tokens(a), _inc_tokens(b)),
             (_interface_tokens(a), _interface_tokens(b)),
@@ -528,24 +601,43 @@ def main() -> int:
             (_sig_num_tokens(a), _sig_num_tokens(b)),
             (_part_tokens(a), _part_tokens(b)),
         )
+        out = False
         for left, right in signal_pairs:
             if left and right and not left.isdisjoint(right):
-                return True
-        return False
+                out = True
+                break
+        _strong_identity_overlap_cache[cache_key] = out
+        _strong_identity_overlap_cache[(cache_key[1], cache_key[0])] = out
+        return out
 
     def _fresh_picker_subject_safe(subject_norm: str, key: str, iface_tokens=None, allow_added_inc: bool = False) -> bool:
         if not subject_norm or not key:
             return False
-        subj_norm = normalize_subject_for_match(subject_norm)
-        key_norm = normalize_subject_for_match(key)
+        cache_key = (
+            subject_norm or "",
+            key or "",
+            tuple(sorted(iface_tokens)) if iface_tokens else (),
+            bool(allow_added_inc),
+        )
+        cached = _fresh_picker_subject_safe_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        subj_norm = _normalize_subject_for_match_cached(subject_norm)
+        key_norm = _normalize_subject_for_match_cached(key)
         subj_inc_set = _inc_tokens(subj_norm)
         key_inc_set = _inc_tokens(key_norm)
         if not allow_added_inc and _defer_added_inc_identity(subj_inc_set, key_inc_set):
-            return False
+            out = False
+            _fresh_picker_subject_safe_cache[cache_key] = out
+            return out
         if _same_subject_family(subj_norm, key_norm):
-            return True
+            out = True
+            _fresh_picker_subject_safe_cache[cache_key] = out
+            return out
         if not _strong_identity_overlap(subj_norm, key_norm):
-            return False
+            out = False
+            _fresh_picker_subject_safe_cache[cache_key] = out
+            return out
         # Interface hints are only supporting signals. If the row subject itself
         # does not explicitly carry interface tokens, do not let inferred hints
         # become a hard rejection gate.
@@ -554,10 +646,14 @@ def main() -> int:
         hinted_iface_set = set(iface_tokens) if iface_tokens else set()
         key_iface_set = _interface_tokens(key_norm)
         if row_has_explicit_iface and key_iface_set and subj_iface_set.isdisjoint(key_iface_set):
-            return False
+            out = False
+            _fresh_picker_subject_safe_cache[cache_key] = out
+            return out
         similarity = _subject_family_similarity(subj_norm, key_norm)
         if similarity >= 0.55:
-            return True
+            out = True
+            _fresh_picker_subject_safe_cache[cache_key] = out
+            return out
         shared_num = _sig_num_tokens(subj_norm) & _sig_num_tokens(key_norm)
         shared_part = _part_tokens(subj_norm) & _part_tokens(key_norm)
         shared_iface = set()
@@ -566,7 +662,9 @@ def main() -> int:
         elif hinted_iface_set and key_iface_set:
             shared_iface = hinted_iface_set & key_iface_set
         shared_id = _id_like_tokens(subj_norm) & _id_like_tokens(key_norm)
-        return similarity >= 0.35 and bool(shared_num or shared_part or shared_iface or shared_id)
+        out = similarity >= 0.35 and bool(shared_num or shared_part or shared_iface or shared_id)
+        _fresh_picker_subject_safe_cache[cache_key] = out
+        return out
 
     def _find_hidden_subject_rescue(subject_norm: str, requester: str, date_tokens=None, iface_tokens=None, baseline_date=None):
         if not subject_norm or not requester:
@@ -5923,6 +6021,56 @@ def main() -> int:
             chosen = strict_reqs[-1] if strict_reqs else reqs[-1]
             return chosen
 
+        def _best_request_anchor_from_sources(merged_sources, subject_norm_value, row_tokens, row_id_tokens, upper_ist, max_gap):
+            if not merged_sources or not upper_ist:
+                return None
+
+            live_req_candidates = []
+            for cand in merged_sources:
+                cand_ist = _email_ist(cand)
+                if not cand_ist or cand_ist >= upper_ist:
+                    continue
+                if max_gap and (upper_ist - cand_ist) > max_gap:
+                    continue
+                if _ess_sender(cand) or _system_like_sender(cand):
+                    continue
+                if not _row_subject_match_email(cand, subject_norm_value, row_tokens, row_id_tokens):
+                    continue
+                live_req_candidates.append((cand_ist, cand))
+
+            quoted_req_candidates = []
+            for src in merged_sources:
+                q_req = _extract_quoted_request_before_ist(src, subject_norm_value, upper_ist)
+                if not q_req or q_req >= upper_ist:
+                    continue
+                if max_gap and (upper_ist - q_req) > max_gap:
+                    continue
+                quoted_req_candidates.append(q_req)
+
+            chosen_live_req_ist = _best_req_before_ack([t for t, _ in live_req_candidates], upper_ist) if live_req_candidates else None
+            chosen_live_req = None
+            if chosen_live_req_ist:
+                for cand_ist, cand in live_req_candidates:
+                    if cand_ist == chosen_live_req_ist:
+                        chosen_live_req = cand
+                        break
+
+            chosen_quoted_req = _best_req_before_ack(quoted_req_candidates, upper_ist) if quoted_req_candidates else None
+
+            if chosen_live_req and _email_ist(chosen_live_req):
+                return {
+                    "when": _email_ist(chosen_live_req),
+                    "src": chosen_live_req.sender_email or chosen_live_req.sender_name,
+                    "kind": "live",
+                }
+            if chosen_quoted_req:
+                return {
+                    "when": chosen_quoted_req,
+                    "src": "PARSED_FROM_QUOTED_REQUEST",
+                    "kind": "quoted",
+                }
+            return None
+
         # Build created-time list in row order.
         created_list = []
         for state in nonblue_row_states:
@@ -10117,6 +10265,8 @@ def main() -> int:
         raw_eml_quoted_cache = {}
         raw_eml_quoted_summary_cache = {}
         raw_eml_header_summary_cache = {}
+        raw_eml_episode_fallback_cache = {}
+        email_by_path_cache = {}
         raw_id_path_cache = {}
         eml_id_index = None
         def _get_quoted_blocks_with_subject_cached(msg):
@@ -10223,6 +10373,20 @@ def main() -> int:
             raw_eml_quoted_summary_cache[path] = summaries
             return summaries
 
+        def _email_for_path(path: str):
+            if not path:
+                return None
+            if path in email_by_path_cache:
+                return email_by_path_cache[path]
+            found = None
+            for e in emails:
+                e_path = str(getattr(e, "path", "") or "")
+                if e_path and e_path == path:
+                    found = e
+                    break
+            email_by_path_cache[path] = found
+            return found
+
         def _get_eml_header_summary(path: str):
             if not path:
                 return None
@@ -10262,6 +10426,206 @@ def main() -> int:
             }
             raw_eml_header_summary_cache[path] = summary
             return summary
+
+        def _final_confident_eml_episode(
+            subject_norm_value: str,
+            row_tokens: set,
+            row_id_tokens_set: set,
+            requester_name: str,
+            merged_sources: list,
+            quoted_pick_idx: int,
+            total_rows: int,
+            target_reply_ist,
+        ):
+            path_candidates = []
+            seen_paths = set()
+            for src in merged_sources or []:
+                src_path = str(getattr(src, "path", "") or "")
+                if src_path and src_path not in seen_paths:
+                    seen_paths.add(src_path)
+                    path_candidates.append(src_path)
+            for path in _find_eml_paths_by_id(row_id_tokens_set):
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    path_candidates.append(path)
+            cache_key = (
+                subject_norm_value or "",
+                requester_name or "",
+                tuple(path_candidates),
+                tuple(sorted(row_id_tokens_set)) if row_id_tokens_set else (),
+                int(quoted_pick_idx or 0),
+                int(total_rows or 0),
+                (
+                    target_reply_ist.replace(second=0, microsecond=0).isoformat()
+                    if target_reply_ist else ""
+                ),
+            )
+            cached = raw_eml_episode_fallback_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            if not path_candidates:
+                raw_eml_episode_fallback_cache[cache_key] = None
+                return None
+
+            candidate_episodes = []
+            for path in path_candidates:
+                header_summary = _get_eml_header_summary(path)
+                if not header_summary or not header_summary.get("sent_dt"):
+                    continue
+                header_ist = _to_ist(header_summary.get("sent_dt"))
+                if not header_ist:
+                    continue
+                header_subject_norm = header_summary.get("subject_norm") or normalize_subject(header_summary.get("subject_raw") or "")
+                header_ids = header_summary.get("subject_ids") or _id_like_tokens(header_subject_norm)
+                header_tokens = _match_tokens(header_subject_norm)
+                if not _quoted_subject_confirms_row(
+                    header_subject_norm,
+                    header_ids,
+                    header_tokens,
+                    subject_norm_value,
+                    row_tokens,
+                    row_id_tokens_set,
+                ):
+                    continue
+                header_email = _email_for_path(path)
+                sender_email = (header_summary.get("sender_email") or "").lower()
+                sender_domain = sender_email.split("@", 1)[-1] if "@" in sender_email else ""
+                is_ess_header = False
+                if header_email is not None:
+                    is_ess_header = _ess_sender(header_email)
+                else:
+                    is_ess_header = bool(
+                        (sender_email and sender_email in ess_email_set)
+                        or (sender_domain and sender_domain in ess_domain_set)
+                    )
+                if not is_ess_header:
+                    continue
+                if header_email is not None:
+                    ack_like_or_nonrequester = (
+                        _ack_like(header_email)
+                        or _ack_like_text_fallback(header_email)
+                        or _ess_only_short_ack(header_email)
+                        or (not _req_match(header_email, requester_name))
+                    )
+                    if not ack_like_or_nonrequester:
+                        continue
+
+                quoted_req_candidates = []
+                for from_line, sent_ist, q_subj in _get_quoted_blocks_from_eml_path(path):
+                    q_norm = normalize_subject(q_subj or "")
+                    q_ids = _id_like_tokens(q_norm)
+                    q_tokens = _match_tokens(q_norm)
+                    if q_subj and not _quoted_subject_confirms_row(
+                        q_norm,
+                        q_ids,
+                        q_tokens,
+                        subject_norm_value,
+                        row_tokens,
+                        row_id_tokens_set,
+                    ):
+                        continue
+                    addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", from_line, flags=re.I)
+                    if not addr_hits:
+                        is_ess = _ess_name_only(from_line)
+                    else:
+                        emails_l = [em.lower() for em in addr_hits]
+                        domains_l = [em.split("@", 1)[-1] for em in emails_l if "@" in em]
+                        is_ess = any(em in ess_email_set for em in emails_l) or any(d in ess_domain_set for d in domains_l)
+                    if is_ess:
+                        continue
+                    if sent_ist >= header_ist:
+                        continue
+                    if (header_ist - sent_ist) > timedelta(minutes=16):
+                        continue
+                    quoted_req_candidates.append(sent_ist)
+                if not quoted_req_candidates:
+                    continue
+                req_ist = _best_req_before_ack(sorted(quoted_req_candidates), header_ist)
+                if not req_ist:
+                    continue
+
+                reply_matches = []
+                for e in merged_sources or []:
+                    e_ist = _email_ist(e)
+                    if not e_ist or e_ist <= header_ist:
+                        continue
+                    if (e_ist - header_ist) > timedelta(hours=48):
+                        continue
+                    if not _ess_sender(e):
+                        continue
+                    cls = _shared_reply_classification(e)
+                    is_direct_resolution = bool(cls.get("direct_resolution"))
+                    if (
+                        (cls.get("ack_like") or cls.get("explicit_ack") or cls.get("short_ess_ack"))
+                        and not is_direct_resolution
+                    ):
+                        continue
+                    if cls.get("thanks_info") or cls.get("nonfinal_followup"):
+                        continue
+                    parent_ess, has_non_ess = _parent_sender_info(e)
+                    if (parent_ess is True) and (not has_non_ess):
+                        continue
+                    if not _row_subject_match_email(e, subject_norm_value, row_tokens, row_id_tokens_set):
+                        continue
+                    reply_matches.append(e)
+                if reply_matches:
+                    if target_reply_ist:
+                        reply_matches.sort(
+                            key=lambda e: (
+                                abs((_email_ist(e) - target_reply_ist).total_seconds()),
+                                _email_ist(e),
+                            )
+                        )
+                    else:
+                        reply_matches.sort(key=lambda e: _email_ist(e))
+                    reply_pick = reply_matches[0]
+                else:
+                    reply_pick = header_email
+
+                if reply_pick is None:
+                    continue
+                candidate_episodes.append(
+                    {
+                        "req_ist": req_ist,
+                        "ack_ist": header_ist,
+                        "reply": reply_pick,
+                        "req_src": "PARSED_FROM_RAW_EML_REQUEST",
+                    }
+                )
+
+            if not candidate_episodes:
+                raw_eml_episode_fallback_cache[cache_key] = None
+                return None
+
+            deduped = []
+            seen_episode_minutes = set()
+            for episode in sorted(candidate_episodes, key=lambda ep: (ep["ack_ist"], ep["req_ist"])):
+                minute_key = (
+                    episode["req_ist"].replace(second=0, microsecond=0),
+                    episode["ack_ist"].replace(second=0, microsecond=0),
+                )
+                if minute_key in seen_episode_minutes:
+                    continue
+                seen_episode_minutes.add(minute_key)
+                deduped.append(episode)
+
+            if total_rows and len(deduped) <= quoted_pick_idx:
+                raw_eml_episode_fallback_cache[cache_key] = None
+                return None
+
+            if target_reply_ist:
+                deduped.sort(
+                    key=lambda ep: (
+                        abs((_email_ist(ep["reply"]) - target_reply_ist).total_seconds()) if _email_ist(ep["reply"]) else float("inf"),
+                        ep["ack_ist"],
+                    )
+                )
+            else:
+                deduped.sort(key=lambda ep: ep["ack_ist"])
+
+            chosen = deduped[quoted_pick_idx] if total_rows and quoted_pick_idx < len(deduped) else deduped[0]
+            raw_eml_episode_fallback_cache[cache_key] = chosen
+            return chosen
 
         def _build_eml_id_index():
             nonlocal eml_id_index
@@ -11248,6 +11612,37 @@ def main() -> int:
                                 candidate_pairs_all.append((req_ist, ack_ist))
                     if candidate_pairs_all:
                         break
+            if not candidate_pairs_all:
+                for ack_msg in sorted(
+                    merged_msgs,
+                    key=lambda e: e.sent_time if getattr(e, "sent_time", None) else datetime.max,
+                ):
+                    ack_ist = _email_ist(ack_msg)
+                    if not ack_ist:
+                        continue
+                    if not _ess_sender(ack_msg):
+                        continue
+                    if not _row_subject_match_email(ack_msg, subject_norm, row_tokens, row_id_tokens):
+                        continue
+                    ack_like_or_nonrequester = (
+                        _ack_like(ack_msg)
+                        or _ack_like_text_fallback(ack_msg)
+                        or _ess_only_short_ack(ack_msg)
+                        or (not _req_match(ack_msg, requester))
+                    )
+                    if not ack_like_or_nonrequester:
+                        continue
+                    req_info = _best_request_anchor_from_sources(
+                        merged_msgs,
+                        subject_norm,
+                        row_tokens,
+                        row_id_tokens,
+                        ack_ist,
+                        timedelta(minutes=16),
+                    )
+                    if not req_info:
+                        continue
+                    candidate_pairs_all.append((req_info["when"], ack_ist))
             hybrid_pair_used = False
 
             if not candidate_pairs_all and row_id_tokens:
@@ -11555,13 +11950,26 @@ def main() -> int:
                                         if quoted_pick_idx < len(direct_replies)
                                         else None
                                     )
-                            direct_gap = _email_ist(direct_reply_candidate) - latest_quoted_req if direct_reply_candidate else None
+                            req_anchor_info = (
+                                _best_request_anchor_from_sources(
+                                    merged_msgs,
+                                    subject_norm,
+                                    row_tokens,
+                                    row_id_tokens,
+                                    _email_ist(direct_reply_candidate),
+                                    timedelta(hours=48),
+                                )
+                                if direct_reply_candidate else None
+                            )
+                            req_anchor_ist = latest_quoted_req or (req_anchor_info.get("when") if req_anchor_info else None)
+                            direct_gap = (_email_ist(direct_reply_candidate) - req_anchor_ist) if (direct_reply_candidate and req_anchor_ist) else None
                             if direct_gap and direct_gap <= timedelta(minutes=16):
                                 pair_req, pair_ack, pair_reply = (
-                                    latest_quoted_req,
+                                    req_anchor_ist,
                                     _email_ist(direct_reply_candidate),
                                     direct_reply_candidate,
                                 )
+                                pair_req_src = (req_anchor_info.get("src") if req_anchor_info else "PARSED_FROM_QUOTED_REQUEST")
                             else:
                                 direct_reply_gap_blue = True
                                 pair_req, pair_ack, pair_reply = None, None, None
@@ -11602,13 +12010,43 @@ def main() -> int:
                             direct_reply_candidate = direct_replies[0] if quoted_pick_idx == 0 else None
                         else:
                             direct_reply_candidate = direct_replies[quoted_pick_idx] if quoted_pick_idx < len(direct_replies) else None
-                    direct_gap = _email_ist(direct_reply_candidate) - latest_quoted_req
+                    req_anchor_info = (
+                        _best_request_anchor_from_sources(
+                            merged_msgs,
+                            subject_norm,
+                            row_tokens,
+                            row_id_tokens,
+                            _email_ist(direct_reply_candidate),
+                            timedelta(hours=48),
+                        )
+                        if direct_reply_candidate else None
+                    )
+                    req_anchor_ist = latest_quoted_req or (req_anchor_info.get("when") if req_anchor_info else None)
+                    direct_gap = (_email_ist(direct_reply_candidate) - req_anchor_ist) if (direct_reply_candidate and req_anchor_ist) else None
                     if direct_reply_candidate and direct_gap <= timedelta(minutes=16):
-                        pair_req = latest_quoted_req
+                        pair_req = req_anchor_ist
                         pair_ack = _email_ist(direct_reply_candidate)
                         pair_reply = direct_reply_candidate
+                        pair_req_src = (req_anchor_info.get("src") if req_anchor_info else "PARSED_FROM_QUOTED_REQUEST")
                     else:
                         direct_reply_gap_blue = True
+
+            if quoted_only and (not pair_req) and (not pair_ack) and (not direct_reply_gap_blue):
+                raw_eml_episode = _final_confident_eml_episode(
+                    subject_norm,
+                    row_tokens,
+                    row_id_tokens,
+                    requester,
+                    merged_msgs,
+                    quoted_pick_idx,
+                    quoted_pick_total,
+                    target_reply_ist,
+                )
+                if raw_eml_episode:
+                    pair_req = raw_eml_episode.get("req_ist")
+                    pair_ack = raw_eml_episode.get("ack_ist")
+                    pair_reply = raw_eml_episode.get("reply")
+                    pair_req_src = raw_eml_episode.get("req_src") or "PARSED_FROM_RAW_EML_REQUEST"
 
             if pair_req and pair_ack:
                 if quoted_only:
@@ -11738,6 +12176,8 @@ def main() -> int:
                             note_tag = "QuotedRequestOnlyHybridLiveAck"
                         elif quoted_only and resolved_pick and _email_ist(resolved_pick) == pair_ack:
                             note_tag = "QuotedRequestOnlyDirectReply"
+                        elif quoted_only and pair_req_src == "PARSED_FROM_RAW_EML_REQUEST":
+                            note_tag = "QuotedRequestOnlyRawEmlFallback"
                         else:
                             note_tag = "QuotedRequestOnlyReanchor" if quoted_only else "ESSOnlyQuotedPairReanchor"
                         debug_rows[list_index]["Notes"] = f"{debug_rows[list_index].get('Notes','')}; {note_tag}"
@@ -13907,6 +14347,7 @@ def main() -> int:
         _stage_timer_stop("risky_and_duplicate_repair_passes", risky_and_duplicate_started_at, items=len(row_states))
         if workbook_kind == "task_business":
             raw_task_candidate_cache = {}
+            task_request_anchor_cache = {}
             task_msgs_by_core = {}
             task_msgs_by_core_day = {}
             task_non_ess_msgs_by_core = {}
@@ -14015,6 +14456,38 @@ def main() -> int:
                     if not task_same_all and sent_minute <= created_minute:
                         return
                     candidate_picks.append((sent_ist, priority, src, note))
+
+                task_request_pool = (
+                    task_msgs_by_core.get(subject_core, [])
+                    if task_same_all
+                    else task_msgs_by_core_day.get((subject_core, ack_ist.date()), [])
+                )
+                if task_request_pool:
+                    anchor_cache_key = (
+                        subject_core,
+                        ack_ist.date().isoformat(),
+                        bool(task_same_all),
+                        tuple(sorted(row_id_tokens)),
+                        ack_minute.isoformat(),
+                    )
+                    request_anchor = task_request_anchor_cache.get(anchor_cache_key)
+                    if request_anchor is None:
+                        request_anchor = _best_request_anchor_from_sources(
+                            task_request_pool,
+                            subject_norm,
+                            _match_tokens(subject_norm),
+                            row_id_tokens,
+                            ack_ist,
+                            timedelta(hours=48) if task_same_all else timedelta(hours=24),
+                        )
+                        task_request_anchor_cache[anchor_cache_key] = request_anchor
+                    if request_anchor:
+                        _push_task_pick(
+                            request_anchor.get("when"),
+                            request_anchor.get("src") or "TASK_REQUEST_ANCHOR",
+                            "TaskRequestAnchor",
+                            0,
+                        )
 
                 live_pick_pool = (
                     task_non_ess_msgs_by_core.get(subject_core, [])
