@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import html
 import os
 import re
@@ -7,6 +8,9 @@ from zoneinfo import ZoneInfo
 import unicodedata
 
 from src.rules.subject_normalizer import normalize_subject, normalize_subject_for_match
+
+_quoted_header_datetime_cache = {}
+_bounded_outlook_header_cache = {}
 
 
 ACK_PHRASES = [
@@ -802,6 +806,99 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
             return timedelta(minutes=1) <= local_gap <= timedelta(minutes=max_gap_min)
         except Exception:
             return False
+
+    def _system_notification_episode():
+        if not system_notif_emails or not requester_name:
+            return None
+
+        requester_real = [
+            e for e in requester_emails
+            if _is_real_reply_candidate(e) and not _is_system_sender(e)
+        ]
+        if not requester_real:
+            return None
+
+        def _has_stronger_live_before(cap_dt):
+            for e in ordered:
+                if not getattr(e, "sent_time", None):
+                    continue
+                e_ist = _to_ist(e.sent_time)
+                if e_ist >= _to_ist(cap_dt):
+                    break
+                if _is_ess_sender(e, ess_team) or _is_system_sender(e):
+                    continue
+                if _match_requester(e.sender_name, e.sender_email, requester_name):
+                    continue
+                return True
+            return False
+
+        def _has_stronger_quoted_before(cap_dt):
+            for e in ordered:
+                parsed = _extract_request_time_from_email(
+                    e,
+                    ess_team,
+                    max_dt=cap_dt,
+                    subject_norm=subject_norm,
+                )
+                if parsed and _to_ist(parsed) < _to_ist(cap_dt):
+                    return True
+            return False
+
+        for sys_msg in reversed(system_notif_emails):
+            sys_dt = sys_msg.sent_time
+            ack_mail = _first_local_episode_ack_after(
+                ordered,
+                ess_team,
+                sys_dt,
+                requester_name=requester_name,
+                allow_requester_owned=False,
+            )
+            if ack_mail:
+                ack_dt = ack_mail.sent_time
+                if _has_stronger_live_before(ack_dt) or _has_stronger_quoted_before(ack_dt):
+                    continue
+                requester_after_ack = [
+                    e for e in requester_real
+                    if _to_ist(e.sent_time) > _to_ist(ack_dt)
+                ]
+                if not requester_after_ack:
+                    continue
+                resolved_pick = min(requester_after_ack, key=lambda e: _to_ist(e.sent_time))
+                return (
+                    TimeResult(
+                        _format_time(sys_dt),
+                        _format_time(ack_dt),
+                        _format_time(resolved_pick.sent_time),
+                    ),
+                    TimeDebug(
+                        sys_msg.sender_email or sys_msg.sender_name,
+                        ack_mail.sender_email or ack_mail.sender_name,
+                        resolved_pick.sender_email or resolved_pick.sender_name,
+                        "SystemNotificationEpisode[with-ack]",
+                    ),
+                )
+
+            requester_after_system = [
+                e for e in requester_real
+                if _to_ist(e.sent_time) > _to_ist(sys_dt)
+            ]
+            if not requester_after_system:
+                continue
+            reply_pick = max(requester_after_system, key=lambda e: _to_ist(e.sent_time))
+            if _has_stronger_live_before(reply_pick.sent_time) or _has_stronger_quoted_before(reply_pick.sent_time):
+                continue
+            t = _format_time(reply_pick.sent_time)
+            src = reply_pick.sender_email or reply_pick.sender_name
+            return (
+                TimeResult(t, t, t),
+                TimeDebug(src, "ACK NOT FOUND", src, "SystemNotificationEpisode[no-ack-all-same]"),
+            )
+
+        return None
+
+    system_notification_episode = _system_notification_episode()
+    if system_notification_episode:
+        return system_notification_episode
 
     # Global requester follow-up guard (non-hardcoded):
     # If requester posts a newer non-ack follow-up over requester/ESS mail and there is no
@@ -2748,6 +2845,210 @@ def _extract_thread_request_time_closest_before(
     return min(filtered, key=lambda dt: (anchor_ist - _to_ist(dt), -_to_ist(dt).timestamp()))
 
 
+@dataclass
+class _QuotedHeaderCandidate:
+    from_line: str
+    sent_line: str
+    to_line: str
+    subject_line: str
+    block_lines: tuple[str, ...]
+    sent_dt: datetime
+
+
+def _normalize_quoted_sent_text(value: str) -> str:
+    value = re.sub(r"(?i)^sent\b\s*:?\s*", "", value or "").strip()
+    value = re.sub(r"(?i)^(mon|tue|wed|thu|fri|sat|sun)\w*,?\s*", "", value).strip()
+    value = re.sub(r"\(.*?\)", " ", value).strip()
+    value = re.sub(r"(?i)(\d)(am|pm)\b", r"\1 \2", value)
+    value = re.sub(r"(?i)\b(a\.m\.|p\.m\.)\b", lambda m: m.group(1).replace(".", "").upper(), value)
+    return " ".join(value.replace(",", " ").replace(" at ", " ").split())
+
+
+def _parse_quoted_header_datetime(value: str):
+    if value in _quoted_header_datetime_cache:
+        return _quoted_header_datetime_cache[value]
+    raw_clean = re.sub(r"(?i)^sent\b\s*:?\s*", "", (value or "")).strip()
+    normalized = _normalize_quoted_sent_text(raw_clean)
+    candidates = []
+    for cand in (normalized, raw_clean):
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    has_am_pm = bool(re.search(r"(?i)\b(am|pm|a\.m\.|p\.m\.)\b", raw_clean))
+    fmts_24h = [
+        "%d %B %Y %H:%M:%S",
+        "%d %B %Y %H:%M",
+        "%d %b %Y %H:%M:%S",
+        "%d %b %Y %H:%M",
+        "%B %d %Y %H:%M:%S",
+        "%B %d %Y %H:%M",
+        "%b %d %Y %H:%M:%S",
+        "%b %d %Y %H:%M",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%A %d %B %Y %H:%M",
+        "%A %d %B %Y %H:%M:%S",
+        "%A %B %d %Y %H:%M",
+        "%A %B %d %Y %H:%M:%S",
+    ]
+    fmts_12h = [
+        "%d %B %Y %I:%M:%S %p",
+        "%d %B %Y %I:%M %p",
+        "%d %b %Y %I:%M:%S %p",
+        "%d %b %Y %I:%M %p",
+        "%B %d %Y %I:%M:%S %p",
+        "%B %d %Y %I:%M %p",
+        "%b %d %Y %I:%M:%S %p",
+        "%b %d %Y %I:%M %p",
+        "%d-%m-%Y %I:%M:%S %p",
+        "%d-%m-%Y %I:%M %p",
+        "%d.%m.%Y %I:%M:%S %p",
+        "%d.%m.%Y %I:%M %p",
+        "%d/%m/%Y %I:%M:%S %p",
+        "%d/%m/%Y %I:%M %p",
+        "%Y-%m-%d %I:%M:%S %p",
+        "%Y-%m-%d %I:%M %p",
+        "%A %B %d %Y %I:%M %p",
+        "%A %B %d %Y %I:%M:%S %p",
+        "%A %d %B %Y %I:%M %p",
+        "%A %d %B %Y %I:%M:%S %p",
+    ]
+    parse_fmts = fmts_12h if has_am_pm else fmts_24h
+    for cand in candidates:
+        for fmt in parse_fmts:
+            try:
+                parsed = datetime.strptime(cand, fmt)
+                _quoted_header_datetime_cache[value] = parsed
+                return parsed
+            except Exception:
+                continue
+    for cand in candidates:
+        try:
+            parsed = parsedate_to_datetime(cand)
+            if parsed:
+                _quoted_header_datetime_cache[value] = parsed
+                return parsed
+        except Exception:
+            pass
+        if has_am_pm:
+            for fmt in fmts_24h:
+                try:
+                    parsed = datetime.strptime(cand, fmt)
+                    _quoted_header_datetime_cache[value] = parsed
+                    return parsed
+                except Exception:
+                    continue
+    _quoted_header_datetime_cache[value] = None
+    return None
+
+
+def _extract_bounded_outlook_header_candidates(lines, allow_relaxed: bool = False):
+    cache_key = (tuple(lines or ()), bool(allow_relaxed))
+    cached = _bounded_outlook_header_cache.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    if not lines:
+        _bounded_outlook_header_cache[cache_key] = ()
+        return []
+
+    def _header_label(line: str):
+        m = re.match(r"(?i)^(from|sent|to|cc|bcc|subject|objet)\b\s*:?\s*(.*)$", line or "")
+        return m.group(1).lower() if m else None
+
+    def _header_value(line: str, label: str) -> str:
+        m = re.match(rf"(?i)^{label}\b\s*:?\s*(.*)$", line or "")
+        return (m.group(1) if m else "").strip()
+
+    def _from_start(line: str) -> bool:
+        if allow_relaxed:
+            return bool(re.search(r"(?i)\bfrom\b\s*:?", line or ""))
+        return bool(re.search(r"(?i)\bfrom\b\s*:", line or ""))
+
+    def _append_meridiem(sent_line: str, start_idx: int) -> str:
+        sent_low = (sent_line or "").lower()
+        if (" am" in sent_low) or (" pm" in sent_low):
+            return sent_line
+        for j in range(start_idx + 1, min(start_idx + 4, len(lines))):
+            extra = (lines[j] or "").strip()
+            if re.fullmatch(r"(?i)(am|pm|a\.m\.|p\.m\.)", extra):
+                return f"{sent_line} {extra}"
+        return sent_line
+
+    out = []
+    i = 0
+    while i < len(lines):
+        if not _from_start(lines[i]):
+            i += 1
+            continue
+        from_line = ""
+        sent_line = ""
+        to_line = ""
+        subject_line = ""
+        header_end = i
+        for j in range(i, min(i + 16, len(lines))):
+            cur = (lines[j] or "").strip()
+            if j > i and (_from_start(cur) or re.match(r"(?i)^[-_]{3,}$", cur)):
+                break
+            label = _header_label(cur)
+            if label == "from" and not from_line:
+                value = _header_value(cur, "from")
+                from_line = f"From: {value}" if value else "From:"
+                if (not value) and (j + 1) < len(lines):
+                    next_line = (lines[j + 1] or "").strip()
+                    if next_line and (_header_label(next_line) is None):
+                        from_line = f"From: {next_line}"
+                        header_end = j + 1
+            elif label == "sent" and not sent_line:
+                value = _header_value(cur, "sent")
+                sent_line = f"Sent: {value}" if value else "Sent:"
+                if (not value) and (j + 1) < len(lines):
+                    next_line = (lines[j + 1] or "").strip()
+                    if next_line and (_header_label(next_line) is None):
+                        sent_line = f"Sent: {next_line}"
+                        header_end = j + 1
+            elif label in {"to", "cc", "bcc"} and not to_line:
+                value = _header_value(cur, label)
+                to_line = f"{label.capitalize()}: {value}" if value else f"{label.capitalize()}:"
+            elif label in {"subject", "objet"} and not subject_line:
+                value = _header_value(cur, label)
+                prefix = "Subject" if label == "subject" else "Objet"
+                subject_line = f"{prefix}: {value}" if value else f"{prefix}:"
+                if (not value) and (j + 1) < len(lines):
+                    next_line = (lines[j + 1] or "").strip()
+                    if next_line and (_header_label(next_line) is None):
+                        subject_line = f"{prefix}: {next_line}"
+                        header_end = j + 1
+            elif j > i and label is None and sent_line and (subject_line or from_line):
+                header_end = j - 1
+                break
+            header_end = j
+
+        if sent_line:
+            sent_line = _append_meridiem(sent_line, header_end)
+            sent_dt = _parse_quoted_header_datetime(sent_line)
+            if sent_dt:
+                block_lines = tuple((lines[k] or "").strip() for k in range(i, min(header_end + 1, len(lines))))
+                out.append(
+                    _QuotedHeaderCandidate(
+                        from_line=from_line,
+                        sent_line=sent_line,
+                        to_line=to_line,
+                        subject_line=subject_line,
+                        block_lines=block_lines,
+                        sent_dt=sent_dt,
+                    )
+                )
+        i = max(i + 1, header_end + 1)
+    _bounded_outlook_header_cache[cache_key] = tuple(out)
+    return list(_bounded_outlook_header_cache[cache_key])
+
+
 def _extract_outlook_block_sent(
     lines,
     max_dt: datetime | None = None,
@@ -2756,6 +3057,49 @@ def _extract_outlook_block_sent(
     exclude_system: bool = False,
     subject_norm: str | None = None,
 ):
+    bounded_candidates = []
+    for candidate in _extract_bounded_outlook_header_candidates(lines, allow_relaxed=False):
+        from_line = candidate.from_line
+        to_line = candidate.to_line
+        subject_line = candidate.subject_line
+        if subject_norm and not _subject_line_matches(subject_line, subject_norm):
+            continue
+        if _is_empty_header_value(from_line):
+            from_line = ""
+        inferred_from = ""
+        if not from_line:
+            inferred_from = _infer_from_line_from_block(candidate.block_lines)
+
+        effective_from = from_line or inferred_from
+        missing_from = not effective_from
+        allow_missing_from = False
+        if subject_norm and missing_from:
+            continue
+        if missing_from and (require_non_ess or exclude_system):
+            if _to_line_has_ess_dl(to_line) and subject_line and not _block_has_system_token(candidate.block_lines):
+                allow_missing_from = True
+            else:
+                continue
+        if subject_norm:
+            if not effective_from:
+                continue
+            if ess_team is not None and _is_ess_from_line(effective_from, ess_team):
+                continue
+        if require_non_ess and ess_team is not None and not missing_from:
+            if _is_ess_from_line(effective_from, ess_team):
+                continue
+        if exclude_system and not missing_from:
+            if _is_system_from_line(effective_from):
+                continue
+        if exclude_system and missing_from and not allow_missing_from:
+            continue
+        dt = candidate.sent_dt
+        if max_dt and _to_ist(dt) > _to_ist(max_dt):
+            continue
+        bounded_candidates.append(dt)
+    if bounded_candidates:
+        return max(bounded_candidates, key=_to_ist)
+
     # Look for blocks containing From/Sent/To/Subject
     block = []
     blocks = []
@@ -2844,6 +3188,49 @@ def _extract_outlook_block_sent_candidates(
     exclude_system: bool = False,
     subject_norm: str | None = None,
 ):
+    bounded_candidates = []
+    for candidate in _extract_bounded_outlook_header_candidates(lines, allow_relaxed=False):
+        from_line = candidate.from_line
+        to_line = candidate.to_line
+        subject_line = candidate.subject_line
+        if subject_norm and not _subject_line_matches(subject_line, subject_norm):
+            continue
+        if _is_empty_header_value(from_line):
+            from_line = ""
+        inferred_from = ""
+        if not from_line:
+            inferred_from = _infer_from_line_from_block(candidate.block_lines)
+
+        effective_from = from_line or inferred_from
+        missing_from = not effective_from
+        allow_missing_from = False
+        if subject_norm and missing_from:
+            continue
+        if missing_from and (require_non_ess or exclude_system):
+            if _to_line_has_ess_dl(to_line) and subject_line and not _block_has_system_token(candidate.block_lines):
+                allow_missing_from = True
+            else:
+                continue
+        if subject_norm:
+            if not effective_from:
+                continue
+            if ess_team is not None and _is_ess_from_line(effective_from, ess_team):
+                continue
+        if require_non_ess and ess_team is not None and not missing_from:
+            if _is_ess_from_line(effective_from, ess_team):
+                continue
+        if exclude_system and not missing_from:
+            if _is_system_from_line(effective_from):
+                continue
+        if exclude_system and missing_from and not allow_missing_from:
+            continue
+        dt = candidate.sent_dt
+        if max_dt and _to_ist(dt) > _to_ist(max_dt):
+            continue
+        bounded_candidates.append(dt)
+    if bounded_candidates:
+        return bounded_candidates
+
     block = []
     blocks = []
     for line in lines:

@@ -228,7 +228,8 @@ def _parse_quoted_sent_time(sent_line: str) -> datetime | None:
     for candidate in (text, normalized):
         if candidate and candidate not in candidates:
             candidates.append(candidate)
-    fmts = [
+    has_am_pm = bool(re.search(r"(?i)\b(am|pm|a\.m\.|p\.m\.)\b", sent_line or ""))
+    fmts_24h = [
         "%d %B %Y %H:%M:%S",
         "%d %B %Y %H:%M",
         "%d %b %Y %H:%M:%S",
@@ -241,37 +242,50 @@ def _parse_quoted_sent_time(sent_line: str) -> datetime | None:
         "%d %B %Y %I:%M %p",
         "%d %b %Y %I:%M:%S %p",
         "%d %b %Y %I:%M %p",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ]
+    fmts_12h = [
+        "%d %B %Y %I:%M:%S %p",
+        "%d %B %Y %I:%M %p",
+        "%d %b %Y %I:%M:%S %p",
+        "%d %b %Y %I:%M %p",
         "%B %d %Y %I:%M:%S %p",
         "%B %d %Y %I:%M %p",
         "%b %d %Y %I:%M:%S %p",
         "%b %d %Y %I:%M %p",
-        "%d-%m-%Y %H:%M:%S",
-        "%d-%m-%Y %H:%M",
         "%d-%m-%Y %I:%M:%S %p",
         "%d-%m-%Y %I:%M %p",
-        "%d.%m.%Y %H:%M:%S",
-        "%d.%m.%Y %H:%M",
         "%d.%m.%Y %I:%M:%S %p",
         "%d.%m.%Y %I:%M %p",
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M",
         "%d/%m/%Y %I:%M:%S %p",
         "%d/%m/%Y %I:%M %p",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
         "%Y-%m-%d %I:%M:%S %p",
         "%Y-%m-%d %I:%M %p",
     ]
+    parse_fmts = fmts_12h if has_am_pm else fmts_24h
     for candidate in candidates:
-        try:
-            return parsedate_to_datetime(candidate)
-        except Exception:
-            pass
-        for fmt in fmts:
+        for fmt in parse_fmts:
             try:
                 return datetime.strptime(candidate, fmt)
             except Exception:
                 continue
+        try:
+            return parsedate_to_datetime(candidate)
+        except Exception:
+            pass
+        if has_am_pm:
+            for fmt in fmts_24h:
+                try:
+                    return datetime.strptime(candidate, fmt)
+                except Exception:
+                    continue
     return None
 
 

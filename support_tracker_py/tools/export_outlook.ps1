@@ -15,7 +15,7 @@ if ($env:EXCLUDE_CREATION_TIME) {
 
 Write-Host "Outlook export (PST append) - copy only, no move"
 Write-Host ("Start time: {0}" -f (Get-Date))
-Write-Host "Export script version: 2026-02-05-1"
+Write-Host "Export script version: 2026-04-06-1"
 Write-Host "Prompt commands: type back to go to the previous step when supported, or quit to exit."
 Write-Host ""
 
@@ -906,7 +906,7 @@ if (-not $destStore) {
 $destRoot = $destStore.GetRootFolder()
 $inbox = $namespace.GetDefaultFolder(6) # olFolderInbox
 
-Write-Host "Date filter (daily chunks): $($startDateObj.ToString('dd-MM-yyyy')) to $($endDateObj.ToString('dd-MM-yyyy'))"
+Write-Host "Date filter (range-first with failed-day retry): $($startDateObj.ToString('dd-MM-yyyy')) to $($endDateObj.ToString('dd-MM-yyyy'))"
 Write-Host "Folders to export:"
 if ($folderPaths.Count -eq 0) {
     Write-Host " - (none)"
@@ -1048,23 +1048,26 @@ function Get-Item-Date {
     return @($null, $false)
 }
 
-function Export-Folder {
+function Export-FolderWindow {
     param(
         [object]$sourceFolder,
         [string]$relativePath,
-        [DateTime]$dayStart,
-        [DateTime]$dayEnd
+        [DateTime]$windowStart,
+        [DateTime]$windowEnd,
+        [string]$windowLabel = ""
     )
 
     $destFolder = Get-OrCreate-Folder -root $destRoot -relativePath $relativePath
     $count = 0
     $processed = 0
+    $copyErrors = 0
+    $sampleErrors = New-Object System.Collections.Generic.List[string]
     $progressEvery = 100
     $folderStart = Get-Date
 
     $items = $sourceFolder.Items
-    $startSql = $dayStart.ToString("yyyy-MM-dd HH:mm")
-    $endSql = $dayEnd.ToString("yyyy-MM-dd HH:mm")
+    $startSql = $windowStart.ToString("yyyy-MM-dd HH:mm")
+    $endSql = $windowEnd.ToString("yyyy-MM-dd HH:mm")
     if ($fastExport) {
         $sql = "@SQL=""urn:schemas:httpmail:datereceived"" >= '$startSql' AND ""urn:schemas:httpmail:datereceived"" <= '$endSql'"
     } else {
@@ -1079,6 +1082,7 @@ function Export-Folder {
     }
 
     $filtered = $null
+    $usedFilterMode = "manual"
     try {
         $filtered = $items.Restrict($sql)
     } catch {
@@ -1087,6 +1091,7 @@ function Export-Folder {
 
     $forceManual = $false
     if ($filtered -ne $null) {
+        $usedFilterMode = "sql"
         Write-Host "SQL Restrict succeeded."
         Write-Host "Using SQL Restrict filter..."
         try {
@@ -1123,6 +1128,10 @@ function Export-Folder {
                         Write-Host ("  Processed {0} items | Exported {1} | Current Time: {2}" -f $processed, $count, $rt)
                     }
                 } catch {
+                    $copyErrors++
+                    if ($sampleErrors.Count -lt 5) {
+                        $sampleErrors.Add($_.Exception.Message) | Out-Null
+                    }
                     continue
                 }
             }
@@ -1157,41 +1166,211 @@ function Export-Folder {
                     Write-Host ("  Processed {0} items | Exported {1} | Current Time: {2}" -f $processed, $count, $rt)
                 }
             } catch {
+                $copyErrors++
+                if ($sampleErrors.Count -lt 5) {
+                    $sampleErrors.Add($_.Exception.Message) | Out-Null
+                }
                 continue
             }
         }
     }
 
     $elapsed = (Get-Date) - $folderStart
-    Write-Host ("Exported {0} items from {1} | Time: {2}" -f $count, $relativePath, $elapsed.ToString())
+    if ([string]::IsNullOrWhiteSpace($windowLabel)) {
+        $windowLabel = "{0} -> {1}" -f $windowStart.ToString("dd-MM-yyyy HH:mm"), $windowEnd.ToString("dd-MM-yyyy HH:mm")
+    }
+    Write-Host ("Exported {0} items from {1} for {2} | Time: {3}" -f $count, $relativePath, $windowLabel, $elapsed.ToString())
+    if ($copyErrors -gt 0) {
+        Write-Host ("WARNING: {0} item(s) could not be copied in {1} for {2}." -f $copyErrors, $relativePath, $windowLabel)
+        foreach ($sample in $sampleErrors) {
+            Write-Host ("  Copy warning: {0}" -f $sample)
+        }
+    }
 
     # No subfolder export (explicit folders only)
+    return [PSCustomObject]@{
+        RelativePath = $relativePath
+        WindowStart  = $windowStart
+        WindowEnd    = $windowEnd
+        WindowLabel  = $windowLabel
+        Exported     = $count
+        Processed    = $processed
+        CopyErrors   = $copyErrors
+        FilterMode   = $usedFilterMode
+    }
+}
+
+function Invoke-FolderExportWithRetry {
+    param(
+        [object]$sourceFolder,
+        [string]$relativePath,
+        [DateTime]$rangeStart,
+        [DateTime]$rangeEnd
+    )
+
+    $folderResults = New-Object System.Collections.Generic.List[object]
+    $failedDays = New-Object System.Collections.Generic.List[DateTime]
+    $rangeLabel = "{0} to {1}" -f $rangeStart.ToString("dd-MM-yyyy"), $rangeEnd.ToString("dd-MM-yyyy")
+    $fullRangeStart = $rangeStart.Date
+    $fullRangeEnd = $rangeEnd.Date.AddDays(1).AddSeconds(-1)
+
+    Write-Host ("Exporting full range for folder: {0} | {1}" -f $relativePath, $rangeLabel)
+    try {
+        $rangeResult = Export-FolderWindow -sourceFolder $sourceFolder -relativePath $relativePath -windowStart $fullRangeStart -windowEnd $fullRangeEnd -windowLabel $rangeLabel
+        $folderResults.Add([PSCustomObject]@{
+            Folder         = $relativePath
+            Scope          = "range"
+            WindowLabel    = $rangeLabel
+            Success        = $true
+            RetryAttempt   = 0
+            Exported       = $rangeResult.Exported
+            CopyErrors     = $rangeResult.CopyErrors
+            FilterMode     = $rangeResult.FilterMode
+            ErrorMessage   = $null
+        }) | Out-Null
+        Write-Host ("SUCCESS: Exported folder {0} for full range." -f $relativePath)
+        return $folderResults
+    } catch {
+        $rangeError = $_.Exception.Message
+        Write-Host ("WARNING: Full-range export failed for {0}: {1}" -f $relativePath, $rangeError)
+        Write-Host ("Falling back to day-by-day export for {0} so we can retry only exact failed dates." -f $relativePath)
+        $folderResults.Add([PSCustomObject]@{
+            Folder         = $relativePath
+            Scope          = "range"
+            WindowLabel    = $rangeLabel
+            Success        = $false
+            RetryAttempt   = 0
+            Exported       = 0
+            CopyErrors     = 0
+            FilterMode     = $null
+            ErrorMessage   = $rangeError
+        }) | Out-Null
+    }
+
+    for ($day = $rangeStart.Date; $day -le $rangeEnd.Date; $day = $day.AddDays(1)) {
+        $dayStart = $day
+        $dayEnd = $day.AddDays(1).AddSeconds(-1)
+        $dayLabel = $day.ToString("dd-MM-yyyy")
+        try {
+            Write-Host ("Trying day export: {0} | {1}" -f $relativePath, $dayLabel)
+            $dayResult = Export-FolderWindow -sourceFolder $sourceFolder -relativePath $relativePath -windowStart $dayStart -windowEnd $dayEnd -windowLabel $dayLabel
+            $folderResults.Add([PSCustomObject]@{
+                Folder         = $relativePath
+                Scope          = "day"
+                WindowLabel    = $dayLabel
+                Success        = $true
+                RetryAttempt   = 0
+                Exported       = $dayResult.Exported
+                CopyErrors     = $dayResult.CopyErrors
+                FilterMode     = $dayResult.FilterMode
+                ErrorMessage   = $null
+            }) | Out-Null
+            Write-Host ("SUCCESS: Exported {0} for {1}." -f $relativePath, $dayLabel)
+        } catch {
+            $dayError = $_.Exception.Message
+            $failedDays.Add($day) | Out-Null
+            $folderResults.Add([PSCustomObject]@{
+                Folder         = $relativePath
+                Scope          = "day"
+                WindowLabel    = $dayLabel
+                Success        = $false
+                RetryAttempt   = 0
+                Exported       = 0
+                CopyErrors     = 0
+                FilterMode     = $null
+                ErrorMessage   = $dayError
+            }) | Out-Null
+            Write-Host ("FAILED: Export failed for {0} on {1}: {2}" -f $relativePath, $dayLabel, $dayError)
+        }
+    }
+
+    if ($failedDays.Count -gt 0) {
+        Write-Host ("Retrying exact failed date(s) for {0}: {1}" -f $relativePath, (($failedDays | ForEach-Object { $_.ToString('dd-MM-yyyy') }) -join ", "))
+    }
+    foreach ($failedDay in $failedDays) {
+        $retryStart = $failedDay.Date
+        $retryEnd = $retryStart.AddDays(1).AddSeconds(-1)
+        $retryLabel = $retryStart.ToString("dd-MM-yyyy")
+        try {
+            $retryResult = Export-FolderWindow -sourceFolder $sourceFolder -relativePath $relativePath -windowStart $retryStart -windowEnd $retryEnd -windowLabel ("Retry " + $retryLabel)
+            $folderResults.Add([PSCustomObject]@{
+                Folder         = $relativePath
+                Scope          = "retry-day"
+                WindowLabel    = $retryLabel
+                Success        = $true
+                RetryAttempt   = 1
+                Exported       = $retryResult.Exported
+                CopyErrors     = $retryResult.CopyErrors
+                FilterMode     = $retryResult.FilterMode
+                ErrorMessage   = $null
+            }) | Out-Null
+            Write-Host ("RETRY SUCCESS: Exported {0} for failed day {1}." -f $relativePath, $retryLabel)
+        } catch {
+            $retryError = $_.Exception.Message
+            $folderResults.Add([PSCustomObject]@{
+                Folder         = $relativePath
+                Scope          = "retry-day"
+                WindowLabel    = $retryLabel
+                Success        = $false
+                RetryAttempt   = 1
+                Exported       = 0
+                CopyErrors     = 0
+                FilterMode     = $null
+                ErrorMessage   = $retryError
+            }) | Out-Null
+            Write-Host ("RETRY FAILED: Export still failed for {0} on {1}: {2}" -f $relativePath, $retryLabel, $retryError)
+        }
+    }
+
+    return $folderResults
 }
 
 $exportResult = $null
 try {
-    for ($day = $startDateObj; $day -le $endDateObj; $day = $day.AddDays(1)) {
-        $dayStart = $day
-        $dayEnd = $day.AddDays(1).AddSeconds(-1)
-        Write-Host ("--- Exporting day: {0} ---" -f $day.ToString("dd-MM-yyyy"))
-        foreach ($path in $folderPaths) {
-            $sourceFolder = Resolve-SourceFolder -path $path
-            if (-not $sourceFolder) {
-                continue
-            }
-            Write-Host "Exporting folder: $path"
-            Export-Folder -sourceFolder $sourceFolder -relativePath $path -dayStart $dayStart -dayEnd $dayEnd
+    $allExportLogs = New-Object System.Collections.Generic.List[object]
+    foreach ($path in $folderPaths) {
+        $sourceFolder = Resolve-SourceFolder -path $path
+        if (-not $sourceFolder) {
+            Write-Host ("SKIPPED: Could not resolve folder {0}" -f $path)
+            $allExportLogs.Add([PSCustomObject]@{
+                Folder         = $path
+                Scope          = "folder"
+                WindowLabel    = "n/a"
+                Success        = $false
+                RetryAttempt   = 0
+                Exported       = 0
+                CopyErrors     = 0
+                FilterMode     = $null
+                ErrorMessage   = "Folder could not be resolved."
+            }) | Out-Null
+            continue
+        }
+
+        foreach ($log in (Invoke-FolderExportWithRetry -sourceFolder $sourceFolder -relativePath $path -rangeStart $startDateObj -rangeEnd $endDateObj)) {
+            $allExportLogs.Add($log) | Out-Null
         }
     }
 
     Write-Host "Export completed."
     Write-Host "PST written to: $OutputPstPath"
+    Write-Host "Export summary:"
+    foreach ($log in $allExportLogs) {
+        $status = if ($log.Success) { "SUCCESS" } else { "FAILED" }
+        $retryText = if ($log.RetryAttempt -gt 0) { "retry $($log.RetryAttempt)" } else { "initial" }
+        $extra = if ($log.Success) {
+            "exported=$($log.Exported); copyErrors=$($log.CopyErrors); mode=$($log.FilterMode)"
+        } else {
+            "error=$($log.ErrorMessage)"
+        }
+        Write-Host (" - {0} | folder={1} | scope={2} | window={3} | attempt={4} | {5}" -f $status, $log.Folder, $log.Scope, $log.WindowLabel, $retryText, $extra)
+    }
 
     $exportResult = [PSCustomObject]@{
         OutputPstPath = $OutputPstPath
         StartDate     = $StartDate
         EndDate       = $EndDate
         FolderPaths   = @($folderPaths)
+        Logs          = @($allExportLogs)
     }
 } finally {
     if ($destRoot) {
