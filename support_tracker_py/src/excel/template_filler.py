@@ -130,6 +130,7 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     yellow_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
     blue_fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    clear_fill = PatternFill(fill_type=None)
 
     filled = 0
     maintenance = 0
@@ -173,6 +174,8 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
         if mark_blue:
             _mark_row(ws, row, blue_fill)
             _write_comment(ws, row, comments_col, MarkingReason.blue)
+        else:
+            _clear_row_if_fill_matches(ws, row, yellow_fill, clear_fill)
 
         _write_values(ws, row, col_map, resolved)
         filled += 1
@@ -332,6 +335,18 @@ def _mark_row(ws, row, fill):
         ws.cell(row, col).fill = fill
 
 
+def _row_has_fill(ws, row, target_fill) -> bool:
+    for col in range(1, ws.max_column + 1):
+        if _fill_matches(ws.cell(row, col).fill, target_fill):
+            return True
+    return False
+
+
+def _clear_row_if_fill_matches(ws, row, target_fill, clear_fill):
+    if _row_has_fill(ws, row, target_fill):
+        _mark_row(ws, row, clear_fill)
+
+
 def _fill_matches(cell_fill, target_fill) -> bool:
     if not cell_fill or not target_fill:
         return False
@@ -346,13 +361,13 @@ def _clear_filled_yellow_rows(ws, col_map, header_row, yellow_fill):
     cleared = 0
     clear_fill = PatternFill(fill_type=None)
     for row in range(header_row + 1, ws.max_row + 1):
-        if not _fill_matches(ws.cell(row, 1).fill, yellow_fill):
+        if not _row_has_fill(ws, row, yellow_fill):
             continue
         current_values = _build_row_context(ws, row, col_map)
         required_missing, _reason = _is_unknown(current_values)
         if required_missing:
             continue
-        _mark_row(ws, row, clear_fill)
+        _clear_row_if_fill_matches(ws, row, yellow_fill, clear_fill)
         cleared += 1
     return cleared
 

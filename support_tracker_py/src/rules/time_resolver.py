@@ -6,11 +6,30 @@ import os
 import re
 from zoneinfo import ZoneInfo
 import unicodedata
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
 
 from src.rules.subject_normalizer import normalize_subject, normalize_subject_for_match
 
 _quoted_header_datetime_cache = {}
 _bounded_outlook_header_cache = {}
+_trace_row_subject_filter = (os.getenv("TRACE_ROW_SUBJECT") or "").strip().lower()
+
+
+def _trace_focus_row(subject_norm: str | None, phase: str, **fields):
+    if not _trace_row_subject_filter:
+        return
+    subject_blob = (subject_norm or "").lower()
+    if _trace_row_subject_filter not in subject_blob:
+        return
+    parts = [f"[TRACE-ROW-BASE] {phase}"]
+    if subject_norm:
+        parts.append(f"subject={subject_norm}")
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    print(" | ".join(parts))
 
 
 ACK_PHRASES = [
@@ -2021,6 +2040,13 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 created_time = first.sent_time
                 created_src = "CREATED_CLAMPED_TO_FIRST"
                 notes = "Created clamped to first email"
+                _trace_focus_row(
+                    subject_norm,
+                    "created_clamped_to_first",
+                    created=_format_time(created_time),
+                    created_src=created_src,
+                    first=_format_time(first.sent_time),
+                )
         except Exception:
             pass
 
@@ -2140,6 +2166,15 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                                 notes = "Created anchored to response time"
                             else:
                                 notes = "Created retained (response anchor unreliable)"
+                                _trace_focus_row(
+                                    subject_norm,
+                                    "created_retained_response_anchor_unreliable",
+                                    created=_format_time(created_time),
+                                    response=response_time,
+                                    resolved=resolved_time,
+                                    created_src=created_src,
+                                    ack_src=ack_src,
+                                )
                         else:
                             # Keep original created when no request can be found.
                             # This avoids converting "request created" into ack/response time.
@@ -2287,19 +2322,29 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
     except Exception:
         pass
 
-    return (
-        TimeResult(
-            _format_time(created_time),
-            response_time,
-            resolved_time,
-        ),
-        TimeDebug(
-            created_src or (created_mail.sender_email if created_mail else ""),
-            ack_src,
-            resolved_mail.sender_email if resolved_mail else (created_src or ""),
-            notes,
-        ),
+    result = TimeResult(
+        _format_time(created_time),
+        response_time,
+        resolved_time,
     )
+    debug = TimeDebug(
+        created_src or (created_mail.sender_email if created_mail else ""),
+        ack_src,
+        resolved_mail.sender_email if resolved_mail else (created_src or ""),
+        notes,
+    )
+    _trace_focus_row(
+        subject_norm,
+        "resolve_times_with_debug:return",
+        created=result.created,
+        response=result.response,
+        resolved=result.resolved,
+        created_src=debug.created_src,
+        ack_src=debug.ack_src,
+        resolved_src=debug.resolved_src,
+        notes=debug.notes,
+    )
+    return (result, debug)
 
 
 def _has_ack_phrase(ordered, ess_team) -> bool:
@@ -2669,7 +2714,7 @@ def _extract_request_time_from_body(
 ):
     if not body:
         return None
-    lines = [_clean_quote_line(line) for line in body.splitlines() if line.strip()]
+    lines = _body_to_clean_lines(body)
     block_dt = _extract_outlook_block_sent(
         lines,
         max_dt,
@@ -2691,7 +2736,7 @@ def _extract_request_time_candidates_from_body(
 ):
     if not body:
         return []
-    lines = [_clean_quote_line(line) for line in body.splitlines() if line.strip()]
+    lines = _body_to_clean_lines(body)
     candidates = []
     block_candidates = _extract_outlook_block_sent_candidates(
         lines,
@@ -2869,12 +2914,53 @@ def _parse_quoted_header_datetime(value: str):
         return _quoted_header_datetime_cache[value]
     raw_clean = re.sub(r"(?i)^sent\b\s*:?\s*", "", (value or "")).strip()
     normalized = _normalize_quoted_sent_text(raw_clean)
+
+    def _extract_primary_sent_fragments(*values: str):
+        regexes = [
+            r"\b[A-Za-z]+,\s+\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[APMapm]{2}\b",
+            r"\b[A-Za-z]+,\s+\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\b",
+            r"\b[A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[APMapm]{2}\b",
+            r"\b[A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\b",
+            r"\b\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[APMapm]{2}\b",
+            r"\b\d{1,2}\s+[A-Za-z]+\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\b",
+            r"\b\d{1,2}[-./]\d{1,2}[-./]\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[APMapm]{2}\b",
+            r"\b\d{1,2}[-./]\d{1,2}[-./]\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\b",
+            r"\b\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[APMapm]{2}\b",
+            r"\b\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?\b",
+        ]
+        out = []
+        seen = set()
+        for candidate_value in values:
+            text = (candidate_value or "").strip()
+            if not text:
+                continue
+            matches = []
+            for rx in regexes:
+                for match in re.finditer(rx, text):
+                    frag = match.group(0).strip()
+                    key = frag.lower()
+                    if key in seen:
+                        continue
+                    matches.append((match.start(), -len(frag), frag))
+            matches.sort()
+            for _, _, frag in matches:
+                key = frag.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(frag)
+            if out:
+                break
+        return out
+
     candidates = []
+    for cand in _extract_primary_sent_fragments(raw_clean, normalized):
+        if cand and cand not in candidates:
+            candidates.append(cand)
     for cand in (normalized, raw_clean):
         if cand and cand not in candidates:
             candidates.append(cand)
 
-    has_am_pm = bool(re.search(r"(?i)\b(am|pm|a\.m\.|p\.m\.)\b", raw_clean))
     fmts_24h = [
         "%d %B %Y %H:%M:%S",
         "%d %B %Y %H:%M",
@@ -2919,8 +3005,9 @@ def _parse_quoted_header_datetime(value: str):
         "%A %d %B %Y %I:%M %p",
         "%A %d %B %Y %I:%M:%S %p",
     ]
-    parse_fmts = fmts_12h if has_am_pm else fmts_24h
     for cand in candidates:
+        cand_has_am_pm = bool(re.search(r"(?i)\b(am|pm|a\.m\.|p\.m\.)\b", cand or ""))
+        parse_fmts = fmts_12h if cand_has_am_pm else fmts_24h
         for fmt in parse_fmts:
             try:
                 parsed = datetime.strptime(cand, fmt)
@@ -2936,8 +3023,8 @@ def _parse_quoted_header_datetime(value: str):
                 return parsed
         except Exception:
             pass
-        if has_am_pm:
-            for fmt in fmts_24h:
+        if not cand_has_am_pm:
+            for fmt in fmts_12h:
                 try:
                     parsed = datetime.strptime(cand, fmt)
                     _quoted_header_datetime_cache[value] = parsed
@@ -2970,6 +3057,32 @@ def _extract_bounded_outlook_header_candidates(lines, allow_relaxed: bool = Fals
             return bool(re.search(r"(?i)\bfrom\b\s*:?", line or ""))
         return bool(re.search(r"(?i)\bfrom\b\s*:", line or ""))
 
+    def _looks_like_body_line(line: str) -> bool:
+        text = (line or "").strip()
+        if not text:
+            return False
+        low = text.lower()
+        if _header_label(text):
+            return False
+        if re.match(r"(?i)^(hi|hello|dear|regards|kind regards|best regards|thanks|thank you|please)\b", text):
+            return True
+        if low.startswith("@"):
+            return True
+        if len(text.split()) >= 7 and not re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I):
+            return True
+        return False
+
+    def _looks_like_from_value(text: str) -> bool:
+        text = (text or "").strip()
+        if not text or _looks_like_body_line(text):
+            return False
+        if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I):
+            return True
+        if re.search(r"<[^>]+>", text):
+            return True
+        parts = [p for p in re.split(r"[^A-Za-z0-9]+", text) if p]
+        return 1 <= len(parts) <= 6
+
     def _append_meridiem(sent_line: str, start_idx: int) -> str:
         sent_low = (sent_line or "").lower()
         if (" am" in sent_low) or (" pm" in sent_low):
@@ -2979,6 +3092,28 @@ def _extract_bounded_outlook_header_candidates(lines, allow_relaxed: bool = Fals
             if re.fullmatch(r"(?i)(am|pm|a\.m\.|p\.m\.)", extra):
                 return f"{sent_line} {extra}"
         return sent_line
+
+    def _collect_header_value(start_idx: int, label: str, *, validator=None, max_continuations: int = 8):
+        base_line = (lines[start_idx] or "").strip()
+        value = _header_value(base_line, label)
+        pieces = [value] if value else []
+        last_idx = start_idx
+        for j in range(start_idx + 1, min(start_idx + 1 + max_continuations, len(lines))):
+            nxt = (lines[j] or "").strip()
+            if not nxt:
+                break
+            if _header_label(nxt):
+                break
+            if _from_start(nxt):
+                break
+            if _looks_like_body_line(nxt):
+                break
+            candidate = " ".join(p for p in pieces + [nxt] if p).strip()
+            if validator and not validator(candidate):
+                break
+            pieces.append(nxt)
+            last_idx = j
+        return " ".join(p for p in pieces if p).strip(), last_idx
 
     out = []
     i = 0
@@ -2991,39 +3126,35 @@ def _extract_bounded_outlook_header_candidates(lines, allow_relaxed: bool = Fals
         to_line = ""
         subject_line = ""
         header_end = i
-        for j in range(i, min(i + 16, len(lines))):
+        for j in range(i, min(i + 32, len(lines))):
             cur = (lines[j] or "").strip()
             if j > i and (_from_start(cur) or re.match(r"(?i)^[-_]{3,}$", cur)):
                 break
             label = _header_label(cur)
             if label == "from" and not from_line:
-                value = _header_value(cur, "from")
+                value, consumed_idx = _collect_header_value(
+                    j,
+                    "from",
+                    validator=_looks_like_from_value,
+                    max_continuations=6,
+                )
                 from_line = f"From: {value}" if value else "From:"
-                if (not value) and (j + 1) < len(lines):
-                    next_line = (lines[j + 1] or "").strip()
-                    if next_line and (_header_label(next_line) is None):
-                        from_line = f"From: {next_line}"
-                        header_end = j + 1
+                header_end = max(header_end, consumed_idx)
             elif label == "sent" and not sent_line:
-                value = _header_value(cur, "sent")
+                value, consumed_idx = _collect_header_value(j, "sent", max_continuations=4)
                 sent_line = f"Sent: {value}" if value else "Sent:"
-                if (not value) and (j + 1) < len(lines):
-                    next_line = (lines[j + 1] or "").strip()
-                    if next_line and (_header_label(next_line) is None):
-                        sent_line = f"Sent: {next_line}"
-                        header_end = j + 1
+                header_end = max(header_end, consumed_idx)
             elif label in {"to", "cc", "bcc"} and not to_line:
                 value = _header_value(cur, label)
                 to_line = f"{label.capitalize()}: {value}" if value else f"{label.capitalize()}:"
             elif label in {"subject", "objet"} and not subject_line:
-                value = _header_value(cur, label)
+                value, consumed_idx = _collect_header_value(j, label, max_continuations=4)
                 prefix = "Subject" if label == "subject" else "Objet"
                 subject_line = f"{prefix}: {value}" if value else f"{prefix}:"
-                if (not value) and (j + 1) < len(lines):
-                    next_line = (lines[j + 1] or "").strip()
-                    if next_line and (_header_label(next_line) is None):
-                        subject_line = f"{prefix}: {next_line}"
-                        header_end = j + 1
+                header_end = max(header_end, consumed_idx)
+            elif j > i and label is None and _looks_like_body_line(cur):
+                header_end = j - 1
+                break
             elif j > i and label is None and sent_line and (subject_line or from_line):
                 header_end = j - 1
                 break
@@ -3593,6 +3724,19 @@ def _clean_quote_line(line: str) -> str:
     # Collapse whitespace
     line = " ".join(line.split())
     return line.strip()
+
+
+def _body_to_clean_lines(body: str) -> list[str]:
+    if not body:
+        return []
+    text = body
+    if BeautifulSoup is not None and re.search(r"(?is)<(html|body|div|p|br|table|tr|td|th|li|span)\b", body or ""):
+        try:
+            soup = BeautifulSoup(body, "html.parser")
+            text = soup.get_text("\n")
+        except Exception:
+            text = body
+    return [_clean_quote_line(line) for line in text.splitlines() if line.strip()]
 
 
 def _parse_datetime(value: str):
