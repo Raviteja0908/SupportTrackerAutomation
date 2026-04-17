@@ -110,6 +110,7 @@ _SOURCE_LOCKED_SAME_TIME_TOKENS = (
     "force prod subject; all times same",
     "latestconsultantreplyallsame",
     "maintenancepatchallthreesame",
+    "selfserviceallthreesame",
     "systemnotificationdirectreplyallsame",
 )
 
@@ -3308,6 +3309,7 @@ def main() -> int:
         date_anchor_after = False
         base_times = None
         base_debug = None
+        _seeded_won = False
         group_key = ("", "")
         group_total = 0
 
@@ -3680,6 +3682,7 @@ def main() -> int:
 
         if deployment_override:
             times, debug = deployment_override
+            _seeded_won = False
             if times and debug:
                 base_times = TimeResult(times.created, times.response, times.resolved)
                 base_debug = TimeDebug(debug.created_src, debug.ack_src, debug.resolved_src, debug.notes)
@@ -3760,13 +3763,14 @@ def main() -> int:
                 if pick:
                     sliced_thread = [e for e in thread if e.sent_time <= pick.sent_time]
                     if sliced_thread:
-                        times, debug, _ = _resolve_times_seeded_first(
+                        times, debug, _episode = _resolve_times_seeded_first(
                             thread=sliced_thread,
                             requester_name=requester,
                             ess_team=ess_team,
                             subject_norm=subject_norm,
                             description=description,
                         )
+                        _seeded_won = _episode is not None
                         debug = TimeDebug(
                             debug.created_src,
                             debug.ack_src,
@@ -3858,13 +3862,14 @@ def main() -> int:
                 else:
                     date_anchor_missing = True
             if times is None:
-                times, debug, _ = _resolve_times_seeded_first(
+                times, debug, _episode = _resolve_times_seeded_first(
                     thread=thread,
                     requester_name=requester,
                     ess_team=ess_team,
                     subject_norm=subject_norm,
                     description=description,
                 )
+                _seeded_won = _episode is not None
             if initial_occurrence_note and times and debug:
                 debug = TimeDebug(
                     debug.created_src,
@@ -3934,13 +3939,14 @@ def main() -> int:
                     cutoff = pick.sent_time
                     sliced_thread = [e for e in thread if e.sent_time <= cutoff]
                     if sliced_thread:
-                        new_times, new_debug, _ = _resolve_times_seeded_first(
+                        new_times, new_debug, _episode = _resolve_times_seeded_first(
                             thread=sliced_thread,
                             requester_name=requester,
                             ess_team=ess_team,
                             subject_norm=subject_norm,
                             description=description,
                         )
+                        _seeded_won = _episode is not None
                         orig_all_same = (
                             times.created
                             and times.response
@@ -4060,13 +4066,14 @@ def main() -> int:
                         else:
                             sliced_thread = []
                         if sliced_thread:
-                            new_times, new_debug, _ = _resolve_times_seeded_first(
+                            new_times, new_debug, _episode = _resolve_times_seeded_first(
                                 thread=sliced_thread,
                                 requester_name=requester,
                                 ess_team=ess_team,
                                 subject_norm=subject_norm,
                                 description=description,
                             )
+                            _seeded_won = _episode is not None
                             new_triplet = (new_times.created, new_times.response, new_times.resolved)
                             if new_triplet != current_triplet:
                                 times = new_times
@@ -4168,13 +4175,14 @@ def main() -> int:
                             )
                             sliced = [e for e in day_thread if e.sent_time <= pick.sent_time]
                             if sliced:
-                                new_times, new_debug, _ = _resolve_times_seeded_first(
+                                new_times, new_debug, _episode = _resolve_times_seeded_first(
                                     thread=sliced,
                                     requester_name=requester,
                                     ess_team=ess_team,
                                     subject_norm=subject_norm,
                                     description=description,
                                 )
+                                _seeded_won = _episode is not None
                                 new_created_dt = _parse_time_str(new_times.created)
                                 new_created_dt_ist = _to_ist(new_created_dt) if new_created_dt else None
                                 if new_created_dt_ist and new_created_dt_ist.date() == expected_created.date():
@@ -4231,13 +4239,14 @@ def main() -> int:
                             )
                             sliced = [e for e in window_thread if e.sent_time <= pick.sent_time]
                             if sliced:
-                                new_times, new_debug, _ = _resolve_times_seeded_first(
+                                new_times, new_debug, _episode = _resolve_times_seeded_first(
                                     thread=sliced,
                                     requester_name=requester,
                                     ess_team=ess_team,
                                     subject_norm=subject_norm,
                                     description=description,
                                 )
+                                _seeded_won = _episode is not None
                                 new_created_dt = _parse_time_str(new_times.created)
                                 new_created_dt_ist = _to_ist(new_created_dt) if new_created_dt else None
                                 if new_created_dt_ist and anchor_min <= new_created_dt_ist <= anchor_max:
@@ -4503,14 +4512,25 @@ def main() -> int:
             )
 
         if workbook_kind == "incident_self_service":
-            same_time = times.response or times.resolved or times.created
-            if same_time:
+            if times.response:
+                same_time = times.response
+                same_src = debug.ack_src or debug.resolved_src or debug.created_src
+                note_suffix = "SelfServiceAllThreeSame"
+            elif times.resolved or times.created:
+                same_time = times.resolved or times.created
+                same_src = debug.resolved_src or debug.created_src or debug.ack_src
+                note_suffix = "SelfServiceAllThreeSame(FallbackNoAck)"
+            else:
+                same_time = None
+                same_src = None
+                note_suffix = ""
+            if same_time and same_src:
                 times = TimeResult(same_time, same_time, same_time)
                 debug = TimeDebug(
-                    debug.ack_src or debug.resolved_src or debug.created_src,
-                    debug.ack_src or debug.resolved_src or debug.created_src,
-                    debug.ack_src or debug.resolved_src or debug.created_src,
-                    f"{debug.notes}; SelfServiceAllThreeSame",
+                    same_src,
+                    same_src,
+                    same_src,
+                    f"{debug.notes}; {note_suffix}",
                 )
 
         final_created_dt = _parse_time_str(times.created)
@@ -4618,7 +4638,7 @@ def main() -> int:
                 "debug": debug,
                 "shared_decision": None,
                 "initial_lane_episode": None,
-                "seed_locked": False,
+                "seed_locked": _seeded_won,
                 "occurrence_locked": False,
                 "occurrence_lock_triplet": None,
                 "row_has_ids": state_row_has_ids,
@@ -8535,13 +8555,14 @@ def main() -> int:
             if not sliced:
                 continue
 
-            new_times, new_debug, _ = _resolve_times_seeded_first(
+            new_times, new_debug, _episode = _resolve_times_seeded_first(
                 thread=sliced,
                 requester_name=requester,
                 ess_team=ess_team,
                 subject_norm=state.get("subject_norm"),
                 description=description,
             )
+            _seeded_won = _episode is not None
 
             new_created_dt = _parse_time_str(new_times.created)
             new_created_dt_ist = _to_ist(new_created_dt) if new_created_dt else None

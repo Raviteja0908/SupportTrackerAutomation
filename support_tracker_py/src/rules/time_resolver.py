@@ -42,7 +42,9 @@ def _bs4_visible_lines_from_text(value: str) -> list[str]:
         return []
     try:
         soup = BeautifulSoup(value, "html.parser")
-        text = html.unescape(soup.get_text("\n"))
+        for tag in soup.find_all(["br", "p", "div", "blockquote", "td", "tr", "li"]):
+            tag.insert_after("\n")
+        text = html.unescape(soup.get_text(" "))
     except Exception:
         return []
     return [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
@@ -3686,7 +3688,7 @@ def _extract_email_from_from_line(line: str) -> str:
         value = line.split(":", 1)[1].strip()
     except Exception:
         value = line
-    m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", value)
+    m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", value)
     return (m.group(0).lower() if m else "")
 
 
@@ -3779,7 +3781,7 @@ def _is_ess_from_line(line: str, ess_team) -> bool:
     except Exception:
         value = line
     value = re.sub(r"mailto:", " ", value, flags=re.IGNORECASE)
-    value = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", " ", value)
+    value = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", " ", value)
     value_tokens = _tokenize(value)
     tokens = set(value_tokens)
     last_token = value_tokens[-1] if value_tokens else ""
@@ -3859,7 +3861,7 @@ def _clean_quote_line(line: str) -> str:
     line = re.sub(r"<[^>]+>", " ", line)
     line = html.unescape(line)
     # Remove common quote markers
-    line = re.sub(r"^(>+\\s*)", "", line)
+    line = re.sub(r"^(>+\s*)", "", line)
     # Collapse whitespace
     line = " ".join(line.split())
     return line.strip()
