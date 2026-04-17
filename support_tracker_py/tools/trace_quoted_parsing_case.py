@@ -10,7 +10,12 @@ from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 
 from src.rules.subject_normalizer import extract_subject_from_description, normalize_subject
-from src.rules.time_resolver import _match_requester, _to_ist
+from src.rules.time_resolver import (
+    _extract_canonical_message_lines,
+    _extract_canonical_quoted_header_candidates,
+    _match_requester,
+    _to_ist,
+)
 
 try:
     from bs4 import BeautifulSoup  # type: ignore
@@ -164,6 +169,10 @@ def _bs4_clean_lines(email_obj: EmailRec) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
 
 
+def _canonical_clean_lines(email_obj: EmailRec) -> list[str]:
+    return _extract_canonical_message_lines(email_obj)
+
+
 def _parse_quoted_sent_time(line: str) -> datetime | None:
     line = re.sub(r"(?i)^sent\b\s*:?\s*", "", (line or "")).strip()
     patterns = [
@@ -272,6 +281,22 @@ def _extract_blocks_from_lines(lines: list[str]) -> list[tuple[int, str, str, da
     return out
 
 
+def _canonical_blocks(email_obj: EmailRec) -> list[tuple[int, str, str, datetime | None, str, list[str]]]:
+    out = []
+    for idx, candidate in enumerate(_extract_canonical_quoted_header_candidates(email_obj, allow_relaxed=False), start=1):
+        out.append(
+            (
+                idx,
+                re.sub(r"(?i)^from\b\s*:?\s*", "", candidate.from_line or "").strip(),
+                candidate.sent_line or "",
+                candidate.sent_dt,
+                re.sub(r"(?i)^(subject|objet)\b\s*:?\s*", "", candidate.subject_line or "").strip(),
+                list(candidate.block_lines or ()),
+            )
+        )
+    return out
+
+
 def _print_lines(title: str, lines: list[str], limit: int = 80):
     print("-" * 100)
     print(title)
@@ -364,6 +389,11 @@ def main() -> int:
         print("-" * 100)
         print(f"target reply path={target.path}")
         print(f"bs4_available={'yes' if BeautifulSoup is not None else 'no'}")
+
+        canonical_lines = _canonical_clean_lines(target)
+        canonical_blocks = _canonical_blocks(target)
+        _print_lines("Canonical cleaned lines", canonical_lines)
+        _print_blocks("Canonical parsed blocks", canonical_blocks)
 
         current_lines = _current_clean_lines(target)
         current_blocks = _extract_blocks_from_lines(current_lines)

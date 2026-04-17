@@ -3,7 +3,7 @@ import re
 
 _prefix_re = re.compile(r"^\s*(re|fw|fwd|aw|wg|sv)\s*:\s*", re.IGNORECASE)
 _external_re = re.compile(r"\[external\]\s*", re.IGNORECASE)
-_arrow_re = r"(?:--?>|→|➔|➡|=>)"
+_arrow_re = "(?:--\\.?>|→|➔|➡|=>)"
 _fancy_quotes = {
     "“": "\"",
     "”": "\"",
@@ -74,9 +74,11 @@ def _strip_trailing_date(text: str) -> str:
         return ""
     # Remove trailing date-like suffixes
     patterns = [
+        r"\s*--\.>\s*\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\s*$",
         r"\s*-->\s*\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\s*$",
         r"\s*->\s*\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\s*$",
         r"\s*[-–>]?\s*\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\s*$",
+        r"\s*--\.>\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$",
         r"\s*-->\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$",
         r"\s*->\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$",
         r"\s*[-–>]?\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$",

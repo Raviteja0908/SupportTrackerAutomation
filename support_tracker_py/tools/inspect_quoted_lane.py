@@ -1,6 +1,5 @@
 import argparse
 import csv
-import html
 import json
 import re
 from dataclasses import dataclass
@@ -11,7 +10,12 @@ from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 
 from src.rules.subject_normalizer import extract_subject_from_description, normalize_subject
-from src.rules.time_resolver import _is_ess_sender, _match_requester, _to_ist
+from src.rules.time_resolver import (
+    _extract_canonical_message_lines,
+    _is_ess_sender,
+    _match_requester,
+    _to_ist,
+)
 
 
 @dataclass
@@ -117,16 +121,7 @@ def _parse_cell_dt(value: str) -> datetime | None:
 
 
 def _clean_lines(email_obj: EmailRec) -> list[str]:
-    raw = f"{email_obj.body}\n{email_obj.body_html}"
-    if not raw:
-        return []
-    txt = re.sub(r"(?is)<style.*?>.*?</style>", " ", raw)
-    txt = re.sub(r"(?is)<script.*?>.*?</script>", " ", txt)
-    txt = re.sub(r"(?i)<\s*br\s*/?>", "\n", txt)
-    txt = re.sub(r"(?i)</\s*(p|div|tr|td|th|li|h[1-6])\s*>", "\n", txt)
-    txt = re.sub(r"(?is)<[^>]+>", " ", txt)
-    txt = html.unescape(txt)
-    return [ln.strip() for ln in txt.splitlines() if ln and ln.strip()]
+    return _extract_canonical_message_lines(email_obj)
 
 
 def _parse_quoted_sent_time(line: str) -> datetime | None:

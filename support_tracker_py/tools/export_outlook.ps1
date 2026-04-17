@@ -251,48 +251,49 @@ function Remove-ManagedPstStoreByPath {
     for ($attempt = 1; $attempt -le $Retries; $attempt++) {
         $matchingStore = $null
         $root = $null
-        foreach ($store in (Get-SafeStores)) {
-            $displayName = $null
-            $rootName = $null
-            $storePath = $null
-            try { $displayName = [string]$store.DisplayName } catch { $displayName = $null }
-            try {
-                $root = $store.GetRootFolder()
-                if ($root) { $rootName = [string]$root.Name }
-            } catch {
-                $root = $null
-                $rootName = $null
-            }
-            try { $storePath = [string]$store.FilePath } catch { $storePath = $null }
-
-            if (Test-ProtectedStoreName $displayName) { continue }
-            if (Test-ProtectedStoreName $rootName) { continue }
-            if (Test-ProtectedStoreName $storePath) { continue }
-            if ([string]::IsNullOrWhiteSpace($storePath)) { continue }
-            if (-not $storePath.ToLower().EndsWith(".pst")) { continue }
-
-            $storePathLower = ""
-            try {
-                $storePathLower = [System.IO.Path]::GetFullPath($storePath).ToLower()
-            } catch {
-                $storePathLower = $storePath.ToLower()
-            }
-
-            if ($storePathLower -ne $targetLower) { continue }
-            if (-not $root) { continue }
-
-            $matchingStore = $store
-            break
-        }
-
-        if (-not $matchingStore -or -not $root) {
-            return $true
-        }
-
         try {
+            foreach ($store in (Get-SafeStores)) {
+                $displayName = $null
+                $rootName = $null
+                $storePath = $null
+                try { $displayName = [string]$store.DisplayName } catch { $displayName = $null }
+                try {
+                    $root = $store.GetRootFolder()
+                    if ($root) { $rootName = [string]$root.Name }
+                } catch {
+                    $root = $null
+                    $rootName = $null
+                }
+                try { $storePath = [string]$store.FilePath } catch { $storePath = $null }
+
+                if (Test-ProtectedStoreName $displayName) { continue }
+                if (Test-ProtectedStoreName $rootName) { continue }
+                if (Test-ProtectedStoreName $storePath) { continue }
+                if ([string]::IsNullOrWhiteSpace($storePath)) { continue }
+                if (-not $storePath.ToLower().EndsWith(".pst")) { continue }
+
+                $storePathLower = ""
+                try {
+                    $storePathLower = [System.IO.Path]::GetFullPath($storePath).ToLower()
+                } catch {
+                    $storePathLower = $storePath.ToLower()
+                }
+
+                if ($storePathLower -ne $targetLower) { continue }
+                if (-not $root) { continue }
+
+                $matchingStore = $store
+                break
+            }
+
+            if (-not $matchingStore -or -not $root) {
+                return $true
+            }
+
             $namespace.RemoveStore($root)
             Write-Host ("Detached managed export PST from Outlook: {0}" -f $TargetPstPath)
             Start-Sleep -Seconds 1
+            return $true
         } catch {
             if ($attempt -ge $Retries) {
                 Write-Host ("WARNING: Unable to detach managed export PST after {0} attempt(s): {1}" -f $Retries, $TargetPstPath)
@@ -300,6 +301,17 @@ function Remove-ManagedPstStoreByPath {
             }
             Write-Host ("WARNING: Detach attempt {0}/{1} failed for export PST, retrying: {2}" -f $attempt, $Retries, $TargetPstPath)
             Start-Sleep -Seconds $RetryDelaySeconds
+        } finally {
+            foreach ($comObj in @($root, $matchingStore)) {
+                if ($comObj) {
+                    try {
+                        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObj)
+                    } catch {
+                    }
+                }
+            }
+            $root = $null
+            $matchingStore = $null
         }
     }
 

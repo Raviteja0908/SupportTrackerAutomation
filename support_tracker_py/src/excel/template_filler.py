@@ -1,7 +1,7 @@
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -187,6 +187,15 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
             unknown = max(0, unknown - resolved_unknowns)
 
     _normalize_datetime_cells(ws, col_map, header_row)
+    resolved_unknowns, _blue_applied = _enforce_final_row_fills(
+        ws,
+        col_map,
+        header_row,
+        yellow_fill,
+        blue_fill,
+    )
+    if resolved_unknowns:
+        unknown = max(0, unknown - resolved_unknowns)
 
     if filter_no_save:
         logger.log("[INFO] FILTER_NO_SAVE=1; skipping Excel save.")
@@ -372,11 +381,62 @@ def _clear_filled_yellow_rows(ws, col_map, header_row, yellow_fill):
     return cleared
 
 
+def _context_value(resolved_values, *keys):
+    direct_keys = list(keys)
+    normalized_keys = {_normalize_header(key) for key in keys if key}
+    for key in direct_keys:
+        value = resolved_values.get(key, "")
+        if value not in (None, ""):
+            return value
+    for key, value in resolved_values.items():
+        if value in (None, ""):
+            continue
+        if _normalize_header(key) in normalized_keys:
+            return value
+    return ""
+
+
+def _enforce_final_row_fills(ws, col_map, header_row, yellow_fill, blue_fill):
+    cleared_yellow = 0
+    clear_fill = PatternFill(fill_type=None)
+    for row in range(header_row + 1, ws.max_row + 1):
+        current_values = _build_row_context(ws, row, col_map)
+        required_missing, _reason = _is_unknown(current_values)
+        has_yellow = _row_has_fill(ws, row, yellow_fill)
+        has_blue = _row_has_fill(ws, row, blue_fill)
+        if required_missing:
+            if has_blue:
+                _clear_row_if_fill_matches(ws, row, blue_fill, clear_fill)
+            continue
+
+        if has_yellow:
+            _clear_row_if_fill_matches(ws, row, yellow_fill, clear_fill)
+            cleared_yellow += 1
+
+        created = _parse_datetime_cell(_context_value(current_values, "Created Date & Time"))
+        response = _parse_datetime_cell(_context_value(current_values, "Actual Response Date & Time"))
+        if created and response and response >= created and (response - created) > timedelta(minutes=16):
+            if not has_blue:
+                _mark_row(ws, row, blue_fill)
+        elif has_blue:
+            _clear_row_if_fill_matches(ws, row, blue_fill, clear_fill)
+
+    return cleared_yellow, True
+
+
 def _is_unknown(resolved_values):
-    created = resolved_values.get("Created Date & Time", "")
-    resolved = resolved_values.get("Actual Resolved Date & Time", "")
-    sr = resolved_values.get("ServiceRequest/Incident?", "")
-    sr_type = resolved_values.get("ServiceRequest/Incident type?", "")
+    created = _context_value(resolved_values, "Created Date & Time")
+    resolved = _context_value(resolved_values, "Actual Resolved Date & Time")
+    sr = _context_value(
+        resolved_values,
+        "ServiceRequest/Incident?",
+        "ServiceRequest Incident",
+    )
+    sr_type = _context_value(
+        resolved_values,
+        "ServiceRequest/Incident type?",
+        "ServiceRequest Incident type",
+    )
 
     missing = []
     if not created:

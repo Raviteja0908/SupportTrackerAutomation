@@ -6,6 +6,10 @@ from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 import html as _html
 import re as _re
+try:
+    from bs4 import BeautifulSoup as _BeautifulSoup
+except Exception:
+    _BeautifulSoup = None
 
 from .models import EmailRecord
 
@@ -153,12 +157,20 @@ def _select_body(plain_text: str, html_text: str) -> str:
 def _html_to_text(value: str) -> str:
     if not value:
         return ""
-    text = _html.unescape(value)
-    # Preserve structure for quoted headers by inserting line breaks.
-    text = _re.sub(r"(?i)<br\\s*/?>", "\n", text)
-    text = _re.sub(r"(?i)</p>", "\n", text)
-    text = _re.sub(r"(?i)</\\s*(div|tr|td|th|li|h[1-6])\\s*>", "\n", text)
-    text = _re.sub(r"<[^>]+>", "", text)
+    text = ""
+    if _BeautifulSoup is not None:
+        try:
+            soup = _BeautifulSoup(value, "html.parser")
+            text = _html.unescape(soup.get_text("\n"))
+        except Exception:
+            text = ""
+    if not text:
+        text = _html.unescape(value)
+        # Fallback only when BS4 parsing is unavailable or errors.
+        text = _re.sub(r"(?i)<br\\s*/?>", "\n", text)
+        text = _re.sub(r"(?i)</p>", "\n", text)
+        text = _re.sub(r"(?i)</\\s*(div|tr|td|th|li|h[1-6])\\s*>", "\n", text)
+        text = _re.sub(r"<[^>]+>", "", text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
 

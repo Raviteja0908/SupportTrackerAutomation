@@ -18,7 +18,14 @@ except Exception:
 from src.rules.subject_normalizer import extract_subject_from_description, normalize_subject
 from src.rules.time_resolver import (
     _classify_reply_kind,
+    _email_has_explicit_ack_signal,
+    _email_has_short_ess_ack_signal,
+    _extract_canonical_message_lines,
+    _extract_canonical_current_text,
+    _extract_canonical_quoted_header_candidates,
+    _is_ack_like_reply,
     _is_ess_sender,
+    _is_thanks_info_reply,
     _match_requester,
     _to_ist,
 )
@@ -127,16 +134,7 @@ def _parse_cell_dt(value: str) -> datetime | None:
 
 
 def _clean_lines(email_obj: EmailRec) -> list[str]:
-    raw = f"{email_obj.body}\n{email_obj.body_html}"
-    if not raw:
-        return []
-    txt = re.sub(r"(?is)<style.*?>.*?</style>", " ", raw)
-    txt = re.sub(r"(?is)<script.*?>.*?</script>", " ", txt)
-    txt = re.sub(r"(?i)<\s*br\s*/?>", "\n", txt)
-    txt = re.sub(r"(?i)</\s*(p|div|tr|td|th|li|h[1-6])\s*>", "\n", txt)
-    txt = re.sub(r"(?is)<[^>]+>", " ", txt)
-    txt = html.unescape(txt)
-    return [ln.strip() for ln in txt.splitlines() if ln and ln.strip()]
+    return _extract_canonical_message_lines(email_obj)
 
 
 def _normalize_quoted_sent_text(value: str) -> str:
@@ -259,100 +257,12 @@ def _parse_quoted_sent_time(sent_line: str) -> datetime | None:
 
 
 def _extract_quoted_blocks(email_obj: EmailRec):
-    lines = _clean_lines(email_obj)
     out = []
-
-    def _label(line: str):
-        m = re.match(r"(?i)^(from|sent|to|cc|subject|objet)\b\s*:?\s*(.*)$", line or "")
-        return m.group(1).lower() if m else None
-
-    def _value(line: str, label: str) -> str:
-        m = re.match(rf"(?i)^{label}\b\s*:?\s*(.*)$", line or "")
-        return (m.group(1) if m else "").strip()
-
-    def _looks_like_body_line(line: str) -> bool:
-        text = (line or "").strip()
-        if not text:
-            return False
-        if _label(text):
-            return False
-        if re.match(r"(?i)^(hi|hello|dear|regards|kind regards|best regards|thanks|thank you|please)\b", text):
-            return True
-        if text.lower().startswith("@"):
-            return True
-        if len(text.split()) >= 7 and not re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I):
-            return True
-        return False
-
-    def _looks_like_from_value(text: str) -> bool:
-        text = (text or "").strip()
-        if not text or _looks_like_body_line(text):
-            return False
-        if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I):
-            return True
-        if re.search(r"<[^>]+>", text):
-            return True
-        parts = [p for p in re.split(r"[^A-Za-z0-9]+", text) if p]
-        return 1 <= len(parts) <= 6
-
-    def _append_meridiem(sent_line: str, start_idx: int) -> str:
-        sent_low = (sent_line or "").lower()
-        if (" am" in sent_low) or (" pm" in sent_low):
-            return sent_line
-        for j in range(start_idx + 1, min(start_idx + 4, len(lines))):
-            extra = (lines[j] or "").strip()
-            if re.fullmatch(r"(?i)(am|pm|a\.m\.|p\.m\.)", extra):
-                return f"{sent_line} {extra}"
-        return sent_line
-
-    i = 0
-    while i < len(lines):
-        if not re.search(r"(?i)\bfrom\b\s*:", lines[i] or ""):
-            i += 1
-            continue
-        from_line = ""
-        sent_line = ""
-        subj_line = ""
-        end = i
-        for j in range(i, min(i + 16, len(lines))):
-            cur = (lines[j] or "").strip()
-            if j > i and (re.search(r"(?i)\bfrom\b\s*:", cur or "") or re.match(r"(?i)^[-_]{3,}$", cur)):
-                break
-            label = _label(cur)
-            if label == "from" and not from_line:
-                from_line = _value(cur, "from")
-                if (not from_line) and (j + 1) < len(lines):
-                    next_line = (lines[j + 1] or "").strip()
-                    if next_line and (_label(next_line) is None) and _looks_like_from_value(next_line):
-                        from_line = next_line
-                        end = j + 1
-            elif label == "sent" and not sent_line:
-                sent_line = cur
-                if (not _value(cur, "sent")) and (j + 1) < len(lines):
-                    next_line = (lines[j + 1] or "").strip()
-                    if next_line and (_label(next_line) is None):
-                        sent_line = f"{cur} {next_line}".strip()
-                        end = j + 1
-            elif label in {"subject", "objet"} and not subj_line:
-                subj_line = cur
-                if (not _value(cur, label)) and (j + 1) < len(lines):
-                    next_line = (lines[j + 1] or "").strip()
-                    if next_line and (_label(next_line) is None):
-                        subj_line = f"{cur} {next_line}".strip()
-                        end = j + 1
-            elif j > i and label is None and _looks_like_body_line(cur):
-                end = j - 1
-                break
-            elif j > i and label is None and sent_line and (subj_line or from_line):
-                end = j - 1
-                break
-            end = j
-        if sent_line:
-            sent_line = _append_meridiem(sent_line, end)
-            sent_dt = _parse_quoted_sent_time(sent_line)
-            subj = re.sub(r"(?i)^(subject|objet)\b\s*:?\s*", "", subj_line).strip() if subj_line else ""
-            out.append((from_line, sent_dt, subj, sent_line))
-        i = max(i + 1, end + 1)
+    for candidate in _extract_canonical_quoted_header_candidates(email_obj, allow_relaxed=False):
+        from_line = re.sub(r"(?i)^from\b\s*:?\s*", "", candidate.from_line or "").strip()
+        subj = re.sub(r"(?i)^(subject|objet)\b\s*:?\s*", "", candidate.subject_line or "").strip()
+        sent_line = candidate.sent_line or ""
+        out.append((from_line, candidate.sent_dt, subj, sent_line))
     return out
 
 
@@ -504,6 +414,91 @@ def _infer_lane_episode(reply_msg: EmailRec, reply_ist: datetime, subject_norm: 
         if q_subj and not _same_subject(q_subj, subject_norm):
             continue
         lane_blocks.append((idx, from_line or "", sent_ist, q_subj or "", sent_line))
+    if not lane_blocks:
+        return {
+            "request": None,
+            "ack": reply_ist,
+            "resolved": reply_ist,
+            "ack_msg": None,
+            "quoted_blocks": lane_blocks,
+            "mode": "direct-reply",
+        }
+
+    def _lower_non_ess_below(reference_idx: int, reference_ist: datetime):
+        for next_idx, next_from_line, next_sent_ist, _next_q_subj, _sent_line in lane_blocks:
+            if next_idx <= reference_idx:
+                continue
+            if next_sent_ist >= reference_ist:
+                continue
+            if _quoted_sender_is_ess(next_from_line, ess_team) is False:
+                return next_sent_ist
+        return None
+
+    first_idx, first_from_line, first_sent_ist, _first_q_subj, _first_sent_line = lane_blocks[0]
+    reply_cls = _classify_reply_kind(reply_msg)
+    html_probe_text = _extract_canonical_current_text(reply_msg)
+    html_probe = (
+        EmailRec(
+            subject=reply_msg.subject,
+            sender_name=reply_msg.sender_name,
+            sender_email=reply_msg.sender_email,
+            sent_time=reply_msg.sent_time,
+            body=html_probe_text,
+            body_html="",
+            path=reply_msg.path,
+        )
+        if html_probe_text
+        else None
+    )
+    reply_ackish = bool(
+        reply_cls.get("explicit_ack")
+        or reply_cls.get("short_ess_ack")
+        or reply_cls.get("ack_like")
+        or reply_cls.get("thanks_info")
+        or reply_cls.get("nonfinal_followup")
+        or _email_has_short_ess_ack_signal(reply_msg)
+        or _is_ack_like_reply(reply_msg)
+        or _is_thanks_info_reply(reply_msg)
+        or _email_has_explicit_ack_signal(reply_msg)
+        or (
+            html_probe is not None
+            and (
+                _email_has_short_ess_ack_signal(html_probe)
+                or _is_ack_like_reply(html_probe)
+                or _is_thanks_info_reply(html_probe)
+                or _email_has_explicit_ack_signal(html_probe)
+            )
+        )
+    )
+    if _quoted_sender_is_ess(first_from_line, ess_team) is False:
+        return {
+            "request": first_sent_ist,
+            "ack": reply_ist,
+            "resolved": reply_ist,
+            "ack_msg": None,
+            "quoted_blocks": lane_blocks,
+            "mode": "direct-reply",
+        }
+    if _quoted_sender_is_ess(first_from_line, ess_team) is True and _is_ess_sender(reply_msg, ess_team) and reply_ackish:
+        lower_non_ess = _lower_non_ess_below(first_idx, first_sent_ist)
+        if lower_non_ess is None:
+            return {
+                "request": reply_ist,
+                "ack": reply_ist,
+                "resolved": reply_ist,
+                "ack_msg": reply_msg,
+                "quoted_blocks": lane_blocks,
+                "mode": "all-three-same",
+            }
+        return {
+            "request": lower_non_ess,
+            "ack": first_sent_ist,
+            "resolved": reply_ist,
+            "ack_msg": None,
+            "quoted_blocks": lane_blocks,
+            "mode": "req-ack-reply",
+        }
+
     ack_idx = None
     ack_ist = None
     ack_msg = None

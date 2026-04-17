@@ -1,6 +1,5 @@
 import argparse
 import csv
-import html
 import json
 import re
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from typing import Iterable
 from src.rules.subject_normalizer import extract_subject_from_description, normalize_subject, normalize_subject_for_match
 from src.rules.time_resolver import (
     _classify_reply_kind,
+    _extract_canonical_message_lines,
     _is_ess_sender,
     _match_requester,
     _to_ist,
@@ -359,17 +359,7 @@ def _ess_name_only(from_line: str, ess_team: list[str]) -> bool:
 
 
 def _clean_message_text(email: DebugEmail) -> list[str]:
-    raw = f"{email.body or ''}\n{email.body_html or ''}"
-    if not raw:
-        return []
-    txt = raw
-    txt = re.sub(r"(?is)<style.*?>.*?</style>", " ", txt)
-    txt = re.sub(r"(?is)<script.*?>.*?</script>", " ", txt)
-    txt = re.sub(r"(?i)<\s*br\s*/?>", "\n", txt)
-    txt = re.sub(r"(?i)</\s*(p|div|tr|td|th|li|h[1-6])\s*>", "\n", txt)
-    txt = re.sub(r"(?is)<[^>]+>", " ", txt)
-    txt = html.unescape(txt)
-    return [ln.strip() for ln in txt.splitlines() if ln and ln.strip()]
+    return _extract_canonical_message_lines(email)
 
 
 def _extract_quoted_blocks_with_subject(email: DebugEmail) -> list[tuple[str, datetime, str]]:

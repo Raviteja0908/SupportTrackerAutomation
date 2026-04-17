@@ -15,21 +15,37 @@ from src.rules.subject_normalizer import normalize_subject, normalize_subject_fo
 
 _quoted_header_datetime_cache = {}
 _bounded_outlook_header_cache = {}
+_canonical_message_lines_cache = {}
+_canonical_current_text_cache = {}
+_canonical_quoted_header_candidates_cache = {}
 _trace_row_subject_filter = (os.getenv("TRACE_ROW_SUBJECT") or "").strip().lower()
 
 
 def _trace_focus_row(subject_norm: str | None, phase: str, **fields):
-    if not _trace_row_subject_filter:
-        return
-    subject_blob = (subject_norm or "").lower()
-    if _trace_row_subject_filter not in subject_blob:
-        return
-    parts = [f"[TRACE-ROW-BASE] {phase}"]
-    if subject_norm:
-        parts.append(f"subject={subject_norm}")
-    for key, value in fields.items():
-        parts.append(f"{key}={value}")
-    print(" | ".join(parts))
+    return
+
+
+def _fallback_visible_lines_from_text(value: str) -> list[str]:
+    if not value:
+        return []
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", value)
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
+    text = re.sub(r"(?i)<\s*br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</\s*(p|div|tr|td|th|li|h[1-6])\s*>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
+
+
+def _bs4_visible_lines_from_text(value: str) -> list[str]:
+    if not value or BeautifulSoup is None:
+        return []
+    try:
+        soup = BeautifulSoup(value, "html.parser")
+        text = html.unescape(soup.get_text("\n"))
+    except Exception:
+        return []
+    return [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
 
 
 ACK_PHRASES = [
@@ -95,6 +111,7 @@ PROMISE_ACK_PHRASES = [
     "we will process",
     "we will proceed",
     "we will proceed to process",
+    "we will change",
     "we will deploy",
     "we will work on this",
     "we will look into this",
@@ -238,6 +255,10 @@ def _is_thanks_info_reply(email_record) -> bool:
     """Ignore non-resolution consultant replies like 'Thanks for the information'."""
     body = _leading_body_segment(email_record.body or "").lower()
     if not body:
+        return False
+    # Courtesy plus an explicit future-action promise is still an ack-like live
+    # response, not a pure "thanks/info" mail to be ignored.
+    if _is_explicit_ack_signal(body):
         return False
     return _contains_any_phrase(
         body,
@@ -2651,8 +2672,21 @@ def _is_ess_sender(email_record, ess_team) -> bool:
 def _is_system_sender(email_record) -> bool:
     sender_email = (email_record.sender_email or "").lower()
     sender_name = (email_record.sender_name or "").lower()
-    tokens = ["system-notification", "system notification", "no-reply", "noreply", "do-not-reply", "donotreply"]
-    return any(t in sender_email for t in tokens) or any(t in sender_name for t in tokens)
+    subject = (getattr(email_record, "subject", "") or "").lower()
+    tokens = [
+        "eai-system-notification",
+        "system-notification",
+        "system notification",
+        "no-reply",
+        "noreply",
+        "do-not-reply",
+        "donotreply",
+    ]
+    return (
+        any(t in sender_email for t in tokens)
+        or any(t in sender_name for t in tokens)
+        or any(t in subject for t in tokens)
+    )
 
 
 def _extract_sent_time_from_body(body: str, max_dt: datetime | None = None):
@@ -3180,6 +3214,95 @@ def _extract_bounded_outlook_header_candidates(lines, allow_relaxed: bool = Fals
     return list(_bounded_outlook_header_cache[cache_key])
 
 
+def _extract_canonical_message_lines(email_record) -> list[str]:
+    cache_key = id(email_record)
+    cached = _canonical_message_lines_cache.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
+    html_source = (
+        f"{getattr(email_record, 'body_html', '') or ''}\n"
+        f"{getattr(email_record, 'body_html_raw', '') or ''}"
+    ).strip()
+    raw = (
+        f"{getattr(email_record, 'body', '') or ''}\n"
+        f"{getattr(email_record, 'body_html', '') or ''}\n"
+        f"{getattr(email_record, 'body_html_raw', '') or ''}"
+    )
+    if not raw.strip():
+        _canonical_message_lines_cache[cache_key] = ()
+        return []
+
+    raw_lines = _fallback_visible_lines_from_text(raw)
+    bs4_lines = _bs4_visible_lines_from_text(html_source)
+
+    # Prefer the human-visible BS4 conversation lines whenever available.
+    # Fall back to raw cleaned lines only when HTML extraction produced nothing.
+    lines = bs4_lines or raw_lines
+
+    _canonical_message_lines_cache[cache_key] = tuple(lines)
+    return list(_canonical_message_lines_cache[cache_key])
+
+
+def _extract_canonical_current_text(email_record, max_lines: int = 48) -> str:
+    cache_key = (id(email_record), max_lines)
+    cached = _canonical_current_text_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    html_source = (
+        f"{getattr(email_record, 'body_html', '') or ''}\n"
+        f"{getattr(email_record, 'body_html_raw', '') or ''}"
+    ).strip()
+    lines = []
+    if html_source:
+        lines = _bs4_visible_lines_from_text(html_source)
+        if not lines:
+            lines = _fallback_visible_lines_from_text(html_source)
+    if not lines:
+        top = _leading_body_segment(getattr(email_record, "body", "") or "")
+        lines = [ln.strip() for ln in top.splitlines() if ln and ln.strip()]
+
+    current_lines = []
+    header_re = re.compile(r"(?i)^(from|sent|to|cc|bcc|subject|objet)\s*:?\s*$")
+    header_with_value_re = re.compile(r"(?i)^(from|sent|to|cc|bcc|subject|objet)\s*:")
+    for line in lines:
+        if header_re.match(line) or header_with_value_re.match(line):
+            break
+        current_lines.append(line)
+        if len(current_lines) >= max_lines:
+            break
+    out = "\n".join(current_lines).strip()
+    _canonical_current_text_cache[cache_key] = out
+    return out
+
+
+def _extract_canonical_quoted_header_candidates(email_record, allow_relaxed: bool = False):
+    cache_key = (id(email_record), bool(allow_relaxed))
+    cached = _canonical_quoted_header_candidates_cache.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
+    candidates = []
+    lines = _extract_canonical_message_lines(email_record)
+    if lines:
+        candidates = _extract_bounded_outlook_header_candidates(lines, allow_relaxed=allow_relaxed)
+
+    if not candidates:
+        raw = (
+            f"{getattr(email_record, 'body', '') or ''}\n"
+            f"{getattr(email_record, 'body_html', '') or ''}\n"
+            f"{getattr(email_record, 'body_html_raw', '') or ''}"
+        )
+        if raw.strip():
+            raw_lines = _fallback_visible_lines_from_text(raw)
+            if raw_lines:
+                candidates = _extract_bounded_outlook_header_candidates(raw_lines, allow_relaxed=allow_relaxed)
+
+    _canonical_quoted_header_candidates_cache[cache_key] = tuple(candidates)
+    return list(_canonical_quoted_header_candidates_cache[cache_key])
+
+
 def _extract_outlook_block_sent(
     lines,
     max_dt: datetime | None = None,
@@ -3678,7 +3801,15 @@ def _is_system_from_line(line: str) -> bool:
     if not line:
         return False
     value = line.lower()
-    tokens = ["system-notification", "system notification", "no-reply", "noreply", "do-not-reply", "donotreply"]
+    tokens = [
+        "eai-system-notification",
+        "system-notification",
+        "system notification",
+        "no-reply",
+        "noreply",
+        "do-not-reply",
+        "donotreply",
+    ]
     return any(t in value for t in tokens)
 
 
@@ -3695,7 +3826,15 @@ def _to_line_has_ess_dl(line: str) -> bool:
 
 
 def _block_has_system_token(block) -> bool:
-    tokens = ["system-notification", "system notification", "no-reply", "noreply", "do-not-reply", "donotreply"]
+    tokens = [
+        "eai-system-notification",
+        "system-notification",
+        "system notification",
+        "no-reply",
+        "noreply",
+        "do-not-reply",
+        "donotreply",
+    ]
     for line in block:
         lower = (line or "").lower()
         if any(t in lower for t in tokens):
@@ -3729,14 +3868,12 @@ def _clean_quote_line(line: str) -> str:
 def _body_to_clean_lines(body: str) -> list[str]:
     if not body:
         return []
-    text = body
-    if BeautifulSoup is not None and re.search(r"(?is)<(html|body|div|p|br|table|tr|td|th|li|span)\b", body or ""):
-        try:
-            soup = BeautifulSoup(body, "html.parser")
-            text = soup.get_text("\n")
-        except Exception:
-            text = body
-    return [_clean_quote_line(line) for line in text.splitlines() if line.strip()]
+    lines = []
+    if re.search(r"(?is)<(html|body|div|p|br|table|tr|td|th|li|span)\b", body or ""):
+        lines = _bs4_visible_lines_from_text(body)
+    if not lines:
+        lines = _fallback_visible_lines_from_text(body)
+    return [_clean_quote_line(line) for line in lines if line.strip()]
 
 
 def _parse_datetime(value: str):
