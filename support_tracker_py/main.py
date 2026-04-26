@@ -49,6 +49,18 @@ from src.utils import (
 )
 
 
+def _email_stable_key(email_record):
+    p = getattr(email_record, "path", None)
+    if p:
+        return ("path", p)
+    return (
+        "content",
+        getattr(email_record, "sender_email", "") or "",
+        str(getattr(email_record, "sent_time", "") or ""),
+        len(getattr(email_record, "body", "") or ""),
+    )
+
+
 def _normalize_template_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
 
@@ -12995,13 +13007,13 @@ def main() -> int:
         _bounded_quoted_header_cache = {}
 
         def _clean_quoted_message_lines(email_obj):
-            cache_key = id(email_obj)
+            cache_key = _email_stable_key(email_obj)
             if cache_key in _quoted_message_lines_cache:
                 return _quoted_message_lines_cache[cache_key]
             _quoted_message_lines_cache[cache_key] = _extract_canonical_message_lines(email_obj)
             return _quoted_message_lines_cache[cache_key]
         def _extract_bounded_quoted_header_candidates(email_obj, *, allow_relaxed: bool = False):
-            cache_key = (id(email_obj), bool(allow_relaxed))
+            cache_key = (_email_stable_key(email_obj), bool(allow_relaxed))
             cached = _bounded_quoted_header_cache.get(cache_key)
             if cached is not None:
                 return list(cached)
@@ -13029,7 +13041,7 @@ def main() -> int:
         _quoted_block_matches_row_cache = {}
         eml_id_index = None
         def _get_quoted_blocks_with_subject_cached(msg):
-            key = id(msg)
+            key = _email_stable_key(msg)
             if key in quoted_block_cache:
                 return quoted_block_cache[key]
             blocks = _extract_quoted_blocks_with_subject(msg)
@@ -13076,7 +13088,7 @@ def main() -> int:
             return blocks
         raw_id_token_cache = {}
         def _canonical_raw_text(msg):
-            key = ("canonical_raw_text", id(msg))
+            key = ("canonical_raw_text", _email_stable_key(msg))
             cached = _raw_match_token_cache.get(key)
             if cached is not None:
                 return cached
@@ -13087,7 +13099,7 @@ def main() -> int:
             _raw_match_token_cache[key] = text
             return text
         def _raw_match_tokens(msg):
-            key = id(msg)
+            key = _email_stable_key(msg)
             cached = _raw_match_token_cache.get(key)
             if cached is not None:
                 return cached
@@ -14327,7 +14339,7 @@ def main() -> int:
         quoted_row_partition_cache = {}
 
         def _get_relaxed_quoted_blocks_cached(msg):
-            key = id(msg)
+            key = _email_stable_key(msg)
             if key in relaxed_quoted_block_cache:
                 return relaxed_quoted_block_cache[key]
             blocks = _extract_quoted_blocks_relaxed(msg)

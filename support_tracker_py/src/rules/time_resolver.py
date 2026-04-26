@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+import functools
 import html
 import os
 import re
@@ -18,6 +19,21 @@ _bounded_outlook_header_cache = {}
 _canonical_message_lines_cache = {}
 _canonical_current_text_cache = {}
 _canonical_quoted_header_candidates_cache = {}
+_classify_reply_kind_cache = {}
+
+
+def _email_stable_key(email_record):
+    p = getattr(email_record, "path", None)
+    if p:
+        return ("path", p)
+    return (
+        "content",
+        getattr(email_record, "sender_email", "") or "",
+        str(getattr(email_record, "sent_time", "") or ""),
+        len(getattr(email_record, "body", "") or ""),
+    )
+
+
 _trace_row_subject_filter = (os.getenv("TRACE_ROW_SUBJECT") or "").strip().lower()
 
 
@@ -325,6 +341,7 @@ def _is_explicit_ack_signal(text: str) -> bool:
     return has_courtesy and has_future_action
 
 
+@functools.lru_cache(maxsize=2000)
 def _leading_body_segment(body: str, max_chars: int = 4000) -> str:
     """
     Return only the newest/top body portion, trimming quoted history blocks.
@@ -468,6 +485,9 @@ def _classify_reply_kind(email_record) -> dict:
             "real_reply": False,
             "kind": "none",
         }
+    _ck = _email_stable_key(email_record)
+    if _ck in _classify_reply_kind_cache:
+        return _classify_reply_kind_cache[_ck]
 
     direct_resolution = _has_direct_resolution_signal(email_record)
     thanks_info = _is_thanks_info_reply(email_record)
@@ -496,7 +516,7 @@ def _classify_reply_kind(email_record) -> dict:
     else:
         kind = "other"
 
-    return {
+    result = {
         "direct_resolution": direct_resolution,
         "thanks_info": thanks_info,
         "nonfinal_followup": nonfinal_followup,
@@ -506,6 +526,8 @@ def _classify_reply_kind(email_record) -> dict:
         "real_reply": real_reply,
         "kind": kind,
     }
+    _classify_reply_kind_cache[_ck] = result
+    return result
 
 
 def _is_real_reply_candidate(email_record) -> bool:
@@ -2946,6 +2968,9 @@ def _normalize_quoted_sent_text(value: str) -> str:
 
 
 def _parse_quoted_header_datetime(value: str):
+    if len(_quoted_header_datetime_cache) > 5000:
+        for _evict_k in list(_quoted_header_datetime_cache.keys())[:1000]:
+            del _quoted_header_datetime_cache[_evict_k]
     if value in _quoted_header_datetime_cache:
         return _quoted_header_datetime_cache[value]
     raw_clean = re.sub(r"(?i)^sent\b\s*:?\s*", "", (value or "")).strip()
@@ -3212,12 +3237,15 @@ def _extract_bounded_outlook_header_candidates(lines, allow_relaxed: bool = Fals
                     )
                 )
         i = max(i + 1, header_end + 1)
+    if len(_bounded_outlook_header_cache) > 2000:
+        for _evict_k in list(_bounded_outlook_header_cache.keys())[:500]:
+            del _bounded_outlook_header_cache[_evict_k]
     _bounded_outlook_header_cache[cache_key] = tuple(out)
     return list(_bounded_outlook_header_cache[cache_key])
 
 
 def _extract_canonical_message_lines(email_record) -> list[str]:
-    cache_key = id(email_record)
+    cache_key = _email_stable_key(email_record)
     cached = _canonical_message_lines_cache.get(cache_key)
     if cached is not None:
         return list(cached)
@@ -3247,7 +3275,7 @@ def _extract_canonical_message_lines(email_record) -> list[str]:
 
 
 def _extract_canonical_current_text(email_record, max_lines: int = 48) -> str:
-    cache_key = (id(email_record), max_lines)
+    cache_key = (_email_stable_key(email_record), max_lines)
     cached = _canonical_current_text_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -3280,7 +3308,7 @@ def _extract_canonical_current_text(email_record, max_lines: int = 48) -> str:
 
 
 def _extract_canonical_quoted_header_candidates(email_record, allow_relaxed: bool = False):
-    cache_key = (id(email_record), bool(allow_relaxed))
+    cache_key = (_email_stable_key(email_record), bool(allow_relaxed))
     cached = _canonical_quoted_header_candidates_cache.get(cache_key)
     if cached is not None:
         return list(cached)

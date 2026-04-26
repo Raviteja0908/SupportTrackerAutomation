@@ -1398,11 +1398,11 @@ try {
         }
     } finally {
         foreach ($comObj in @($destRoot, $destStore, $inbox, $namespace, $outlook)) {
-            if ($comObj) {
-                try {
+            try {
+                if ($comObj) {
                     [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObj)
-                } catch {
                 }
+            } catch {
             }
         }
         [GC]::Collect()
