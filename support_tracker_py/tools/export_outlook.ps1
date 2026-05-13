@@ -303,11 +303,11 @@ function Remove-ManagedPstStoreByPath {
             Start-Sleep -Seconds $RetryDelaySeconds
         } finally {
             foreach ($comObj in @($root, $matchingStore)) {
-                if ($comObj) {
-                    try {
+                try {
+                    if ($comObj) {
                         [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObj)
-                    } catch {
                     }
+                } catch {
                 }
             }
             $root = $null
@@ -1160,15 +1160,15 @@ function Export-FolderWindow {
                     if ($item.Class -ne 43) { continue }
                     $rt = $item.ReceivedTime
                     if (-not $rt) { continue }
-                    if ($rt -lt $dayStart) { break }
-                    if ($rt -gt $dayEnd) { continue }
+                    if ($rt -lt $windowStart) { break }
+                    if ($rt -gt $windowEnd) { continue }
                 } else {
                     $dtInfo = Get-Item-Date $item
                     $rt = $dtInfo[0]
                     $usedReceived = $dtInfo[1]
                     if (-not $rt) { continue }
-                    if ($usedReceived -and $rt -lt $dayStart) { break }
-                    if ($rt -gt $dayEnd) { continue }
+                    if ($usedReceived -and $rt -lt $windowStart) { break }
+                    if ($rt -gt $windowEnd) { continue }
                 }
                 $copy = $item.Copy()
                 $copy.Move($destFolder) | Out-Null
