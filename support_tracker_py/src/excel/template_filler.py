@@ -336,7 +336,9 @@ def _parse_datetime_cell(value):
 
 
 def _write_comment(ws, row, comments_col, text):
-    return
+    if not comments_col or text is None:
+        return
+    ws.cell(row, comments_col).value = str(text)
 
 
 def _mark_row(ws, row, fill):

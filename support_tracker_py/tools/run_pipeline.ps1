@@ -105,7 +105,6 @@ if ([string]::IsNullOrWhiteSpace($pstDir)) {
 
 $maxWaitSeconds = 120
 $waitIntervalSeconds = 5
-$startWait = Get-Date
 
 function Test-FileUnlocked {
     param([string]$path)
@@ -294,6 +293,7 @@ find /app/output -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 }
 
 Write-Section "PST Lock Check"
+$startWait = Get-Date
 if (-not (Test-FileUnlocked $OutputPstPath)) {
     Write-Log "warn" "PST is still locked; trying bounded Outlook close."
     if (Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue) {
@@ -326,6 +326,17 @@ Write-Log "info" ("PST folder: {0}" -f $pstDir)
 Write-Log "info" ("Output folder: {0}" -f $outputDir)
 
 Write-Log "info" "Starting Docker..."
+# Verify the Docker image exists before attempting any container run.
+$null = & docker image inspect support-tracker 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Section "Docker Image Missing"
+    Write-Log "fail" "Docker image 'support-tracker' not found locally."
+    Write-Log "hint" "Build it first by running from the repo root:"
+    Write-Log "hint" "  docker build -t support-tracker support_tracker_py"
+    exit 1
+}
+Write-Log "ok" "Docker image 'support-tracker' found."
+
 $useVolume = $UseVolume -and -not $NoVolume
 if ($useVolume) {
     Write-Log "info" "Docker output mode: named volume"

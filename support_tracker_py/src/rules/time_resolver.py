@@ -4,6 +4,7 @@ from email.utils import parsedate_to_datetime
 import functools
 import html
 import os
+import random
 import re
 from zoneinfo import ZoneInfo
 import unicodedata
@@ -337,7 +338,9 @@ def _is_explicit_ack_signal(text: str) -> bool:
     if _contains_any_phrase(t, ACK_PHRASES) or _contains_any_phrase(t, PROMISE_ACK_PHRASES):
         return True
     has_courtesy = any(t.startswith(prefix) or f"{prefix} " in t for prefix in ACK_COURTESY_PREFIXES)
-    has_future_action = _contains_any_phrase(t, ACK_PHRASES) or _contains_any_phrase(t, PROMISE_ACK_PHRASES)
+    # Forward-action check: look for future-tense indicators not captured by
+    # the exact-phrase test above (e.g. "Sure, will do" / "OK, will check").
+    has_future_action = bool(re.search(r"\bwill\b|\bshall\b", t))
     return has_courtesy and has_future_action
 
 
@@ -2442,14 +2445,14 @@ def _find_latest_quoted_request_time(
     return latest
 
 
-def _select_ack_and_request(emails, ess_team, max_time: datetime | None = None):
+def _select_ack_and_request(emails, ess_team, max_time: datetime | None = None, subject_norm: str | None = None):
     candidates = []
     for e in emails:
         if not _is_ess_sender(e, ess_team):
             continue
         if max_time and _to_ist(e.sent_time) > _to_ist(max_time):
             continue
-        req_time, req_src = _latest_request_time_before(emails, ess_team, e.sent_time)
+        req_time, req_src = _latest_request_time_before(emails, ess_team, e.sent_time, subject_norm=subject_norm)
         if not req_time:
             continue
         delta = _to_ist(e.sent_time) - _to_ist(req_time)
@@ -2969,7 +2972,9 @@ def _normalize_quoted_sent_text(value: str) -> str:
 
 def _parse_quoted_header_datetime(value: str):
     if len(_quoted_header_datetime_cache) > 5000:
-        for _evict_k in list(_quoted_header_datetime_cache.keys())[:1000]:
+        _evict_keys = list(_quoted_header_datetime_cache.keys())
+        random.shuffle(_evict_keys)
+        for _evict_k in _evict_keys[:1000]:
             del _quoted_header_datetime_cache[_evict_k]
     if value in _quoted_header_datetime_cache:
         return _quoted_header_datetime_cache[value]
@@ -3077,6 +3082,7 @@ def _parse_quoted_header_datetime(value: str):
             except Exception:
                 continue
     for cand in candidates:
+        cand_has_am_pm = bool(re.search(r"(?i)\b(am|pm|a\.m\.|p\.m\.)\b", cand or ""))
         try:
             parsed = parsedate_to_datetime(cand)
             if parsed:
@@ -3238,7 +3244,9 @@ def _extract_bounded_outlook_header_candidates(lines, allow_relaxed: bool = Fals
                 )
         i = max(i + 1, header_end + 1)
     if len(_bounded_outlook_header_cache) > 2000:
-        for _evict_k in list(_bounded_outlook_header_cache.keys())[:500]:
+        _evict_keys = list(_bounded_outlook_header_cache.keys())
+        random.shuffle(_evict_keys)
+        for _evict_k in _evict_keys[:500]:
             del _bounded_outlook_header_cache[_evict_k]
     _bounded_outlook_header_cache[cache_key] = tuple(out)
     return list(_bounded_outlook_header_cache[cache_key])

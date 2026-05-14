@@ -30,6 +30,7 @@ from src.rules.time_resolver import (
     _classify_reply_kind as _shared_reply_classification,
     _is_thanks_info_reply,
     _email_has_explicit_ack_signal,
+    _email_stable_key,
     _is_force_same_time_subject,
     _is_nonfinal_followup_reply as _shared_nonfinal_followup_reply,
     _is_real_reply_candidate as _shared_real_reply_candidate,
@@ -47,18 +48,6 @@ from src.utils import (
     load_aspose_license,
     load_subject_exclusions,
 )
-
-
-def _email_stable_key(email_record):
-    p = getattr(email_record, "path", None)
-    if p:
-        return ("path", p)
-    return (
-        "content",
-        getattr(email_record, "sender_email", "") or "",
-        str(getattr(email_record, "sent_time", "") or ""),
-        len(getattr(email_record, "body", "") or ""),
-    )
 
 
 def _normalize_template_name(name: str) -> str:
@@ -605,6 +594,7 @@ def main() -> int:
     same_time_rows = []
     row_states = []
     _match_tokens_cache = {}
+    _id_like_tokens_cache = {}
     _interface_tokens_cache = {}
     _inc_tokens_cache = {}
     _sig_num_tokens_cache = {}
@@ -646,7 +636,12 @@ def main() -> int:
         return out
 
     def _id_like_tokens(text: str) -> set:
+        _ck = text or ""
+        _cached = _id_like_tokens_cache.get(_ck)
+        if _cached is not None:
+            return _cached
         if not text:
+            _id_like_tokens_cache[_ck] = set()
             return set()
         text = re.sub(r"[Ã¢â‚¬ÂÃ¢â‚¬â€˜Ã¢â‚¬â€™Ã¢â‚¬â€œÃ¢â‚¬â€Ã¢â‚¬â€¢Ã¢Ë†â€™Ã¯Â¹Â£Ã¯Â¼Â\u00ad]", "-", text)
         text = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff]", "", text)
@@ -660,7 +655,27 @@ def main() -> int:
                     continue
                 if any(c.isalpha() for c in part) and any(c.isdigit() for c in part):
                     tokens.add(part)
+        _id_like_tokens_cache[_ck] = tokens
         return tokens
+
+    # Pre-warm the EML header summary cache from already-loaded EmailRecord objects.
+    # Prevents _get_eml_header_summary() from re-opening every .eml file from disk.
+    _eml_header_prewarm = {}
+    for _pw_e in emails:
+        _pw_path = str(getattr(_pw_e, "path", "") or "")
+        if not _pw_path:
+            continue
+        _pw_subject_raw = getattr(_pw_e, "subject", "") or ""
+        _pw_subject_norm = normalize_subject(_pw_subject_raw)
+        _eml_header_prewarm[_pw_path] = {
+            "sent_dt": getattr(_pw_e, "sent_time", None),
+            "subject_raw": _pw_subject_raw,
+            "subject_norm": _pw_subject_norm,
+            "subject_ids": _id_like_tokens(_pw_subject_norm),
+            "sender_email": (getattr(_pw_e, "sender_email", "") or "").lower(),
+            "sender_name": getattr(_pw_e, "sender_name", "") or "",
+        }
+    logger.log(f"[INFO] EML header cache pre-warmed: {len(_eml_header_prewarm)} entries")
 
     def _task_subject_core(text: str) -> str:
         norm = normalize_subject(text or "")
@@ -2319,13 +2334,13 @@ def main() -> int:
                 if delta > 300:
                     continue
                 sender_score = 1 if _seed_quoted_sender_matches_live(from_line, e) else 0
-                matches.append((sender_score, -delta, e_ist, e))
+                matches.append((sender_score, -delta, e_ist, id(e), e))
             if not matches:
                 continue
             matches.sort(reverse=True)
             ack_idx = idx
             ack_ist = matches[0][2]
-            ack_msg = matches[0][3]
+            ack_msg = matches[0][4]
             break
 
         req_ist = None
@@ -13041,11 +13056,31 @@ def main() -> int:
         quoted_block_cache = {}
         raw_eml_quoted_cache = {}
         raw_eml_quoted_summary_cache = {}
-        raw_eml_header_summary_cache = {}
+        raw_eml_header_summary_cache = dict(_eml_header_prewarm)
         raw_eml_episode_fallback_cache = {}
         email_by_path_cache = {}
         raw_id_path_cache = {}
         _quoted_block_matches_row_cache = {}
+        # Pre-warm raw_eml_quoted_cache from already-loaded EmailRecord objects.
+        # Prevents _get_quoted_blocks_from_eml_path from re-reading files from disk.
+        for _pw_e in emails:
+            _pw_path = str(getattr(_pw_e, "path", "") or "")
+            if not _pw_path or _pw_path in raw_eml_quoted_cache:
+                continue
+            try:
+                _pw_blocks = _extract_quoted_blocks_with_subject(_pw_e)
+                if not _pw_blocks:
+                    _pw_blocks = _extract_quoted_blocks_relaxed(_pw_e)
+                raw_eml_quoted_cache[_pw_path] = _pw_blocks
+            except Exception:
+                raw_eml_quoted_cache[_pw_path] = []
+
+        # Pre-warm email_by_path_cache - turns O(n) linear scan per call into O(1) dict lookup.
+        email_by_path_cache.update({
+            str(getattr(_pw_e, "path", "") or ""): _pw_e
+            for _pw_e in emails
+            if getattr(_pw_e, "path", None)
+        })
         eml_id_index = None
         def _get_quoted_blocks_with_subject_cached(msg):
             key = _email_stable_key(msg)
@@ -13380,13 +13415,13 @@ def main() -> int:
                     if delta > 300:
                         continue
                     sender_score = 1 if _quoted_sender_matches_live_shared(from_line, e) else 0
-                    live_ack_matches.append((sender_score, -delta, e_ist, e))
+                    live_ack_matches.append((sender_score, -delta, e_ist, id(e), e))
                 if not live_ack_matches:
                     continue
                 live_ack_matches.sort(reverse=True)
                 ack_idx = idx
                 ack_ist = live_ack_matches[0][2]
-                ack_msg = live_ack_matches[0][3]
+                ack_msg = live_ack_matches[0][4]
                 break
 
             req_ist = None

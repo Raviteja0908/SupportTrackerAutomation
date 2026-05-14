@@ -4,8 +4,10 @@ from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
+import os
 import html as _html
 import re as _re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     from bs4 import BeautifulSoup as _BeautifulSoup
 except Exception:
@@ -21,12 +23,17 @@ def read_eml_directory(root: Path, logger):
         logger.log(f"[WARNING] EML dir missing: {root}")
         return emails
 
-    for path in root.rglob("*.eml"):
+    paths = list(root.rglob("*.eml"))
+    if not paths:
+        logger.log(f"[INFO] EML loaded: 0 from {root}")
+        return emails
+
+    def _parse_one(path):
         try:
             with path.open("rb") as f:
                 msg = BytesParser(policy=policy.default).parse(f)
         except Exception:
-            continue
+            return None
 
         subject = (msg.get("subject") or "").strip()
         from_header = msg.get("from") or ""
@@ -48,18 +55,24 @@ def read_eml_directory(root: Path, logger):
         body, body_html, body_html_raw = _extract_body_parts(msg)
         body = _select_body(body, body_html)
 
-        emails.append(
-            EmailRecord(
-                path=str(path),
-                subject=subject,
-                sender_email=sender_email,
-                sender_name=sender_name or sender_email,
-                sent_time=sent_time,
-                body=body,
-                body_html=body_html,
-                body_html_raw=body_html_raw,
-            )
+        return EmailRecord(
+            path=str(path),
+            subject=subject,
+            sender_email=sender_email,
+            sender_name=sender_name or sender_email,
+            sent_time=sent_time,
+            body=body,
+            body_html=body_html,
+            body_html_raw=body_html_raw,
         )
+
+    max_workers = min(8, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_parse_one, p): p for p in paths}
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                emails.append(result)
 
     logger.log(f"[INFO] EML loaded: {len(emails)} from {root}")
     return emails
@@ -143,9 +156,6 @@ def _select_body(plain_text: str, html_text: str) -> str:
     if plain_has_headers:
         return plain_text
     if html_has_headers:
-        # Preserve any plain top-level content but include HTML headers.
-        if plain_text:
-            return f"{plain_text}\n{html_text}"
         return html_text
     if plain_text:
         return plain_text
@@ -167,9 +177,9 @@ def _html_to_text(value: str) -> str:
     if not text:
         text = _html.unescape(value)
         # Fallback only when BS4 parsing is unavailable or errors.
-        text = _re.sub(r"(?i)<br\\s*/?>", "\n", text)
+        text = _re.sub(r"(?i)<br\s*/?>", "\n", text)
         text = _re.sub(r"(?i)</p>", "\n", text)
-        text = _re.sub(r"(?i)</\\s*(div|tr|td|th|li|h[1-6])\\s*>", "\n", text)
+        text = _re.sub(r"(?i)</\s*(div|tr|td|th|li|h[1-6])\s*>", "\n", text)
         text = _re.sub(r"<[^>]+>", "", text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
