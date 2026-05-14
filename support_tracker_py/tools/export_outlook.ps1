@@ -7,21 +7,71 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Write-Log {
+    param(
+        [string]$Level,
+        [string]$Message
+    )
+    $label = switch ($Level.ToLower()) {
+        "ok" { "ok" }
+        "warn" { "warn" }
+        "fail" { "fail" }
+        "progress" { "progress" }
+        "hint" { "hint" }
+        default { "info" }
+    }
+    Write-Host ("[{0}] {1}" -f $label, $Message)
+}
+
+function Write-Section {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host ("== {0} ==" -f $Title)
+}
+
+function Resolve-TrackerRoot {
+    if (-not [string]::IsNullOrWhiteSpace($env:SUPPORT_TRACKER_ROOT)) {
+        return [System.IO.Path]::GetFullPath($env:SUPPORT_TRACKER_ROOT)
+    }
+    $dir = $PSScriptRoot
+    for ($i = 0; $i -lt 8 -and -not [string]::IsNullOrWhiteSpace($dir); $i++) {
+        $hasRuntimeDirs = (Test-Path (Join-Path $dir "PstFiles")) -or (Test-Path (Join-Path $dir "DockerOutput"))
+        $hasRepoDir = Test-Path (Join-Path $dir "SupportTrackerAutomation")
+        if ($hasRuntimeDirs -or $hasRepoDir) {
+            return $dir
+        }
+        $parent = Split-Path -Parent $dir
+        if ($parent -eq $dir) { break }
+        $dir = $parent
+    }
+    return (Split-Path -Parent $PSScriptRoot)
+}
+
+function Release-ComObjectQuietly {
+    param([object]$ComObject)
+    try {
+        if ($ComObject) {
+            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ComObject)
+        }
+    } catch {
+    }
+}
+
 $includeCreationTime = $true
 if ($env:EXCLUDE_CREATION_TIME) {
     $val = $env:EXCLUDE_CREATION_TIME.ToString().ToLower()
     if ($val -in @("1", "true", "yes", "y", "on")) { $includeCreationTime = $false }
 }
 
-Write-Host "Outlook export (PST append) - copy only, no move"
-Write-Host ("Start time: {0}" -f (Get-Date))
-Write-Host "Export script version: 2026-04-06-1"
-Write-Host "Prompt commands: type back to go to the previous step when supported, or quit to exit."
-Write-Host ""
+Write-Section "Outlook Export"
+Write-Log "info" "Mode: PST append, copy only"
+Write-Log "info" ("Start: {0}" -f (Get-Date))
+Write-Log "info" "Script version: 2026-04-06-1"
+Write-Log "hint" "Prompt commands: back, quit"
 
 $Script:BackToken = "__SCRIPT_BACK__"
 $Script:DefaultScriptsDir = $PSScriptRoot
-$Script:DefaultTrackerRoot = Split-Path -Parent $Script:DefaultScriptsDir
+$Script:DefaultTrackerRoot = Resolve-TrackerRoot
 $Script:DefaultPstDir = Join-Path $Script:DefaultTrackerRoot "PstFiles"
 $Script:DefaultOutputDir = Join-Path $Script:DefaultTrackerRoot "DockerOutput"
 $Script:DefaultPstPath = Join-Path $Script:DefaultPstDir "export_filtered.pst"
@@ -32,7 +82,8 @@ foreach ($dir in @($Script:DefaultTrackerRoot, $Script:DefaultScriptsDir, $Scrip
     }
 }
 
-Write-Host "Connecting to Outlook..."
+Write-Section "Outlook"
+Write-Log "info" "Connecting..."
 $outlookWasRunning = @(Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue).Count -gt 0
 $startupPstHint = if ([string]::IsNullOrWhiteSpace($OutputPstPath)) { $Script:DefaultPstPath } else { $OutputPstPath }
 if ($startupPstHint -match '^[\\/]' -and $startupPstHint -notmatch '^[A-Za-z]:') {
@@ -62,7 +113,15 @@ if ($env:FAST_EXPORT) {
         $fastExport = $true
     }
 }
-Write-Host ("Export mode: {0}" -f ($(if ($fastExport) { "FAST (MailItem + ReceivedTime)" } else { "COMPLETE (All items + SentOn fallback)" })))
+Write-Log "info" ("Export mode: {0}" -f ($(if ($fastExport) { "FAST (MailItem + ReceivedTime)" } else { "COMPLETE (All items + SentOn fallback)" })))
+
+$closeOutlookAfterExport = $false
+if ($env:CLOSE_OUTLOOK_AFTER_EXPORT) {
+    $val = $env:CLOSE_OUTLOOK_AFTER_EXPORT.ToString().ToLower()
+    if ($val -in @("1", "true", "yes", "y", "on")) {
+        $closeOutlookAfterExport = $true
+    }
+}
 
 function Split-InboxCombinedPath {
     param([string]$path)
@@ -226,9 +285,9 @@ function Remove-StaleManagedPstStores {
 
         try {
             $namespace.RemoveStore($root)
-            Write-Host ("Removed stale Outlook PST store: {0}" -f $storePath)
+            Write-Log "ok" ("Removed stale PST store: {0}" -f $storePath)
         } catch {
-            Write-Host ("WARNING: Unable to remove stale Outlook PST store: {0}" -f $storePath)
+            Write-Log "warn" ("Unable to remove stale PST store: {0}" -f $storePath)
         }
     }
 }
@@ -291,15 +350,15 @@ function Remove-ManagedPstStoreByPath {
             }
 
             $namespace.RemoveStore($root)
-            Write-Host ("Detached managed export PST from Outlook: {0}" -f $TargetPstPath)
+            Write-Log "ok" ("Detached export PST: {0}" -f $TargetPstPath)
             Start-Sleep -Seconds 1
             return $true
         } catch {
             if ($attempt -ge $Retries) {
-                Write-Host ("WARNING: Unable to detach managed export PST after {0} attempt(s): {1}" -f $Retries, $TargetPstPath)
+                Write-Log "warn" ("Unable to detach export PST after {0} attempt(s): {1}" -f $Retries, $TargetPstPath)
                 return $false
             }
-            Write-Host ("WARNING: Detach attempt {0}/{1} failed for export PST, retrying: {2}" -f $attempt, $Retries, $TargetPstPath)
+            Write-Log "warn" ("Detach attempt {0}/{1} failed; retrying: {2}" -f $attempt, $Retries, $TargetPstPath)
             Start-Sleep -Seconds $RetryDelaySeconds
         } finally {
             foreach ($comObj in @($root, $matchingStore)) {
@@ -864,12 +923,12 @@ if ([string]::IsNullOrWhiteSpace($OutputPstPath)) {
 if ($OutputPstPath -match '^[\\/]' -and $OutputPstPath -notmatch '^[A-Za-z]:') {
     $defaultDrive = [System.IO.Path]::GetPathRoot($Script:DefaultTrackerRoot).TrimEnd('\')
     $OutputPstPath = "$defaultDrive$OutputPstPath"
-    Write-Host ("WARNING: Drive letter missing; using {0}" -f $OutputPstPath)
+    Write-Log "warn" ("Drive letter missing; using {0}" -f $OutputPstPath)
 }
 $startDateObj = $startDateObj.Date
 $endDateObj = $endDateObj.Date
 if ($endDateObj -lt $startDateObj) {
-    Write-Host ("WARNING: End date {0} is earlier than start date {1}. Swapping." -f $endDateObj.ToString("dd-MM-yyyy"), $startDateObj.ToString("dd-MM-yyyy"))
+    Write-Log "warn" ("End date {0} is earlier than start date {1}; swapping." -f $endDateObj.ToString("dd-MM-yyyy"), $startDateObj.ToString("dd-MM-yyyy"))
     $tmp = $startDateObj
     $startDateObj = $endDateObj
     $endDateObj = $tmp
@@ -880,25 +939,26 @@ if ($outDir -and -not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir | Out-Null
 }
 if ($outDir -ne $Script:DefaultPstDir) {
-    Write-Host ("WARNING: PST path is not in {0} -> {1}" -f $Script:DefaultPstDir, $outDir)
-    Write-Host ("For team consistency, please use: {0}" -f $Script:DefaultPstDir)
+    Write-Log "warn" ("PST path is outside the team default: {0}" -f $outDir)
+    Write-Log "hint" ("Team default PST folder: {0}" -f $Script:DefaultPstDir)
 }
 
 Remove-StaleManagedPstStores -ManagedDir $outDir -TargetPstPath $OutputPstPath
 Remove-ManagedPstStoreByPath -TargetPstPath $OutputPstPath | Out-Null
 
-Write-Host "Opening/creating PST at: $OutputPstPath"
-Write-Host "Checking if PST is already attached..."
+Write-Section "PST"
+Write-Log "info" ("Path: {0}" -f $OutputPstPath)
+Write-Log "info" "Checking Outlook attachment..."
 $destStore = Wait-ForStoreByPath -TargetPath $OutputPstPath -Retries 2 -RetryDelaySeconds 1
 if ($destStore) {
-    Write-Host "PST already attached. Skipping AddStore."
+    Write-Log "ok" "PST already attached; skipping AddStore."
 } else {
     $addStoreAction = {
         if ($namespace.PSObject.Methods.Name -contains "AddStoreEx") {
-            Write-Host "Using AddStoreEx (Unicode PST)..."
-            $namespace.AddStoreEx($OutputPstPath, 3) | Out-Null
+            Write-Log "info" "Creating/attaching Unicode PST with AddStoreEx."
+            $namespace.AddStoreEx($OutputPstPath, 2) | Out-Null
         } else {
-            Write-Host "Using AddStore..."
+            Write-Log "info" "Attaching PST with AddStore."
             $namespace.AddStore($OutputPstPath) | Out-Null
         }
     }
@@ -918,14 +978,15 @@ if (-not $destStore) {
 $destRoot = $destStore.GetRootFolder()
 $inbox = $namespace.GetDefaultFolder(6) # olFolderInbox
 
-Write-Host "Date filter (range-first with failed-day retry): $($startDateObj.ToString('dd-MM-yyyy')) to $($endDateObj.ToString('dd-MM-yyyy'))"
-Write-Host "Folders to export:"
+Write-Section "Export Plan"
+Write-Log "info" ("Date range: {0} to {1}" -f $startDateObj.ToString('dd-MM-yyyy'), $endDateObj.ToString('dd-MM-yyyy'))
+Write-Log "info" "Folders:"
 if ($folderPaths.Count -eq 0) {
-    Write-Host " - (none)"
+    Write-Host "  - (none)"
 } else {
     $idx = 1
     foreach ($p in $folderPaths) {
-        Write-Host (" {0}. {1}" -f $idx, $p)
+        Write-Host ("  {0}. {1}" -f $idx, $p)
         $idx++
     }
 }
@@ -1031,15 +1092,15 @@ function Resolve-SourceFolder {
 }
 
 # Validate folders before export (FOUND / NOT FOUND)
-Write-Host "Validating folder paths..."
+Write-Section "Folder Validation"
 $validated = @()
 foreach ($path in $folderPaths) {
     $resolved = Resolve-SourceFolder -path $path
     if ($resolved) {
-        Write-Host ("FOUND: {0}" -f $path)
+        Write-Log "ok" $path
         $validated += $path
     } else {
-        Write-Host ("NOT FOUND: {0}" -f $path)
+        Write-Log "fail" $path
     }
 }
 $folderPaths = $validated
@@ -1058,6 +1119,43 @@ function Get-Item-Date {
         if ($ct -and $ct -ne [DateTime]::MinValue) { return @($ct, $false) }
     }
     return @($null, $false)
+}
+
+function Test-DateInWindow {
+    param(
+        [object]$Value,
+        [DateTime]$WindowStart,
+        [DateTime]$WindowEnd
+    )
+    if (-not $Value) { return $false }
+    try {
+        $dt = [DateTime]$Value
+    } catch {
+        return $false
+    }
+    if ($dt -eq [DateTime]::MinValue) { return $false }
+    return ($dt -ge $WindowStart -and $dt -le $WindowEnd)
+}
+
+function Get-Item-DateInWindow {
+    param(
+        [object]$item,
+        [DateTime]$WindowStart,
+        [DateTime]$WindowEnd
+    )
+
+    $rt = $null
+    $st = $null
+    $ct = $null
+    try { $rt = $item.ReceivedTime } catch { $rt = $null }
+    if (Test-DateInWindow -Value $rt -WindowStart $WindowStart -WindowEnd $WindowEnd) { return @($rt, "ReceivedTime") }
+    try { $st = $item.SentOn } catch { $st = $null }
+    if (Test-DateInWindow -Value $st -WindowStart $WindowStart -WindowEnd $WindowEnd) { return @($st, "SentOn") }
+    if ($includeCreationTime) {
+        try { $ct = $item.CreationTime } catch { $ct = $null }
+        if (Test-DateInWindow -Value $ct -WindowStart $WindowStart -WindowEnd $WindowEnd) { return @($ct, "CreationTime") }
+    }
+    return @($null, "")
 }
 
 function Export-FolderWindow {
@@ -1104,40 +1202,50 @@ function Export-FolderWindow {
     $forceManual = $false
     if ($filtered -ne $null) {
         $usedFilterMode = "sql"
-        Write-Host "SQL Restrict succeeded."
-        Write-Host "Using SQL Restrict filter..."
+        Write-Log "ok" "SQL Restrict filter ready."
+        $filteredCount = 0
         try {
             $filteredCount = $filtered.Count
-            Write-Host ("  Filtered items count: {0}" -f $filteredCount)
+            Write-Log "info" ("Filtered items: {0}" -f $filteredCount)
             if ($filteredCount -eq 0) {
-                Write-Host "  Filtered count is 0 (no items in range)."
+                Write-Log "info" "Filtered items: 0, no items in range."
                 if ($includeCreationTime) {
                     $forceManual = $true
-                    Write-Host "  Falling back to manual scan for CreationTime items..."
+                    Write-Log "warn" "Falling back to manual scan for CreationTime items."
                 }
             }
         } catch {
-            Write-Host "  Filtered items count: unknown"
+            Write-Log "info" "Filtered items: unknown"
         }
         if (-not $forceManual) {
-            foreach ($item in @($filtered)) {
+            try {
+                $filtered.Sort("[ReceivedTime]", $true)
+                Write-Log "ok" "Sorted by ReceivedTime descending."
+            } catch {
+                Write-Log "warn" "Unable to sort filtered items; strict date window still applies."
+            }
+            for ($itemIndex = 1; $itemIndex -le $filteredCount; $itemIndex++) {
+                $item = $null
+                $copy = $null
+                $moved = $null
                 try {
+                    $item = $filtered.Item($itemIndex)
                     if (-not $item) { continue }
                     if ($fastExport) {
                         if ($item.Class -ne 43) { continue }
                         $rt = $item.ReceivedTime
-                        if (-not $rt) { continue }
+                        if (-not (Test-DateInWindow -Value $rt -WindowStart $windowStart -WindowEnd $windowEnd)) { continue }
                     } else {
-                        $dtInfo = Get-Item-Date $item
+                        $dtInfo = Get-Item-DateInWindow -item $item -WindowStart $windowStart -WindowEnd $windowEnd
                         $rt = $dtInfo[0]
                         if (-not $rt) { continue }
                     }
                     $copy = $item.Copy()
-                    $copy.Move($destFolder) | Out-Null
+                    $moved = $copy.Move($destFolder)
                     $count++
                     $processed++
                     if (($processed % $progressEvery) -eq 0) {
-                        Write-Host ("  Processed {0} items | Exported {1} | Current Time: {2}" -f $processed, $count, $rt)
+                        Write-Log "progress" ("processed={0}; exported={1}; current={2}" -f $processed, $count, $rt)
                     }
                 } catch {
                     $copyErrors++
@@ -1145,37 +1253,57 @@ function Export-FolderWindow {
                         $sampleErrors.Add($_.Exception.Message) | Out-Null
                     }
                     continue
+                } finally {
+                    Release-ComObjectQuietly $moved
+                    Release-ComObjectQuietly $copy
+                    Release-ComObjectQuietly $item
                 }
             }
         }
     } else {
-        # Fast mode: sort descending and break once we pass the start date
-        $items.Sort("[ReceivedTime]", $true)
-        Write-Host "SQL Restrict failed (falling back to fast manual scan)..."
-        Write-Host "Using fast manual scan (descending, early break)..."
-        foreach ($item in @($items)) {
+        # Sort descending and break once received-time scans pass the start date.
+        $manualSorted = $false
+        try {
+            $items.Sort("[ReceivedTime]", $true)
+            $manualSorted = $true
+        } catch {
+            Write-Log "warn" "Unable to sort source items; manual scan continues without early date ordering."
+        }
+        Write-Log "warn" "SQL Restrict failed; using manual scan."
+        Write-Log "info" "Manual scan: descending ReceivedTime with early break."
+        $itemCount = 0
+        try {
+            $itemCount = $items.Count
+        } catch {
+            $itemCount = 0
+        }
+        for ($itemIndex = 1; $itemIndex -le $itemCount; $itemIndex++) {
+            $item = $null
+            $copy = $null
+            $moved = $null
             try {
+                $item = $items.Item($itemIndex)
                 if (-not $item) { continue }
                 if ($fastExport) {
                     if ($item.Class -ne 43) { continue }
                     $rt = $item.ReceivedTime
                     if (-not $rt) { continue }
-                    if ($rt -lt $windowStart) { break }
+                    if ($rt -lt $windowStart) {
+                        if ($manualSorted) { break }
+                        continue
+                    }
                     if ($rt -gt $windowEnd) { continue }
                 } else {
-                    $dtInfo = Get-Item-Date $item
+                    $dtInfo = Get-Item-DateInWindow -item $item -WindowStart $windowStart -WindowEnd $windowEnd
                     $rt = $dtInfo[0]
-                    $usedReceived = $dtInfo[1]
                     if (-not $rt) { continue }
-                    if ($usedReceived -and $rt -lt $windowStart) { break }
-                    if ($rt -gt $windowEnd) { continue }
                 }
                 $copy = $item.Copy()
-                $copy.Move($destFolder) | Out-Null
+                $moved = $copy.Move($destFolder)
                 $count++
                 $processed++
                 if (($processed % $progressEvery) -eq 0) {
-                    Write-Host ("  Processed {0} items | Exported {1} | Current Time: {2}" -f $processed, $count, $rt)
+                    Write-Log "progress" ("processed={0}; exported={1}; current={2}" -f $processed, $count, $rt)
                 }
             } catch {
                 $copyErrors++
@@ -1183,6 +1311,10 @@ function Export-FolderWindow {
                     $sampleErrors.Add($_.Exception.Message) | Out-Null
                 }
                 continue
+            } finally {
+                Release-ComObjectQuietly $moved
+                Release-ComObjectQuietly $copy
+                Release-ComObjectQuietly $item
             }
         }
     }
@@ -1191,11 +1323,11 @@ function Export-FolderWindow {
     if ([string]::IsNullOrWhiteSpace($windowLabel)) {
         $windowLabel = "{0} -> {1}" -f $windowStart.ToString("dd-MM-yyyy HH:mm"), $windowEnd.ToString("dd-MM-yyyy HH:mm")
     }
-    Write-Host ("Exported {0} items from {1} for {2} | Time: {3}" -f $count, $relativePath, $windowLabel, $elapsed.ToString())
+    Write-Log "ok" ("{0} | exported={1}; window={2}; time={3}" -f $relativePath, $count, $windowLabel, $elapsed.ToString())
     if ($copyErrors -gt 0) {
-        Write-Host ("WARNING: {0} item(s) could not be copied in {1} for {2}." -f $copyErrors, $relativePath, $windowLabel)
+        Write-Log "warn" ("{0} copy error(s) in {1} for {2}." -f $copyErrors, $relativePath, $windowLabel)
         foreach ($sample in $sampleErrors) {
-            Write-Host ("  Copy warning: {0}" -f $sample)
+            Write-Host ("  - {0}" -f $sample)
         }
     }
 
@@ -1226,7 +1358,8 @@ function Invoke-FolderExportWithRetry {
     $fullRangeStart = $rangeStart.Date
     $fullRangeEnd = $rangeEnd.Date.AddDays(1).AddSeconds(-1)
 
-    Write-Host ("Exporting full range for folder: {0} | {1}" -f $relativePath, $rangeLabel)
+    Write-Section ("Folder: {0}" -f $relativePath)
+    Write-Log "info" ("Window: {0}" -f $rangeLabel)
     try {
         $rangeResult = Export-FolderWindow -sourceFolder $sourceFolder -relativePath $relativePath -windowStart $fullRangeStart -windowEnd $fullRangeEnd -windowLabel $rangeLabel
         $folderResults.Add([PSCustomObject]@{
@@ -1240,12 +1373,12 @@ function Invoke-FolderExportWithRetry {
             FilterMode     = $rangeResult.FilterMode
             ErrorMessage   = $null
         }) | Out-Null
-        Write-Host ("SUCCESS: Exported folder {0} for full range." -f $relativePath)
+        Write-Log "ok" "Full-range export complete."
         return $folderResults
     } catch {
         $rangeError = $_.Exception.Message
-        Write-Host ("WARNING: Full-range export failed for {0}: {1}" -f $relativePath, $rangeError)
-        Write-Host ("Falling back to day-by-day export for {0} so we can retry only exact failed dates." -f $relativePath)
+        Write-Log "warn" ("Full-range export failed: {0}" -f $rangeError)
+        Write-Log "info" "Falling back to day-by-day export for exact retry windows."
         $folderResults.Add([PSCustomObject]@{
             Folder         = $relativePath
             Scope          = "range"
@@ -1264,7 +1397,7 @@ function Invoke-FolderExportWithRetry {
         $dayEnd = $day.AddDays(1).AddSeconds(-1)
         $dayLabel = $day.ToString("dd-MM-yyyy")
         try {
-            Write-Host ("Trying day export: {0} | {1}" -f $relativePath, $dayLabel)
+            Write-Log "info" ("Trying day: {0}" -f $dayLabel)
             $dayResult = Export-FolderWindow -sourceFolder $sourceFolder -relativePath $relativePath -windowStart $dayStart -windowEnd $dayEnd -windowLabel $dayLabel
             $folderResults.Add([PSCustomObject]@{
                 Folder         = $relativePath
@@ -1277,7 +1410,7 @@ function Invoke-FolderExportWithRetry {
                 FilterMode     = $dayResult.FilterMode
                 ErrorMessage   = $null
             }) | Out-Null
-            Write-Host ("SUCCESS: Exported {0} for {1}." -f $relativePath, $dayLabel)
+            Write-Log "ok" ("Day complete: {0}" -f $dayLabel)
         } catch {
             $dayError = $_.Exception.Message
             $failedDays.Add($day) | Out-Null
@@ -1292,12 +1425,12 @@ function Invoke-FolderExportWithRetry {
                 FilterMode     = $null
                 ErrorMessage   = $dayError
             }) | Out-Null
-            Write-Host ("FAILED: Export failed for {0} on {1}: {2}" -f $relativePath, $dayLabel, $dayError)
+            Write-Log "fail" ("Day failed: {0}; {1}" -f $dayLabel, $dayError)
         }
     }
 
     if ($failedDays.Count -gt 0) {
-        Write-Host ("Retrying exact failed date(s) for {0}: {1}" -f $relativePath, (($failedDays | ForEach-Object { $_.ToString('dd-MM-yyyy') }) -join ", "))
+        Write-Log "warn" ("Retrying failed day(s): {0}" -f (($failedDays | ForEach-Object { $_.ToString('dd-MM-yyyy') }) -join ", "))
     }
     foreach ($failedDay in $failedDays) {
         $retryStart = $failedDay.Date
@@ -1316,7 +1449,7 @@ function Invoke-FolderExportWithRetry {
                 FilterMode     = $retryResult.FilterMode
                 ErrorMessage   = $null
             }) | Out-Null
-            Write-Host ("RETRY SUCCESS: Exported {0} for failed day {1}." -f $relativePath, $retryLabel)
+            Write-Log "ok" ("Retry complete: {0}" -f $retryLabel)
         } catch {
             $retryError = $_.Exception.Message
             $folderResults.Add([PSCustomObject]@{
@@ -1330,7 +1463,7 @@ function Invoke-FolderExportWithRetry {
                 FilterMode     = $null
                 ErrorMessage   = $retryError
             }) | Out-Null
-            Write-Host ("RETRY FAILED: Export still failed for {0} on {1}: {2}" -f $relativePath, $retryLabel, $retryError)
+            Write-Log "fail" ("Retry failed: {0}; {1}" -f $retryLabel, $retryError)
         }
     }
 
@@ -1343,7 +1476,7 @@ try {
     foreach ($path in $folderPaths) {
         $sourceFolder = Resolve-SourceFolder -path $path
         if (-not $sourceFolder) {
-            Write-Host ("SKIPPED: Could not resolve folder {0}" -f $path)
+            Write-Log "fail" ("Folder could not be resolved: {0}" -f $path)
             $allExportLogs.Add([PSCustomObject]@{
                 Folder         = $path
                 Scope          = "folder"
@@ -1363,18 +1496,27 @@ try {
         }
     }
 
-    Write-Host "Export completed."
-    Write-Host "PST written to: $OutputPstPath"
-    Write-Host "Export summary:"
+    Write-Section "Export Summary"
+    Write-Log "ok" "Export pass complete."
+    Write-Log "info" ("PST: {0}" -f $OutputPstPath)
     foreach ($log in $allExportLogs) {
-        $status = if ($log.Success) { "SUCCESS" } else { "FAILED" }
+        $status = if ($log.Success -and $log.CopyErrors -gt 0) { "INCOMPLETE" } elseif ($log.Success) { "SUCCESS" } else { "FAILED" }
         $retryText = if ($log.RetryAttempt -gt 0) { "retry $($log.RetryAttempt)" } else { "initial" }
         $extra = if ($log.Success) {
             "exported=$($log.Exported); copyErrors=$($log.CopyErrors); mode=$($log.FilterMode)"
         } else {
             "error=$($log.ErrorMessage)"
         }
-        Write-Host (" - {0} | folder={1} | scope={2} | window={3} | attempt={4} | {5}" -f $status, $log.Folder, $log.Scope, $log.WindowLabel, $retryText, $extra)
+        $level = if ($status -eq "SUCCESS") { "ok" } elseif ($status -eq "INCOMPLETE") { "warn" } else { "fail" }
+        Write-Log $level ("{0} | {1} | {2} | {3} | {4}" -f $log.Folder, $log.Scope, $log.WindowLabel, $retryText, $extra)
+    }
+
+    $totalCopyErrors = 0
+    foreach ($log in $allExportLogs) {
+        $totalCopyErrors += [int]$log.CopyErrors
+    }
+    if ($totalCopyErrors -gt 0) {
+        throw ("Export incomplete: {0} item(s) could not be copied. The output PST is likely full or unable to accept more items. Use a fresh PST path, then rerun." -f $totalCopyErrors)
     }
 
     $exportResult = [PSCustomObject]@{
@@ -1385,16 +1527,24 @@ try {
         Logs          = @($allExportLogs)
     }
 } finally {
-    if ($destRoot) {
+    try {
         $null = Remove-ManagedPstStoreByPath -TargetPstPath $OutputPstPath -Retries 4 -RetryDelaySeconds 3
+        $destRoot = $null
+        $destStore = $null
+    } catch {
+        Write-Log "warn" ("Cleanup detach failed: {0}" -f ($_.Exception.Message))
     }
     try {
-        if (-not $outlookWasRunning -and $outlook) {
+        if (-not $outlookWasRunning -and $closeOutlookAfterExport) {
             try {
-                $outlook.Quit()
-                Write-Host "Closed Outlook instance started by export script."
+                if ($outlook) {
+                    $outlook.Quit()
+                    Write-Log "ok" "Closed Outlook instance started by export script."
+                }
             } catch {
             }
+        } elseif (-not $outlookWasRunning) {
+            Write-Log "info" "Leaving Outlook open after export cleanup to avoid shutdown hangs."
         }
     } finally {
         foreach ($comObj in @($destRoot, $destStore, $inbox, $namespace, $outlook)) {

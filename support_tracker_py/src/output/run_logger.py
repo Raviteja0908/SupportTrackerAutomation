@@ -8,10 +8,22 @@ class RunLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(self, message: str):
-        line = message.rstrip()
+        line = self._clean_prefix(message.rstrip())
         with self.path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         print(line, flush=True)
+
+    @staticmethod
+    def _clean_prefix(line: str) -> str:
+        replacements = {
+            "[INFO]": "[info]",
+            "[WARNING]": "[warn]",
+            "[ERROR]": "[error]",
+        }
+        for old, new in replacements.items():
+            if line.startswith(old):
+                return new + line[len(old):]
+        return line
 
 
 @dataclass(frozen=True)

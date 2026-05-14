@@ -495,9 +495,16 @@ def main() -> int:
     emails = []
     for pst_path in pst_files:
         logger.log(f"[INFO] Reading PST: {pst_path}")
-        emails.extend(read_pst_emails(pst_path, logger, eml_root))
+        try:
+            emails.extend(read_pst_emails(pst_path, logger, eml_root))
+        except Exception as exc:
+            logger.log(f"[ERROR] PST extraction failed for {pst_path}: {exc}")
+            return 1
 
     logger.log(f"[INFO] Total emails extracted: {len(emails)}")
+    if not emails:
+        logger.log("[ERROR] No emails extracted from PST files; stopping before workbook fill.")
+        return 1
 
     threads = {}
     alt_index = {}

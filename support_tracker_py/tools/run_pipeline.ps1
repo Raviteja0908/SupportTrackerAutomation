@@ -4,16 +4,57 @@ param(
     [string]$EndDate = "",
     [string]$OutputPstPath = "",
     [switch]$NoVolume,
+    [switch]$UseVolume,
     [switch]$KeepVolumeData,
     [switch]$CleanVolume
 )
 
 $ErrorActionPreference = "Stop"
 
+function Resolve-TrackerRoot {
+    if (-not [string]::IsNullOrWhiteSpace($env:SUPPORT_TRACKER_ROOT)) {
+        return [System.IO.Path]::GetFullPath($env:SUPPORT_TRACKER_ROOT)
+    }
+    $dir = $PSScriptRoot
+    for ($i = 0; $i -lt 8 -and -not [string]::IsNullOrWhiteSpace($dir); $i++) {
+        $hasRuntimeDirs = (Test-Path (Join-Path $dir "PstFiles")) -or (Test-Path (Join-Path $dir "DockerOutput"))
+        $hasRepoDir = Test-Path (Join-Path $dir "SupportTrackerAutomation")
+        if ($hasRuntimeDirs -or $hasRepoDir) {
+            return $dir
+        }
+        $parent = Split-Path -Parent $dir
+        if ($parent -eq $dir) { break }
+        $dir = $parent
+    }
+    return (Split-Path -Parent $PSScriptRoot)
+}
+
 $Script:DefaultScriptsDir = $PSScriptRoot
-$Script:DefaultTrackerRoot = Split-Path -Parent $Script:DefaultScriptsDir
+$Script:DefaultTrackerRoot = Resolve-TrackerRoot
 $Script:DefaultPstDir = Join-Path $Script:DefaultTrackerRoot "PstFiles"
 $Script:DefaultOutputDir = Join-Path $Script:DefaultTrackerRoot "DockerOutput"
+
+function Write-Log {
+    param(
+        [string]$Level,
+        [string]$Message
+    )
+    $label = switch ($Level.ToLower()) {
+        "ok" { "ok" }
+        "warn" { "warn" }
+        "fail" { "fail" }
+        "progress" { "progress" }
+        "hint" { "hint" }
+        default { "info" }
+    }
+    Write-Host ("[{0}] {1}" -f $label, $Message)
+}
+
+function Write-Section {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host ("== {0} ==" -f $Title)
+}
 
 foreach ($dir in @($Script:DefaultTrackerRoot, $Script:DefaultScriptsDir, $Script:DefaultPstDir, $Script:DefaultOutputDir)) {
     if (-not (Test-Path $dir)) {
@@ -21,20 +62,20 @@ foreach ($dir in @($Script:DefaultTrackerRoot, $Script:DefaultScriptsDir, $Scrip
     }
 }
 
-Write-Host "=== Support Tracker Pipeline ==="
-Write-Host "Step 1: Export from Outlook to PST (daily chunks)"
+Write-Section "Support Tracker Pipeline"
+Write-Log "info" "Step 1: export Outlook folders to PST"
 
 $exportScript = Join-Path $PSScriptRoot "export_outlook.ps1"
-Write-Host ("Using export script: {0}" -f $exportScript)
+Write-Log "info" ("Export script: {0}" -f $exportScript)
 try {
     $verLine = Select-String -Path $exportScript -Pattern "Export script version" | Select-Object -First 1
     if ($verLine) {
-        Write-Host $verLine.Line
+        Write-Log "info" $verLine.Line
     } else {
-        Write-Host "WARNING: export script version not found (script may be outdated)."
+        Write-Log "warn" "Export script version not found; script may be outdated."
     }
 } catch {
-    Write-Host "WARNING: unable to read export script for version."
+    Write-Log "warn" "Unable to read export script version."
 }
 try {
     $exportResult = & $exportScript -FolderPathsInput $FolderPaths -StartDate $StartDate -EndDate $EndDate -OutputPstPath $OutputPstPath
@@ -48,9 +89,8 @@ try {
         }
     }
 } catch {
-    Write-Host ""
-    Write-Host "Export failed."
-    Write-Host $_.Exception.Message
+    Write-Section "Export Failed"
+    Write-Log "fail" ($_.Exception.Message)
     exit 1
 }
 
@@ -63,7 +103,7 @@ if ([string]::IsNullOrWhiteSpace($pstDir)) {
     throw "Unable to determine PST folder from path: $OutputPstPath"
 }
 
-$maxWaitSeconds = 600
+$maxWaitSeconds = 120
 $waitIntervalSeconds = 5
 $startWait = Get-Date
 
@@ -79,12 +119,14 @@ function Test-FileUnlocked {
 }
 
 function Close-OutlookGracefully {
+    param([int]$WaitSeconds = 20)
+
     $outlookProcs = @(Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue)
     if (-not $outlookProcs) {
         return $true
     }
 
-    Write-Host "Outlook is still running. Trying to close it safely..."
+    Write-Log "info" "Outlook is still running; trying a bounded close."
 
     try {
         $outlookApp = [System.Runtime.InteropServices.Marshal]::GetActiveObject("Outlook.Application")
@@ -92,6 +134,14 @@ function Close-OutlookGracefully {
             $outlookApp.Quit()
         }
     } catch {
+    } finally {
+        try {
+            if ($outlookApp) {
+                [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($outlookApp)
+            }
+        } catch {
+        }
+        $outlookApp = $null
     }
 
     foreach ($proc in @(Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue)) {
@@ -103,7 +153,7 @@ function Close-OutlookGracefully {
         }
     }
 
-    $deadline = (Get-Date).AddSeconds(60)
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
         if (-not (Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue)) {
             return $true
@@ -237,19 +287,23 @@ function Assert-WorkbookCopiedBack {
 function Reset-VolumeRunArtifacts {
     param([string]$VolumeName)
     $cmd = @'
-find /app/output -mindepth 1 -maxdepth 1 ! -name eml -exec rm -rf {} +
+find /app/output -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 '@
     & docker run --rm --entrypoint sh -v "${VolumeName}:/app/output" support-tracker -c $cmd
     Assert-LastExitCode ("Resetting run artifacts in Docker volume {0}" -f $VolumeName)
 }
 
-Write-Host "Step 1b: Ensure Outlook export is finished before Docker"
-if (Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue) {
-    $closed = Close-OutlookGracefully
-    if (-not $closed) {
-        Write-Host "Outlook did not close automatically. Please close Outlook to avoid PST file locks."
-        Read-Host "Press Enter once Outlook is closed"
+Write-Section "PST Lock Check"
+if (-not (Test-FileUnlocked $OutputPstPath)) {
+    Write-Log "warn" "PST is still locked; trying bounded Outlook close."
+    if (Get-Process -Name OUTLOOK -ErrorAction SilentlyContinue) {
+        $closed = Close-OutlookGracefully -WaitSeconds 20
+        if (-not $closed) {
+            Write-Log "warn" "Outlook still running after 20 seconds; waiting only for the PST lock now."
+        }
     }
+} else {
+    Write-Log "ok" "PST file is already released; skipping Outlook close."
 }
 
 while (-not (Test-FileUnlocked $OutputPstPath)) {
@@ -257,7 +311,7 @@ while (-not (Test-FileUnlocked $OutputPstPath)) {
     if ($elapsed.TotalSeconds -gt $maxWaitSeconds) {
         throw "PST file is still locked after $maxWaitSeconds seconds. Please close Outlook and run again."
     }
-    Write-Host "Waiting for PST file to be released..."
+    Write-Log "progress" "Waiting for PST file to be released..."
     Start-Sleep -Seconds $waitIntervalSeconds
 }
 
@@ -265,14 +319,19 @@ $outputDir = $Script:DefaultOutputDir
 if (-not (Test-Path $outputDir)) {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 }
-Write-Host ("Using default Docker output folder: {0}" -f $outputDir)
+Write-Log "info" ("Docker output folder: {0}" -f $outputDir)
 
-Write-Host "Step 2: Run Docker pipeline"
-Write-Host ("Using PST folder: {0}" -f $pstDir)
-Write-Host ("Using output folder: {0}" -f $outputDir)
+Write-Section "Docker Pipeline"
+Write-Log "info" ("PST folder: {0}" -f $pstDir)
+Write-Log "info" ("Output folder: {0}" -f $outputDir)
 
-Write-Host "Running Docker..."
-$useVolume = -not $NoVolume
+Write-Log "info" "Starting Docker..."
+$useVolume = $UseVolume -and -not $NoVolume
+if ($useVolume) {
+    Write-Log "info" "Docker output mode: named volume"
+} else {
+    Write-Log "info" "Docker output mode: direct bind mount"
+}
 if ($useVolume) {
     $volumeName = "support_tracker_output"
     $templates = @()
@@ -311,9 +370,9 @@ if ($useVolume) {
         $zeroes = Get-ChildItem $outputDir -Filter "*.xlsx" -ErrorAction SilentlyContinue |
             Where-Object { $_.Length -eq 0 } |
             Select-Object -ExpandProperty Name
-        Write-Host ("No recognized workbook .xlsx found in output folder: {0}" -f $outputDir)
+        Write-Log "warn" ("No recognized workbook .xlsx found in output folder: {0}" -f $outputDir)
         if ($zeroes) {
-            Write-Host ("Found zero-byte .xlsx files: {0}" -f ($zeroes -join ", "))
+            Write-Log "warn" ("Zero-byte .xlsx files: {0}" -f ($zeroes -join ", "))
         }
         $resume = Read-Host "Place the sheet in this folder, then press Enter to continue. Type quit to stop"
         if ($resume -match '^(?i)\s*(quit|exit)\s*$') {
@@ -331,16 +390,18 @@ if ($useVolume) {
             throw "Unable to read template file. Close Excel if it is open, then run again. Details: $($_.Exception.Message)"
         }
     }
-    Write-Host ("Using Docker volume for output: {0}" -f $volumeName)
+    Write-Log "info" ("Docker volume: {0}" -f $volumeName)
     & docker volume create $volumeName | Out-Null
     Assert-LastExitCode ("Creating Docker volume {0}" -f $volumeName)
     if ($KeepVolumeData) {
-        Write-Host "Keeping EML cache, but clearing prior run artifacts from volume..."
-        Reset-VolumeRunArtifacts -VolumeName $volumeName
+        Write-Log "info" "Keeping Docker volume after run; clearing prior artifacts before starting."
+    } else {
+        Write-Log "info" "Clearing prior Docker volume artifacts before starting."
     }
+    Reset-VolumeRunArtifacts -VolumeName $volumeName
     foreach ($templateInfo in $templates) {
         $template = $templateInfo.File
-        Write-Host ("Copying workbook into volume: {0}" -f $template.Name)
+        Write-Log "info" ("Copy workbook into volume: {0}" -f $template.Name)
         & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "$($template.FullName):/host/template.xlsx:ro" support-tracker -c "cp /host/template.xlsx '/app/output/$($template.Name)'"
         Assert-LastExitCode ("Copying workbook {0} into Docker volume" -f $template.Name)
     }
@@ -349,39 +410,40 @@ if ($useVolume) {
         foreach ($templateInfo in $templates) {
             $template = $templateInfo.File
             $null = Clear-TemplateArtifactsInVolume -VolumeName $volumeName -TemplateName $template.Name
-            Write-Host ("Starting workbook fill: {0} ({1})" -f $templateInfo.Label, $template.Name)
+            Write-Section ("Workbook: {0}" -f $templateInfo.Label)
+            Write-Log "info" ("Template: {0}" -f $template.Name)
             $sw = [Diagnostics.Stopwatch]::StartNew()
             & docker run --rm -e "TEMPLATE_PATH=/app/output/$($template.Name)" -v "${pstDir}:/app/input" -v "${volumeName}:/app/output" support-tracker
             Assert-LastExitCode ("Docker workbook fill for {0}" -f $template.Name)
             $sw.Stop()
             $csvSummary = Get-TemplateArtifactsFromVolume -VolumeName $volumeName -TemplateName $template.Name
-            Write-Host ("Finished workbook fill: {0} | Time: {1}" -f $templateInfo.Label, $sw.Elapsed)
-            Write-Host ("Verified fresh outputs: {0} data row(s), {1} debug row(s)" -f ($csvSummary.AutomationLines - 1), ($csvSummary.DebugLines - 1))
-            Write-Host ("Copying workbook back to host file: {0}" -f $template.Name)
+            Write-Log "ok" ("Workbook fill complete; time={0}" -f $sw.Elapsed)
+            Write-Log "ok" ("Fresh outputs: dataRows={0}; debugRows={1}" -f ($csvSummary.AutomationLines - 1), ($csvSummary.DebugLines - 1))
+            Write-Log "info" ("Copy workbook back: {0}" -f $template.Name)
             & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" -v "${outputDir}:/host" support-tracker -c "cp '/app/output/$($template.Name)' '/host/$($template.Name)'"
             Assert-LastExitCode ("Copying workbook {0} back to host" -f $template.Name)
             Assert-WorkbookCopiedBack -WorkbookPath (Join-Path $outputDir $template.Name)
         }
         $totalSw.Stop()
-        Write-Host ("Total workbook fill time: {0}" -f $totalSw.Elapsed)
+        Write-Log "ok" ("Total workbook fill time: {0}" -f $totalSw.Elapsed)
     } finally {
         if (-not $KeepVolumeData) {
-            Write-Host "Clearing volume data..."
+            Write-Log "info" "Clearing volume data..."
             & docker run --rm --entrypoint sh -v "${volumeName}:/app/output" support-tracker -c "find /app/output -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
             Assert-LastExitCode ("Clearing Docker volume {0}" -f $volumeName)
-            Write-Host "Cleanup complete (volume cleared)."
+            Write-Log "ok" "Volume cleanup complete."
         } else {
-            Write-Host "Keeping volume data (EMLs retained)."
+            Write-Log "info" "Keeping volume data."
         }
         if ($CleanVolume) {
             if ($KeepVolumeData) {
-                Write-Host "NOTE: -CleanVolume will remove the volume (data will be lost)."
+                Write-Log "warn" "-CleanVolume will remove the kept volume."
             }
-            Write-Host ("Removing Docker volume: {0}" -f $volumeName)
+            Write-Log "info" ("Removing Docker volume: {0}" -f $volumeName)
             try {
                 & docker volume rm $volumeName | Out-Null
             } catch {
-                Write-Host "WARNING: unable to remove Docker volume."
+                Write-Log "warn" "Unable to remove Docker volume."
             }
         }
     }
@@ -411,17 +473,18 @@ if ($useVolume) {
     foreach ($templateInfo in $templates) {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $null = Clear-TemplateArtifactsOnHost -OutputDir $outputDir -TemplateName $templateInfo.File.Name
-        Write-Host ("Starting workbook fill: {0} ({1})" -f $templateInfo.Label, $templateInfo.File.Name)
+        Write-Section ("Workbook: {0}" -f $templateInfo.Label)
+        Write-Log "info" ("Template: {0}" -f $templateInfo.File.Name)
         & docker run --rm -e "TEMPLATE_PATH=/app/output/$($templateInfo.File.Name)" -v "${pstDir}:/app/input" -v "${outputDir}:/app/output" support-tracker
         Assert-LastExitCode ("Docker workbook fill for {0}" -f $templateInfo.File.Name)
         $sw.Stop()
         $csvSummary = Get-TemplateArtifactsOnHost -OutputDir $outputDir -TemplateName $templateInfo.File.Name
-        Write-Host ("Finished workbook fill: {0} | Time: {1}" -f $templateInfo.Label, $sw.Elapsed)
-        Write-Host ("Verified fresh outputs: {0} data row(s), {1} debug row(s)" -f ($csvSummary.AutomationLines - 1), ($csvSummary.DebugLines - 1))
+        Write-Log "ok" ("Workbook fill complete; time={0}" -f $sw.Elapsed)
+        Write-Log "ok" ("Fresh outputs: dataRows={0}; debugRows={1}" -f ($csvSummary.AutomationLines - 1), ($csvSummary.DebugLines - 1))
         Assert-WorkbookCopiedBack -WorkbookPath $templateInfo.File.FullName
     }
     $totalSw.Stop()
-    Write-Host ("Total workbook fill time: {0}" -f $totalSw.Elapsed)
+    Write-Log "ok" ("Total workbook fill time: {0}" -f $totalSw.Elapsed)
 }
 
-Write-Host "=== Done ==="
+Write-Section "Done"

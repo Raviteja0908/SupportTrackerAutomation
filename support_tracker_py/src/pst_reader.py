@@ -21,8 +21,12 @@ def read_pst_emails(pst_path, logger, eml_root: Path):
 
     existing_any = next(eml_dir.rglob("*.eml"), None)
     if existing_any is not None:
-        logger.log(f"[INFO] Using existing EMLs in {eml_dir}")
-        return read_eml_directory(eml_dir, logger)
+        if _env_truthy("SKIP_PST_CONVERT"):
+            logger.log(f"[INFO] Using existing EMLs in {eml_dir}")
+            return read_eml_directory(eml_dir, logger)
+        logger.log(f"[INFO] Removing existing EML cache before fresh PST conversion: {eml_dir}")
+        shutil.rmtree(eml_dir)
+        eml_dir.mkdir(parents=True, exist_ok=True)
 
     work_dir = eml_root / "__pst_work__"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -47,9 +51,12 @@ def read_pst_emails(pst_path, logger, eml_root: Path):
                 logger.log(f"[ERROR] readpst stderr: {exc.stderr.strip()}")
         except Exception:
             pass
-        return []
+        raise RuntimeError(f"readpst failed for {pst_path}") from exc
 
-    return read_eml_directory(eml_dir, logger)
+    emails = read_eml_directory(eml_dir, logger)
+    if not emails:
+        raise RuntimeError(f"readpst produced zero emails for {pst_path}")
+    return emails
 
 
 def _readpst_available() -> bool:
