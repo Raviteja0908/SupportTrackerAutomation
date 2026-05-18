@@ -1529,6 +1529,8 @@ try {
 } finally {
     try {
         $null = Remove-ManagedPstStoreByPath -TargetPstPath $OutputPstPath -Retries 4 -RetryDelaySeconds 3
+        Release-ComObjectQuietly $destRoot
+        Release-ComObjectQuietly $destStore
         $destRoot = $null
         $destStore = $null
     } catch {
@@ -1547,7 +1549,7 @@ try {
             Write-Log "info" "Leaving Outlook open after export cleanup to avoid shutdown hangs."
         }
     } finally {
-        foreach ($comObj in @($destRoot, $destStore, $inbox, $namespace, $outlook)) {
+        foreach ($comObj in @($inbox, $namespace, $outlook)) {
             try {
                 if ($comObj) {
                     [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObj)

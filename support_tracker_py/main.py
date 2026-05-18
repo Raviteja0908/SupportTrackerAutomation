@@ -637,12 +637,12 @@ def main() -> int:
 
     def _id_like_tokens(text: str) -> set:
         _ck = text or ""
-        _cached = _id_like_tokens_cache.get(_ck)
-        if _cached is not None:
-            return _cached
+        if _ck in _id_like_tokens_cache:
+            return _id_like_tokens_cache[_ck]
         if not text:
-            _id_like_tokens_cache[_ck] = set()
-            return set()
+            tokens = set()
+            _id_like_tokens_cache[_ck] = tokens
+            return tokens
         text = re.sub(r"[Ã¢â‚¬ÂÃ¢â‚¬â€˜Ã¢â‚¬â€™Ã¢â‚¬â€œÃ¢â‚¬â€Ã¢â‚¬â€¢Ã¢Ë†â€™Ã¯Â¹Â£Ã¯Â¼Â\u00ad]", "-", text)
         text = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff]", "", text)
         tokens = {
