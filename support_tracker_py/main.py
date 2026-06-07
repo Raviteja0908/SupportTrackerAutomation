@@ -5542,6 +5542,7 @@ def main() -> int:
                             ess_match,
                             -abs((e_ist - resolved_ist).total_seconds()),
                             e_ist,
+                            id(e),
                             e,
                         )
                         if best is None or cand > best:
@@ -5551,7 +5552,7 @@ def main() -> int:
                         continue
 
                     seen.add(minute_key)
-                    out.append(best[4])
+                    out.append(best[5])
 
                 out.sort(key=lambda e: _email_ist(e) or datetime.max)
                 return out
@@ -6729,7 +6730,7 @@ def main() -> int:
                         sender_src = e.sender_email or e.sender_name or ""
                         if sender_src and resolved_src_now and sender_src.lower() == str(resolved_src_now).lower():
                             src_match = 1
-                    cand = (src_match, -abs((e_ist - r_ist).total_seconds()), e_ist, e)
+                    cand = (src_match, -abs((e_ist - r_ist).total_seconds()), e_ist, id(e), e)
                     if best_local is None or cand > best_local:
                         best_local = cand
                 return best_local
@@ -6783,7 +6784,7 @@ def main() -> int:
                     e_ist = _email_ist(e)
                     if not e_ist or abs((e_ist - live_reply_ist).total_seconds()) > 300:
                         continue
-                    cand = (-abs((e_ist - live_reply_ist).total_seconds()), e_ist, e)
+                    cand = (-abs((e_ist - live_reply_ist).total_seconds()), e_ist, id(e), e)
                     if best_local is None or cand > best_local:
                         best_local = cand
                 return best_local
@@ -6792,7 +6793,7 @@ def main() -> int:
             if best is None and expanded_thread is not base_thread:
                 best = _best_message_from(expanded_thread)
 
-            out = best[2] if best else None
+            out = best[3] if best else None
             _live_reply_message_cache[cache_key] = out
             return out
 
@@ -13683,13 +13684,13 @@ def main() -> int:
                             continue
                         if not _quoted_sender_matches_live_shared(first_from_line, e):
                             continue
-                        cand = (-delta, e_ist, e)
+                        cand = (-delta, e_ist, id(e), e)
                         if same_time_match is None or cand > same_time_match:
                             same_time_match = cand
 
                     if same_time_match is not None:
                         matched_ess_ist = same_time_match[1]
-                        matched_ess_msg = same_time_match[2]
+                        matched_ess_msg = same_time_match[3]
                         lower_non_ess = _lower_non_ess_below(first_idx, matched_ess_ist, matched_ess_msg)
                         if lower_non_ess is None:
                             out = {
@@ -13755,13 +13756,13 @@ def main() -> int:
                     if delta > 300:
                         continue
                     sender_score = 1 if _quoted_sender_matches_live_shared(first_from_line, e) else 0
-                    cand = (sender_score, -delta, e_ist, e)
+                    cand = (sender_score, -delta, e_ist, id(e), e)
                     if ack_match is None or cand > ack_match:
                         ack_match = cand
 
                 if ack_match is not None:
                     ack_ist = ack_match[2]
-                    ack_msg = ack_match[3]
+                    ack_msg = ack_match[4]
                     ack_echo_skips = 0
                     for next_idx, next_from_line, next_sent_ist, _next_q_subj in primary_blocks[1:]:
                         if next_idx <= first_idx:

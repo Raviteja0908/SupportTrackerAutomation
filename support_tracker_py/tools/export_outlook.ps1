@@ -66,7 +66,7 @@ if ($env:EXCLUDE_CREATION_TIME) {
 Write-Section "Outlook Export"
 Write-Log "info" "Mode: PST append, copy only"
 Write-Log "info" ("Start: {0}" -f (Get-Date))
-Write-Log "info" "Script version: 2026-04-06-1"
+Write-Log "info" "Script version: 2026-05-19-4"
 Write-Log "hint" "Prompt commands: back, quit"
 
 $Script:BackToken = "__SCRIPT_BACK__"
@@ -126,14 +126,42 @@ if ($env:CLOSE_OUTLOOK_AFTER_EXPORT) {
 function Split-InboxCombinedPath {
     param([string]$path)
     if ([string]::IsNullOrWhiteSpace($path)) { return @() }
-    $p = $path.Trim()
+    $p = [regex]::Replace($path.Trim(), '\\+', '\')
+    if ($p.Length -gt 0 -and ($p.Length % 2) -eq 0) {
+        $half = [int]($p.Length / 2)
+        $left = $p.Substring(0, $half)
+        $right = $p.Substring($half)
+        if ($left -ieq $right) {
+            return @($left, $right)
+        }
+    }
+    $firstSlash = $p.IndexOf("\")
+    if ($firstSlash -gt 0) {
+        $firstPrefix = $p.Substring(0, $firstSlash + 1)
+        $repeatIdx = $p.IndexOf($firstPrefix, $firstSlash + 1, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($repeatIdx -gt 0) {
+            return @($p.Substring(0, $repeatIdx).Trim(), $p.Substring($repeatIdx).Trim()) | Where-Object { $_ -ne "" }
+        }
+    }
     $lower = $p.ToLower()
-    $needle = "inbox\\"
+    $needle = "inbox\"
+    foreach ($info in @($storeInfos)) {
+        foreach ($name in @($info.DisplayName, $info.RootName)) {
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            $candidate = "$name\"
+            if ($lower.StartsWith($candidate.ToLower())) {
+                $needle = $candidate
+                break
+            }
+        }
+        if ($needle -ne "inbox\") { break }
+    }
+    $needleLower = $needle.ToLower()
     $indices = @()
-    $idx = $lower.IndexOf($needle)
+    $idx = $lower.IndexOf($needleLower)
     while ($idx -ge 0) {
         $indices += $idx
-        $idx = $lower.IndexOf($needle, $idx + 1)
+        $idx = $lower.IndexOf($needleLower, $idx + 1)
     }
     if ($indices.Count -le 1) { return @($p) }
     $parts = @()
@@ -310,6 +338,7 @@ function Remove-ManagedPstStoreByPath {
     for ($attempt = 1; $attempt -le $Retries; $attempt++) {
         $matchingStore = $null
         $root = $null
+        $detachedStore = $false
         try {
             foreach ($store in (Get-SafeStores)) {
                 $displayName = $null
@@ -350,6 +379,7 @@ function Remove-ManagedPstStoreByPath {
             }
 
             $namespace.RemoveStore($root)
+            $detachedStore = $true
             Write-Log "ok" ("Detached export PST: {0}" -f $TargetPstPath)
             Start-Sleep -Seconds 1
             return $true
@@ -361,12 +391,14 @@ function Remove-ManagedPstStoreByPath {
             Write-Log "warn" ("Detach attempt {0}/{1} failed; retrying: {2}" -f $attempt, $Retries, $TargetPstPath)
             Start-Sleep -Seconds $RetryDelaySeconds
         } finally {
-            foreach ($comObj in @($root, $matchingStore)) {
-                try {
-                    if ($comObj) {
-                        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObj)
+            if (-not $detachedStore) {
+                foreach ($comObj in @($root, $matchingStore)) {
+                    try {
+                        if ($comObj) {
+                            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObj)
+                        }
+                    } catch {
                     }
-                } catch {
                 }
             }
             $root = $null
@@ -413,17 +445,21 @@ function Normalize-UserPath {
     param([string]$raw)
     $clean = ($raw -replace "/", "\\").Replace('"', '').Replace("'", '').Trim()
     if ([string]::IsNullOrWhiteSpace($clean)) { return $null }
+    $clean = [regex]::Replace($clean, '\\+', '\')
     $clean = $clean.TrimStart("\")
     $storePrefixMatch = $false
     foreach ($info in $storeInfos) {
-        if ($info.DisplayName -and $clean -like "$($info.DisplayName)\\*") {
+        if ($info.DisplayName -and $clean -like "$($info.DisplayName)\*") {
             $storePrefixMatch = $true
             break
         }
-        if ($info.RootName -and $clean -like "$($info.RootName)\\*") {
+        if ($info.RootName -and $clean -like "$($info.RootName)\*") {
             $storePrefixMatch = $true
             break
         }
+    }
+    if (-not $storePrefixMatch -and $clean -match '^[^\\]+@[^\\]+\\') {
+        $storePrefixMatch = $true
     }
     if (-not ($clean -match '^(?i)inbox\\') -and -not $storePrefixMatch) {
         $clean = "Inbox\$clean"
@@ -735,6 +771,11 @@ function Prompt-InteractiveExportDetails {
                     }
                     continue
                 }
+                $rawParts = @(Split-InboxCombinedPath $pRaw)
+                if ($rawParts.Count -gt 1) {
+                    Write-Host 'It looks like multiple paths were pasted. Please enter only one path for this item.'
+                    continue
+                }
                 $p = Normalize-UserPath -raw $pRaw
                 if ([string]::IsNullOrWhiteSpace($p)) {
                     Write-Host 'Please enter a valid path like Inbox\\My Team.'
@@ -823,12 +864,14 @@ if (-not [string]::IsNullOrWhiteSpace($FolderPathsInput)) {
     # Split on comma/semicolon/newline, trim whitespace
     $rawPaths = ($FolderPathsInput -split '[,;\r\n]+' ) | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
     foreach ($raw in $rawPaths) {
-        $clean = Normalize-UserPath -raw $raw
-        if ([string]::IsNullOrWhiteSpace($clean)) { continue }
-        $parts = Split-InboxCombinedPath $clean
-        foreach ($part in $parts) {
-            if (-not [string]::IsNullOrWhiteSpace($part)) {
-                $folderPaths += ,$part
+        foreach ($rawPart in (Split-InboxCombinedPath $raw)) {
+            $clean = Normalize-UserPath -raw $rawPart
+            if ([string]::IsNullOrWhiteSpace($clean)) { continue }
+            $parts = Split-InboxCombinedPath $clean
+            foreach ($part in $parts) {
+                if (-not [string]::IsNullOrWhiteSpace($part)) {
+                    $folderPaths += ,$part
+                }
             }
         }
     }
@@ -851,7 +894,9 @@ $finalList = New-Object System.Collections.Generic.List[string]
 foreach ($fp in $folderPaths) {
     foreach ($part in (Split-InboxCombinedPath $fp)) {
         if (-not [string]::IsNullOrWhiteSpace($part)) {
-            $finalList.Add($part)
+            if (-not $finalList.Contains($part)) {
+                $finalList.Add($part)
+            }
         }
     }
 }
@@ -1075,6 +1120,15 @@ function Resolve-SourceFolder {
         }
         $resolved = Resolve-ChildPath -root $current -parts $remaining
         if (-not $resolved) {
+            if ($startIdx -eq 1) {
+                $storeInbox = Get-StoreInboxFolder -storeName $parts[0]
+                if ($storeInbox) {
+                    $resolved = Resolve-ChildPath -root $storeInbox -parts $remaining
+                    if ($resolved) {
+                        return $resolved
+                    }
+                }
+            }
             $rel = @()
             if ($parts.Length -gt $startIdx) { $rel = $parts[$startIdx..($parts.Length - 1)] }
             $leaf = if ($rel.Length -gt 0) { $rel[$rel.Length - 1] } else { $null }
@@ -1104,6 +1158,9 @@ foreach ($path in $folderPaths) {
     }
 }
 $folderPaths = $validated
+if ($folderPaths.Count -eq 0) {
+    throw "No requested Outlook folders could be resolved. Re-run with a folder path shown in the Outlook folder listing, for example: Inbox\My Team."
+}
 
 function Get-Item-Date {
     param([object]$item)
@@ -1528,11 +1585,11 @@ try {
     }
 } finally {
     try {
-        $null = Remove-ManagedPstStoreByPath -TargetPstPath $OutputPstPath -Retries 4 -RetryDelaySeconds 3
         Release-ComObjectQuietly $destRoot
         Release-ComObjectQuietly $destStore
         $destRoot = $null
         $destStore = $null
+        $null = Remove-ManagedPstStoreByPath -TargetPstPath $OutputPstPath -Retries 4 -RetryDelaySeconds 3
     } catch {
         Write-Log "warn" ("Cleanup detach failed: {0}" -f ($_.Exception.Message))
     }
@@ -1557,10 +1614,11 @@ try {
             } catch {
             }
         }
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
+        $inbox = $null
+        $namespace = $null
+        $outlook = $null
+        # Do not force CLR finalizers here. Outlook can invalidate PST COM wrappers
+        # during RemoveStore, and run_pipeline.ps1 handles the bounded PST lock wait.
     }
 }
 

@@ -33,6 +33,7 @@ $Script:DefaultScriptsDir = $PSScriptRoot
 $Script:DefaultTrackerRoot = Resolve-TrackerRoot
 $Script:DefaultPstDir = Join-Path $Script:DefaultTrackerRoot "PstFiles"
 $Script:DefaultOutputDir = Join-Path $Script:DefaultTrackerRoot "DockerOutput"
+$Script:DefaultPstPath = Join-Path $Script:DefaultPstDir "export_filtered.pst"
 
 function Write-Log {
     param(
@@ -67,8 +68,11 @@ Write-Log "info" "Step 1: export Outlook folders to PST"
 
 $exportScript = Join-Path $PSScriptRoot "export_outlook.ps1"
 Write-Log "info" ("Export script: {0}" -f $exportScript)
+if ([string]::IsNullOrWhiteSpace($OutputPstPath)) {
+    $OutputPstPath = $Script:DefaultPstPath
+}
 try {
-    $verLine = Select-String -Path $exportScript -Pattern "Export script version" | Select-Object -First 1
+    $verLine = Select-String -Path $exportScript -Pattern "Export script version|Script version" | Select-Object -First 1
     if ($verLine) {
         Write-Log "info" $verLine.Line
     } else {
@@ -89,9 +93,26 @@ try {
         }
     }
 } catch {
-    Write-Section "Export Failed"
-    Write-Log "fail" ($_.Exception.Message)
-    exit 1
+    $exportError = $_.Exception.Message
+    $pstExists = Test-Path $OutputPstPath
+    $pstLooksUsable = $false
+    if ($pstExists) {
+        try {
+            $pstLooksUsable = ((Get-Item -LiteralPath $OutputPstPath).Length -gt 0)
+        } catch {
+            $pstLooksUsable = $false
+        }
+    }
+    if ($exportError -match 'Argument types do not match' -and $pstLooksUsable) {
+        Write-Section "Export Cleanup Warning"
+        Write-Log "warn" "Outlook raised a known COM cleanup error after creating the PST."
+        Write-Log "warn" $exportError
+        Write-Log "ok" ("Continuing with PST: {0}" -f $OutputPstPath)
+    } else {
+        Write-Section "Export Failed"
+        Write-Log "fail" $exportError
+        exit 1
+    }
 }
 
 if (-not (Test-Path $OutputPstPath)) {
@@ -460,25 +481,38 @@ if ($useVolume) {
     }
 } else {
     $templates = @()
-    $seenKinds = @{}
-    Get-ChildItem $outputDir -Filter "*.xlsx" |
-        Where-Object { $_.Name -notmatch "filled|done|automation_output" -and $_.Length -gt 0 } |
-        Sort-Object LastWriteTime -Descending |
-        ForEach-Object {
-            $kind = Get-WorkbookKind -FileName $_.Name
-            if ([string]::IsNullOrWhiteSpace($kind)) { return $null }
-            if ($seenKinds.ContainsKey($kind)) {
-                throw ("Multiple workbook files detected for {0}: {1}, {2}. Keep only one per workbook type." -f (Get-WorkbookLabel $kind), $seenKinds[$kind].Name, $_.Name)
+    while ($templates.Count -eq 0) {
+        $seenKinds = @{}
+        Get-ChildItem $outputDir -Filter "*.xlsx" |
+            Where-Object { $_.Name -notmatch "filled|done|automation_output" -and $_.Length -gt 0 } |
+            Sort-Object LastWriteTime -Descending |
+            ForEach-Object {
+                $kind = Get-WorkbookKind -FileName $_.Name
+                if ([string]::IsNullOrWhiteSpace($kind)) { return $null }
+                if ($seenKinds.ContainsKey($kind)) {
+                    throw ("Multiple workbook files detected for {0}: {1}, {2}. Keep only one per workbook type." -f (Get-WorkbookLabel $kind), $seenKinds[$kind].Name, $_.Name)
+                }
+                $seenKinds[$kind] = $_
+                $templates += [PSCustomObject]@{
+                    Kind  = $kind
+                    Label = Get-WorkbookLabel -Kind $kind
+                    File  = $_
+                }
             }
-            $seenKinds[$kind] = $_
-            $templates += [PSCustomObject]@{
-                Kind  = $kind
-                Label = Get-WorkbookLabel -Kind $kind
-                File  = $_
-            }
+        if ($templates.Count -gt 0) {
+            break
         }
-    if (-not $templates -or $templates.Count -eq 0) {
-        throw "No recognized workbook .xlsx found in output folder."
+        $zeroes = Get-ChildItem $outputDir -Filter "*.xlsx" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -eq 0 } |
+            Select-Object -ExpandProperty Name
+        Write-Log "warn" ("No recognized workbook .xlsx found in output folder: {0}" -f $outputDir)
+        if ($zeroes) {
+            Write-Log "warn" ("Zero-byte .xlsx files: {0}" -f ($zeroes -join ", "))
+        }
+        $resume = Read-Host "Place the sheet in this folder, then press Enter to continue. Type quit to stop"
+        if ($resume -match '^(?i)\s*(quit|exit)\s*$') {
+            throw "Workbook template not provided."
+        }
     }
     $totalSw = [Diagnostics.Stopwatch]::StartNew()
     foreach ($templateInfo in $templates) {
