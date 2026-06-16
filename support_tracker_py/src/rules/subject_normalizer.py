@@ -12,7 +12,7 @@ _fancy_quotes = {
 }
 
 _ess_name_re = re.compile(
-    r"^\s*ESS\s*-\s*[^-]{1,60}\s*-\s*(?=(re|fw|fwd|aw|wg|sv)\s*:)",
+    r"^\s*ESS\s*-\s*[^-]{1,60}\s*-\s*",
     re.IGNORECASE,
 )
 
@@ -25,6 +25,11 @@ def normalize_subject(subject: str) -> str:
         s = s.replace(k, v)
     s = _external_re.sub("", s)
     s = _strip_leading_symbols(s)
+    while True:
+        new_s = _prefix_re.sub("", s)
+        if new_s == s:
+            break
+        s = new_s
     s = _ess_name_re.sub("", s)
     while True:
         new_s = _prefix_re.sub("", s)

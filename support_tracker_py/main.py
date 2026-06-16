@@ -13161,7 +13161,7 @@ def main() -> int:
             if subj_ids and (not subj_ids.isdisjoint(row_id_tokens_set)):
                 return True
 
-            key = id(msg)
+            key = _email_stable_key(msg)
             if key in raw_id_token_cache:
                 return bool(raw_id_token_cache[key] & row_id_tokens_set)
 
@@ -15271,7 +15271,7 @@ def main() -> int:
             quoted_day_slack = 0
             parent_ess_cache = {}
             def _parent_sender_info(msg):
-                key = id(msg)
+                key = _email_stable_key(msg)
                 if key in parent_ess_cache:
                     return parent_ess_cache[key]
                 parent_is_ess = None

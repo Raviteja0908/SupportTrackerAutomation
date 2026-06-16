@@ -171,7 +171,9 @@ def _html_to_text(value: str) -> str:
     if _BeautifulSoup is not None:
         try:
             soup = _BeautifulSoup(value, "html.parser")
-            text = _html.unescape(soup.get_text("\n"))
+            for tag in soup.find_all(["br", "p", "div", "blockquote", "td", "tr", "li"]):
+                tag.insert_after("\n")
+            text = _html.unescape(soup.get_text(" "))
         except Exception:
             text = ""
     if not text:
