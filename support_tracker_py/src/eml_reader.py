@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email import policy
 from email.parser import BytesParser
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime, getaddresses
 from pathlib import Path
 import os
 import html as _html
@@ -39,6 +39,14 @@ def read_eml_directory(root: Path, logger):
         from_header = msg.get("from") or ""
         sender_name, sender_email = parseaddr(from_header)
         sender_email = (sender_email or "").strip().lower()
+        to_header = msg.get_all("to") or []
+        cc_header = msg.get_all("cc") or []
+        to_recipients = tuple(
+            sorted({addr.strip().lower() for _name, addr in getaddresses(to_header) if addr})
+        )
+        cc_recipients = tuple(
+            sorted({addr.strip().lower() for _name, addr in getaddresses(cc_header) if addr})
+        )
 
         sent_time = _parse_date(msg.get("date"))
         received_time = _parse_received(msg.get_all("received"))
@@ -64,6 +72,8 @@ def read_eml_directory(root: Path, logger):
             body=body,
             body_html=body_html,
             body_html_raw=body_html_raw,
+            to_recipients=to_recipients,
+            cc_recipients=cc_recipients,
         )
 
     max_workers = min(8, os.cpu_count() or 4)

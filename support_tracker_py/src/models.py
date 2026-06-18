@@ -12,3 +12,5 @@ class EmailRecord:
     body: str
     body_html: str = ""
     body_html_raw: str = ""
+    to_recipients: tuple = ()
+    cc_recipients: tuple = ()

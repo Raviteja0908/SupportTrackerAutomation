@@ -116,6 +116,49 @@ _SOURCE_LOCKED_SAME_TIME_TOKENS = (
 )
 
 
+# DL addresses used when an ESS member intentionally reroutes their own
+# follow-up/closure reply to the shared ESS distribution list instead of
+# the original requester. When a reply matches this pattern, it must NOT
+# be treated as an "ESS replied over ESS" same-time collapse signal for
+# the Business Incident sheet.
+_ESS_DL_ONLY_RECIPIENTS = (
+    "enterprise-services-support@umusic.com",
+    "enterprise-services-support@inveniolsi.com",
+)
+
+
+def _is_ess_dl_only_reroute(email_record, ess_team) -> bool:
+    """
+    Returns True when an email should be EXCLUDED from the ESS-over-ESS
+    all-three-same collapse pool because the sender (an ESS member)
+    intentionally rerouted the reply to only the shared ESS DL.
+
+    The To-recipients of this email, once any address belonging to the
+    sender themselves is excluded, must resolve to ONLY one of the known
+    ESS DL addresses (no other recipient present). Cc is intentionally
+    NOT checked, to avoid false positives from someone who simply cc'd
+    the DL while still genuinely replying to the requester.
+
+    This function is intentionally conservative: if recipient data is
+    missing or ambiguous, it returns False (does NOT exclude), so
+    existing behavior is preserved whenever there is any doubt.
+    """
+    if not email_record:
+        return False
+
+    to_recipients = getattr(email_record, "to_recipients", None)
+    if to_recipients:
+        sender_email = (getattr(email_record, "sender_email", "") or "").strip().lower()
+        other_recipients = {
+            addr for addr in to_recipients
+            if addr and addr != sender_email
+        }
+        if other_recipients and other_recipients.issubset(set(_ESS_DL_ONLY_RECIPIENTS)):
+            return True
+
+    return False
+
+
 def _has_source_locked_same_time(notes_text: str) -> bool:
     notes_l = (notes_text or "").lower()
     return any(token in notes_l for token in _SOURCE_LOCKED_SAME_TIME_TOKENS)
@@ -5382,6 +5425,8 @@ def main() -> int:
                         flags = _shared_reply_flags(email_record=e)
                         if _system_like_sender(e) or flags["ignore_reply"]:
                             continue
+                        if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                            continue
                     else:
                         if not _group_req_match(e):
                             continue
@@ -5479,6 +5524,8 @@ def main() -> int:
                         continue
                     flags = _shared_reply_flags(email_record=e)
                     if _system_like_sender(e) or flags["ignore_reply"]:
+                        continue
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                         continue
                     if row_tokens:
                         s_norm = normalize_subject(getattr(e, "subject", "") or "")
@@ -6175,6 +6222,8 @@ def main() -> int:
                 flags = _shared_reply_flags(email_record=e)
                 if _ess_sender(e):
                     if _system_like_sender(e) or flags["ignore_reply"]:
+                        continue
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                         continue
                     ess_pool.append(e)
                     if _group_req_match(e):

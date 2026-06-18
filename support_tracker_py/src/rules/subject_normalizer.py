@@ -70,6 +70,11 @@ def _strip_interface_prefix(text: str) -> str:
     left = m.group(1).strip()
     right = m.group(3).strip()
     if _looks_like_interface_prefix(left):
+        while True:
+            new_right = _prefix_re.sub("", right)
+            if new_right == right:
+                break
+            right = new_right
         return right
     return text
 
