@@ -6769,6 +6769,8 @@ def main() -> int:
                         continue
                     if not _is_real_reply_candidate(e):
                         continue
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                        continue
                     if not _row_subject_match_email(e, subject_norm_value, row_tokens, row_id_tokens):
                         continue
                     e_ist = _email_ist(e)
@@ -6827,6 +6829,8 @@ def main() -> int:
                     if not _req_match(e, requester):
                         continue
                     if not _is_real_reply_candidate(e):
+                        continue
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                         continue
                     if not _row_subject_match_email(e, subject_norm_value, row_tokens, row_id_tokens):
                         continue
@@ -13598,6 +13602,10 @@ def main() -> int:
             if not (reply_msg and reply_ist and thread):
                 _seed_locked_lane_episode_cache[cache_key] = None
                 return None
+            reply_is_dl_only_reroute = (
+                workbook_kind == "incident_business"
+                and _is_ess_dl_only_reroute(reply_msg, ess_team)
+            )
 
             quoted_blocks = _get_quoted_blocks_with_subject_cached(reply_msg)
             if not quoted_blocks:
@@ -13708,6 +13716,7 @@ def main() -> int:
                 if (
                     allow_strict_same_time
                     and _ess_sender(reply_msg)
+                    and not reply_is_dl_only_reroute
                     and reply_flags["substantive_reply"]
                     and not reply_flags["ack_candidate"]
                     and not reply_flags["ignore_reply"]
@@ -13718,6 +13727,8 @@ def main() -> int:
                         if not e_ist or e_ist >= reply_ist:
                             continue
                         if not _ess_sender(e):
+                            continue
+                        if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                             continue
                         if not _row_subject_match_email_quoted(e, subject_norm_value, row_tokens, row_id_tokens_set):
                             continue
@@ -13763,7 +13774,7 @@ def main() -> int:
                         _seed_locked_lane_episode_cache[cache_key] = out
                         return out
 
-                if allow_strict_same_time and _ess_sender(reply_msg) and reply_ackish:
+                if allow_strict_same_time and _ess_sender(reply_msg) and not reply_is_dl_only_reroute and reply_ackish:
                     lower_non_ess = _lower_non_ess_below(first_idx, first_sent_ist)
                     if lower_non_ess is None:
                         out = {
@@ -13792,6 +13803,8 @@ def main() -> int:
                     if not e_ist or e_ist >= reply_ist:
                         continue
                     if not _ess_sender(e):
+                        continue
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                         continue
                     if not _row_subject_match_email_quoted(e, subject_norm_value, row_tokens, row_id_tokens_set):
                         continue
@@ -13898,6 +13911,8 @@ def main() -> int:
                                     if e_ist.replace(second=0, microsecond=0) != fb_ack_ist.replace(second=0, microsecond=0):
                                         continue
                                     if not _ess_sender(e):
+                                        continue
+                                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                                         continue
                                     if not _row_subject_match_email_quoted(e, subject_norm_value, row_tokens, row_id_tokens):
                                         continue
