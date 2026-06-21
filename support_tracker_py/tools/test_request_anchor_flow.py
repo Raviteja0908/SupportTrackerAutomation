@@ -179,7 +179,7 @@ def _id_like_tokens(text: str) -> set[str]:
     text = text.lower()
     tokens = {
         m.group(0)
-        for m in re.finditer(r"(?<![a-z0-9])[a-z]{2,}[a-z0-9\\-]*\\d[a-z0-9\\-]*(?![a-z0-9])", text)
+        for m in re.finditer(r"(?<![a-z0-9])[a-z]{2,}[a-z0-9\-]*\d[a-z0-9\-]*(?![a-z0-9])", text)
     }
     if not tokens:
         for part in re.split(r"[^a-z0-9\\-]+", text):

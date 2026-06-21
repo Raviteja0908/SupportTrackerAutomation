@@ -1886,13 +1886,14 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                 created_time = req_time
                 created_src = req_src
                 created_dt = _to_ist(created_time)
-        response_time = _format_time(effective_ack.sent_time)
         if ack_dt - created_dt <= timedelta(minutes=16):
+            response_time = _format_time(effective_ack.sent_time)
             if ack_mail is None:
                 notes = "Ack fallback OK"
             else:
                 notes = "OK"
         else:
+            response_time = "NA"
             notes = "Ack delayed (>16 min)"
 
         # If created came from quoted parsing, re-parse ack body to find the

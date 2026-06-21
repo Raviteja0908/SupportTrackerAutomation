@@ -1334,8 +1334,8 @@ def main() -> int:
 
     def _subject_for_description(description: str) -> str:
         subject_text = extract_subject_from_description(description or "")
-        if description and re.search(r"(?:--\.?>|â†’|âž”|âž¡|=>)", description):
-            parts = re.split(r"\s*(?:--\.?>|â†’|âž”|âž¡|=>)\s*", description, maxsplit=1)
+        if description and re.search(ARROW_SPLIT_RE, description):
+            parts = re.split(ARROW_SPLIT_RE, description, maxsplit=1)
             if len(parts) >= 2:
                 _right = parts[1].strip()
                 _right_l = _right.lower()
@@ -3396,8 +3396,8 @@ def main() -> int:
         # Interface tokens from description prefix help disambiguate
         # when the subject text itself loses the interface prefix.
         desc_prefix = ""
-        if description and re.search(r"(?:--\.?>|â†’|âž”|âž¡|Ã¢â€ â€™|Ã¢Å¾â€|Ã¢Å¾Â¡|=>)", description):
-            parts = re.split(r"\s*(?:--\.?>|â†’|âž”|âž¡|Ã¢â€ â€™|Ã¢Å¾â€|Ã¢Å¾Â¡|=>)\s*", description, maxsplit=1)
+        if description and re.search(ARROW_SPLIT_RE, description):
+            parts = re.split(ARROW_SPLIT_RE, description, maxsplit=1)
             if len(parts) >= 2:
                 desc_prefix = parts[0].strip()
         iface_hint_tokens = _interface_tokens(desc_prefix) if desc_prefix else set()
@@ -5819,7 +5819,7 @@ def main() -> int:
                         for from_line, sent_ist in _extract_quoted_blocks(e, subject_norm_value):
                             if sent_ist < day_start or sent_ist >= day_end:
                                 continue
-                            addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", from_line, flags=re.I)
+                            addr_hits = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", from_line, flags=re.I)
                             if not addr_hits:
                                 continue
                             emails_l = [em.lower() for em in addr_hits]
@@ -8881,6 +8881,9 @@ def main() -> int:
 
             next_reply = _pick_reply_after_ack(consultant_after, ack_ist, requester)
             next_reply_ist = _email_ist(next_reply) if next_reply else None
+            owner_reply = None
+            owner_reply_ist = None
+            owner_reply_in_window = False
             if (
                 owner_reply_in_window
                 and owner_reply is not None
@@ -13223,7 +13226,7 @@ def main() -> int:
             raw = raw.replace("&ndash;", "-").replace("&mdash;", "-").replace("&#8209;", "-")
             raw_tokens = {
                 m.group(0)
-                for m in re.finditer(r"(?<![a-z0-9])[a-z]{2,}[a-z0-9\\-]*\\d[a-z0-9\\-]*(?![a-z0-9])", raw)
+                for m in re.finditer(r"(?<![a-z0-9])[a-z]{2,}[a-z0-9\-]*\d[a-z0-9\-]*(?![a-z0-9])", raw)
             }
             raw_id_token_cache[key] = raw_tokens
             return bool(raw_tokens & row_id_tokens_set)
