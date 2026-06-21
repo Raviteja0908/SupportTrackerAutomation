@@ -3,7 +3,7 @@ import re
 
 _prefix_re = re.compile(r"^\s*(re|fw|fwd|aw|wg|sv)\s*:\s*", re.IGNORECASE)
 _external_re = re.compile(r"\[external\]\s*", re.IGNORECASE)
-_arrow_re = "(?:--\\.?>|→|➔|➡|=>)"
+_arrow_re = r"(?:--\.?>|->|→|➔|➡|=>)"
 _fancy_quotes = {
     "“": "\"",
     "”": "\"",

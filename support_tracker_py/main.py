@@ -690,10 +690,10 @@ def main() -> int:
         text = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff]", "", text)
         tokens = {
             m.group(0).lower()
-            for m in re.finditer(r"(?<![a-z0-9])[a-z]{2,}[a-z0-9\\-]*\\d[a-z0-9\\-]*(?![a-z0-9])", text.lower())
+            for m in re.finditer(r"(?<![a-z0-9])[a-z]{2,}[a-z0-9\-]*\d[a-z0-9\-]*(?![a-z0-9])", text.lower())
         }
         if not tokens:
-            for part in re.split(r"[^a-z0-9\\-]+", text.lower()):
+            for part in re.split(r"[^a-z0-9\-]+", text.lower()):
                 if not part:
                     continue
                 if any(c.isalpha() for c in part) and any(c.isdigit() for c in part):
@@ -793,7 +793,7 @@ def main() -> int:
         tokens = re.findall(r"\b[a-z]{1,5}\d{2,}\b", text, flags=re.IGNORECASE)
         return {t.lower() for t in tokens}
 
-    ARROW_SPLIT_RE = r"\s*(?:--?>|Ã¢â€ â€™|Ã¢Å¾â€|Ã¢Å¾Â¡|=>)\s*"
+    ARROW_SPLIT_RE = r"\s*(?:--?>|->|→|➔|➡|=>)\s*"
 
     def _looks_like_date_only(text: str) -> bool:
         if not text:

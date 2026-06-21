@@ -14,8 +14,10 @@ def _canonical_text(text: str) -> str:
     value = text or ""
     value = value.replace("\n", " ").strip()
     value = _RE_PREFIX.sub("", value)
-    if "-->" in value:
-        value = value.split("-->", 1)[0].strip()
+    _arrow_split = re.compile(r"--\.?>|->|→|➔|➡|=>")
+    m = _arrow_split.search(value)
+    if m:
+        value = value[:m.start()].strip()
     value = _RE_SPACE.sub(" ", value).strip()
     return value
 

@@ -314,7 +314,7 @@ def _normalize_datetime_cells(ws, col_map, header_row):
             current_format = str(cell.number_format or "").strip()
             cell.value = parsed
             if not current_format or current_format.lower() == "general":
-                cell.number_format = "DD-MM-YYYY HH:MM"
+                cell.number_format = "DD-MM-YYYY HH:mm"
 
 
 def _parse_datetime_cell(value):

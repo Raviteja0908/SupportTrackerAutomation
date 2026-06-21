@@ -153,7 +153,6 @@ def _extract_body_parts(msg):
             return "", "", ""
     except Exception:
         return "", "", ""
-    return "", "", ""
 
 
 def _select_body(plain_text: str, html_text: str) -> str:
