@@ -28,11 +28,14 @@ def read_eml_directory(root: Path, logger):
         logger.log(f"[INFO] EML loaded: 0 from {root}")
         return emails
 
+    failed_paths = []
+
     def _parse_one(path):
         try:
             with path.open("rb") as f:
                 msg = BytesParser(policy=policy.default).parse(f)
-        except Exception:
+        except Exception as exc:
+            logger.log(f"[WARNING] Failed to parse EML file {path}: {exc}")
             return None
 
         subject = (msg.get("subject") or "").strip()
@@ -52,14 +55,20 @@ def read_eml_directory(root: Path, logger):
         received_time = _parse_received(msg.get_all("received"))
         # Prefer Received time when Date is missing or significantly off.
         if received_time:
-            if sent_time == datetime.min:
+            if sent_time is None:
                 sent_time = received_time
-            else:
+            elif sent_time is not None:
                 try:
                     if abs(received_time - sent_time) > timedelta(hours=6):
                         sent_time = received_time
                 except Exception:
                     pass
+        # Default to received_time if sent_time is still None, otherwise use sent_time
+        if sent_time is None:
+            sent_time = received_time
+        # If both are None, use current time as fallback
+        if sent_time is None:
+            sent_time = datetime.now(IST)
         body, body_html, body_html_raw = _extract_body_parts(msg)
         body = _select_body(body, body_html)
 
@@ -81,10 +90,16 @@ def read_eml_directory(root: Path, logger):
         futures = {pool.submit(_parse_one, p): p for p in paths}
         for future in as_completed(futures):
             result = future.result()
+            path = futures[future]
             if result is not None:
                 emails.append(result)
+            else:
+                failed_paths.append(str(path))
 
     logger.log(f"[INFO] EML loaded: {len(emails)} from {root}")
+    if failed_paths:
+        logger.log(f"[WARNING] Failed to parse {len(failed_paths)} EML files (see details above)")
+
     return emails
 
 
@@ -93,16 +108,17 @@ IST = ZoneInfo("Asia/Kolkata")
 
 def _parse_date(value):
     if not value:
-        return datetime.min
+        return None
     try:
         dt = parsedate_to_datetime(value)
         if not isinstance(dt, datetime):
-            return datetime.min
+            return None
         if dt.tzinfo is None:
+            # Note: Assuming IST for timezone-naive dates. This may be incorrect for non-India emails.
             return dt.replace(tzinfo=IST)
         return dt
     except Exception:
-        return datetime.min
+        return None
 
 
 def _parse_received(values):
@@ -184,17 +200,24 @@ def _html_to_text(value: str) -> str:
             for tag in soup.find_all(["br", "p", "div", "blockquote", "td", "tr", "li"]):
                 tag.insert_after("\n")
             text = _html.unescape(soup.get_text(" "))
-        except Exception:
+        except Exception as exc:
             text = ""
     if not text:
-        text = _html.unescape(value)
-        # Fallback only when BS4 parsing is unavailable or errors.
-        text = _re.sub(r"(?i)<br\s*/?>", "\n", text)
-        text = _re.sub(r"(?i)</p>", "\n", text)
-        text = _re.sub(r"(?i)</\s*(div|tr|td|th|li|h[1-6])\s*>", "\n", text)
-        text = _re.sub(r"<[^>]+>", "", text)
+        # Fallback when BS4 parsing is unavailable or errors
+        try:
+            text = _html.unescape(value)
+            text = _re.sub(r"(?i)<br\s*/>", "\n", text)
+            text = _re.sub(r"(?i)</p>", "\n", text)
+            text = _re.sub(r"(?i)</\s*(div|tr|td|th|li|h[1-6])\s*>", "\n", text)
+            text = _re.sub(r"<[^>]+>", "", text)
+        except Exception as exc:
+            text = ""  # Return empty string if fallback fails
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    # Validate output is not garbage (at least some printable content)
+    if result and len(result) > 10:
+        return result
+    return ""
 
 
 def _has_header_block(text: str) -> bool:

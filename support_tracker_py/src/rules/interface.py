@@ -6,6 +6,7 @@ _RE_PREFIX = re.compile(r"(?i)^\s*re:\s*")
 _RE_SPACE = re.compile(r"\s+")
 _LEADING_INTERFACE_RE = re.compile(r"^\s*([a-z]{2,8}\d{2,4}[a-z]{0,3})\b", re.IGNORECASE)
 _ANY_INTERFACE_RE = re.compile(r"\b([a-z]{2,8}\d{2,4}[a-z]{0,3})\b", re.IGNORECASE)
+_INTERFACE_VALIDATION_RE = re.compile(r"^[a-z]{2,8}\d{2,4}[a-z]{0,3}$", re.IGNORECASE)
 _BANNED_PREFIXES = ("inc", "sr")
 
 

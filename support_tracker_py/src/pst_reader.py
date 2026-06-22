@@ -48,6 +48,19 @@ def read_pst_emails(pst_path, logger, eml_root: Path):
                 logger.log(f"[ERROR] readpst stderr: {exc.stderr.strip()}")
         except Exception:
             pass
+        # Clean up work directory and copied PST file on failure to prevent disk space leak
+        try:
+            if local_pst != pst_path and local_pst.exists():
+                local_pst.unlink()
+                logger.log(f"[INFO] Cleaned up local PST copy: {local_pst}")
+        except Exception as cleanup_exc:
+            logger.log(f"[WARNING] Failed to cleanup local PST: {cleanup_exc}")
+        try:
+            if work_dir.exists():
+                shutil.rmtree(work_dir)
+                logger.log(f"[INFO] Cleaned up PST work directory: {work_dir}")
+        except Exception as cleanup_exc:
+            logger.log(f"[WARNING] Failed to cleanup work directory: {cleanup_exc}")
         raise RuntimeError(f"readpst failed for {pst_path}") from exc
 
     emails = read_eml_directory(eml_dir, logger)

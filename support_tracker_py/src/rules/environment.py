@@ -14,7 +14,7 @@ _TEST_OVERRIDE_PROD_RE = re.compile(r"\b(prod|prd|production|fcp|bip|fct)\b", re
 _TEST_OVERRIDE_UAT_RE = re.compile(r"\b(uat|biu)\b", re.IGNORECASE)
 
 _QUOTED_BOUNDARY_RE = re.compile(
-    r"^\s*(from:|sent:|subject:|de:|envoy[ée]?:|objet:|on .+ wrote:|[-]{2,}\s*original message\s*[-]{2,}|>)",
+    r"^\s*(from:|sent:|subject:|de:|envoy[ée]?:|objet:|on .+ wrote:|[-]{2,}\s*original message\s*[-]{2,})$",
     re.IGNORECASE,
 )
 

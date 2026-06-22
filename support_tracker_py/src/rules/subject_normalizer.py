@@ -67,8 +67,13 @@ def _strip_interface_prefix(text: str) -> str:
     m = re.match(rf"^\s*(.+?)\s*({_arrow_re}|:|-|\|)\s*(.+)$", text)
     if not m:
         return text
-    left = m.group(1).strip()
-    right = m.group(3).strip()
+    # Verify that regex captured all required groups
+    try:
+        left = m.group(1).strip()
+        # group(2) is the separator, we don't need it
+        right = m.group(3).strip()
+    except (IndexError, AttributeError):
+        return text
     if _looks_like_interface_prefix(left):
         while True:
             new_right = _prefix_re.sub("", right)

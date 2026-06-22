@@ -124,6 +124,7 @@ _SOURCE_LOCKED_SAME_TIME_TOKENS = (
 _ESS_DL_ONLY_RECIPIENTS = (
     "enterprise-services-support@umusic.com",
     "enterprise-services-support@inveniolsi.com",
+    "enterprise-services-support@invenio-solutions.com",
 )
 
 
@@ -142,6 +143,10 @@ def _is_ess_dl_only_reroute(email_record, ess_team) -> bool:
     This function is intentionally conservative: if recipient data is
     missing or ambiguous, it returns False (does NOT exclude), so
     existing behavior is preserved whenever there is any doubt.
+    
+    Note: This function checks if the email was sent ONLY to ESS distribution
+    lists. If the email was sent to any other external recipient (requester,
+    customer, etc.), it returns False even if a DL was included in the To list.
     """
     if not email_record:
         return False
@@ -609,7 +614,9 @@ def main() -> int:
         expected = {_normalize_header(h) for h in EXPECTED_HEADERS}
         best_row = 1
         best_hits = 0
-        for row in range(1, min(15, ws.max_row) + 1):
+        # Search up to 50 rows for headers instead of just 15
+        search_limit = min(50, ws.max_row)
+        for row in range(1, search_limit + 1):
             row_values = [
                 _normalize_header(ws.cell(row, c).value)
                 for c in range(1, ws.max_column + 1)
@@ -907,7 +914,7 @@ def main() -> int:
         return out
 
     def _sig_num_tokens(text: str) -> set:
-        """Return significant numeric tokens for disambiguation (exclude years)."""
+        """Return significant numeric tokens for disambiguation (exclude only 4-digit years)."""
         key = text or ""
         cached = _sig_num_tokens_cache.get(key)
         if cached is not None:
@@ -921,8 +928,10 @@ def main() -> int:
                     iv = int(n)
                 except Exception:
                     continue
-                if 1900 <= iv <= 2099:
+                # Only exclude 4-digit numbers that look like actual years
+                if len(n) == 4 and 1900 <= iv <= 2099:
                     continue
+                # Keep 3-digit and 5-digit numbers, they're unlikely to be dates
                 out.add(n)
         _sig_num_tokens_cache[key] = out
         return out
@@ -2509,7 +2518,8 @@ def main() -> int:
                 service_key = _service_no_key(ws.cell(row, service_no_col).value) if service_no_col else ""
                 key = (subject_key, _requester_key(cons_val))
                 group_counts[key] = group_counts.get(key, 0) + 1
-                subject_family_rows.setdefault(subject_key, []).append((row, service_key))
+                requester_key_for_family = _requester_key(cons_val)
+                subject_family_rows.setdefault((subject_key, requester_key_for_family), []).append((row, service_key))
                 if service_key:
                     subject_service_keys.setdefault(subject_key, set()).add(service_key)
                     service_key_tuple = (subject_key, _requester_key(cons_val), service_key)
@@ -2549,9 +2559,10 @@ def main() -> int:
             return group_counts_by_service.get((subject_key, requester_key, service_bucket), 0)
         return group_counts.get((subject_key, requester_key), 0)
 
-    def _pre_resolve_family_slot(subject_norm_value: str, row_index_value) -> tuple[int, int]:
+    def _pre_resolve_family_slot(subject_norm_value: str, row_index_value, requester_value: str = "") -> tuple[int, int]:
         subject_key = (subject_norm_value or "").lower()
-        family_rows = sorted(subject_family_rows.get(subject_key, []), key=lambda x: x[0])
+        requester_key_for_family = _requester_key(requester_value)
+        family_rows = sorted(subject_family_rows.get((subject_key, requester_key_for_family), []), key=lambda x: x[0])
         if len({svc for _, svc in family_rows if svc}) < 2:
             return 0, 1
         slot_index = 0
@@ -2567,7 +2578,7 @@ def main() -> int:
             return _to_ist(sent) if sent else None
         if not thread or not requester_value or not _subject_has_multiple_service_nos(subject_norm_value):
             return thread, ""
-        slot_index, family_total = _pre_resolve_family_slot(subject_norm_value, row_index_value)
+        slot_index, family_total = _pre_resolve_family_slot(subject_norm_value, row_index_value, requester_value)
         if family_total < 2:
             return thread, ""
 
@@ -5419,13 +5430,15 @@ def main() -> int:
                     e_ist = _email_ist(e)
                     if not e_ist:
                         continue
+                    # CRITICAL: Apply DL-only exclusion to ALL pools for incident_business,
+                    # not just ESS pool, since reply_pool is preferred in pool selection
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                        continue
                     if use_ess_pool:
                         if not _ess_sender(e):
                             continue
                         flags = _shared_reply_flags(email_record=e)
                         if _system_like_sender(e) or flags["ignore_reply"]:
-                            continue
-                        if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                             continue
                     else:
                         if not _group_req_match(e):
@@ -5459,6 +5472,9 @@ def main() -> int:
                     e_ist = _email_ist(e)
                     if not e_ist:
                         continue
+                    # Apply DL-only exclusion to incident_business
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                        continue
                     if not _group_req_match(e):
                         continue
                     if not _is_shared_ack_candidate(e):
@@ -5488,6 +5504,9 @@ def main() -> int:
                 for e in merged:
                     e_ist = _email_ist(e)
                     if not e_ist:
+                        continue
+                    # Apply DL-only exclusion to incident_business
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                         continue
                     if not _group_req_match(e):
                         continue
@@ -5562,6 +5581,9 @@ def main() -> int:
                     for e in merged:
                         e_ist = _email_ist(e)
                         if not e_ist:
+                            continue
+                        # Apply DL-only exclusion to incident_business
+                        if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
                             continue
                         if abs((e_ist - resolved_ist).total_seconds()) > 300:
                             continue
@@ -12903,6 +12925,12 @@ def main() -> int:
 
         blue_gap_audit_started_at = _stage_timer_start()
         for state in row_states:
+            # Clear row-specific caches to prevent contamination between rows
+            # Deterministic token caches (subject, text-based) can persist, but
+            # thread/context-specific and environment caches should be fresh per row
+            _env_consultant_text_cache.clear()
+            _env_thread_text_cache.clear()
+
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
@@ -14913,6 +14941,10 @@ def main() -> int:
             return out
 
         for state in row_states:
+            # Clear row-specific caches to prevent contamination between rows
+            _env_consultant_text_cache.clear()
+            _env_thread_text_cache.clear()
+
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
@@ -15190,6 +15222,10 @@ def main() -> int:
         lane_local_initial_seed_started_at = _stage_timer_start()
         lane_local_initial_seeded = 0
         for state in row_states:
+            # Clear row-specific caches to prevent contamination between rows
+            _env_consultant_text_cache.clear()
+            _env_thread_text_cache.clear()
+
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
@@ -15207,6 +15243,10 @@ def main() -> int:
         occurrence_lock_started_at = _stage_timer_start()
         occurrence_locked_rows = 0
         for state in row_states:
+            # Clear row-specific caches to prevent contamination between rows
+            _env_consultant_text_cache.clear()
+            _env_thread_text_cache.clear()
+
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:
@@ -15290,6 +15330,10 @@ def main() -> int:
 
         ess_only_strict_started_at = _stage_timer_start()
         for state in row_states:
+            # Clear row-specific caches to prevent contamination between rows
+            _env_consultant_text_cache.clear()
+            _env_thread_text_cache.clear()
+
             list_index = state.get("list_index")
             row_idx = state.get("row_index")
             if list_index is None or list_index >= len(automation_rows) or not row_idx:

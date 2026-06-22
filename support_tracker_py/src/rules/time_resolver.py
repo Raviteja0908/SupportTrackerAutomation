@@ -255,9 +255,10 @@ def _match_requester(sender_name: str, sender_email: str, requester_name: str) -
     if not overlap:
         return False
 
-    if len(overlap) / max(1, len(r_tokens)) >= 0.6:
+    # Stricter thresholds (70% instead of 60%) to reduce false positives
+    if len(overlap) / max(1, len(r_tokens)) >= 0.7:
         return True
-    if len(overlap) / max(1, len(s_tokens)) >= 0.6:
+    if len(overlap) / max(1, len(s_tokens)) >= 0.7:
         return True
 
     # Last-name strong match fallback
@@ -301,7 +302,8 @@ def _normalize_for_phrase_match(text: str) -> str:
     if not text:
         return ""
     s = text.lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
+    # Keep apostrophes (contractions) but remove other punctuation to preserve word meaning
+    s = re.sub(r"[^a-z0-9']+", " ", s)
     return " ".join(s.split())
 
 
@@ -614,7 +616,9 @@ IST = ZoneInfo("Asia/Kolkata")
 
 def _to_ist(dt: datetime) -> datetime:
     if not isinstance(dt, datetime):
-        return datetime.min.replace(tzinfo=IST)
+        raise ValueError(f"Expected datetime, got {type(dt).__name__}")
+    if dt.year <= 1901:
+        raise ValueError(f"Invalid date year {dt.year}")
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=IST)
     return dt.astimezone(IST)
@@ -739,13 +743,13 @@ def _first_local_episode_ack_after(
 
 def _format_time(dt: datetime) -> str:
     if not isinstance(dt, datetime):
-        return ""
+        return None  # Return None instead of empty string for invalid input
     if dt.year <= 1901:
-        return ""
+        return None  # Return None for invalid/sentinel dates
     try:
         dt = _to_ist(dt)
-    except Exception:
-        pass
+    except Exception as exc:
+        return None  # Return None on conversion failure
     return dt.strftime("%d-%m-%Y %H:%M")
 
 

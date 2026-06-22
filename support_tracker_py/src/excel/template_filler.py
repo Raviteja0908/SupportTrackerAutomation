@@ -81,7 +81,9 @@ def select_target_sheet(wb, logger=None, preferred_sheet_name="LOG"):
     best_hits = -1
     for ws in wb.worksheets:
         hits = 0
-        for row in range(1, min(15, ws.max_row) + 1):
+        # Search up to 50 rows instead of just 15
+        search_limit = min(50, ws.max_row)
+        for row in range(1, search_limit + 1):
             row_values = [
                 _normalize_header(ws.cell(row, c).value)
                 for c in range(1, ws.max_column + 1)
@@ -103,123 +105,130 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
     output_path = Path(output_path)
 
     wb = load_workbook(template_path)
-    calc = getattr(wb, "calculation", None)
-    if calc is not None:
-        # openpyxl preserves the formulas themselves, but this template is in
-        # manual calc mode. Force Excel to recalculate when the user opens it.
-        calc.calcMode = "auto"
-        calc.fullCalcOnLoad = True
-        if hasattr(calc, "forceFullCalc"):
-            calc.forceFullCalc = True
-    ws = select_target_sheet(wb, logger, preferred_sheet_name=sheet_name)
-    filter_subject = (os.environ.get("FILTER_SUBJECT") or "").strip().lower()
-    filter_no_save = os.environ.get("FILTER_NO_SAVE") == "1"
-    debug_stage_times = os.environ.get("DEBUG_STAGE_TIMES") == "1"
-    resolver_total_seconds = 0.0
-    resolver_calls = 0
-    slowest_rows = []
+    try:
+        calc = getattr(wb, "calculation", None)
+        if calc is not None:
+            # openpyxl preserves the formulas themselves, but this template is in
+            # manual calc mode. Force Excel to recalculate when the user opens it.
+            calc.calcMode = "auto"
+            calc.fullCalcOnLoad = True
+            if hasattr(calc, "forceFullCalc"):
+                calc.forceFullCalc = True
+        ws = select_target_sheet(wb, logger, preferred_sheet_name=sheet_name)
+        filter_subject = (os.environ.get("FILTER_SUBJECT") or "").strip().lower()
+        filter_no_save = os.environ.get("FILTER_NO_SAVE") == "1"
+        debug_stage_times = os.environ.get("DEBUG_STAGE_TIMES") == "1"
+        resolver_total_seconds = 0.0
+        resolver_calls = 0
+        slowest_rows = []
 
-    header_row = _find_header_row(ws, logger)
-    col_map = _build_col_map(ws, header_row)
+        header_row = _find_header_row(ws, logger)
+        col_map = _build_col_map(ws, header_row)
 
-    if "description" not in col_map:
-        raise RuntimeError("Description column not found in template.")
+        if "description" not in col_map:
+            raise RuntimeError("Description column not found in template.")
 
-    comments_col = col_map.get("comments")
+        comments_col = col_map.get("comments")
 
-    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    yellow_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-    blue_fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-    clear_fill = PatternFill(fill_type=None)
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        yellow_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+        blue_fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+        clear_fill = PatternFill(fill_type=None)
 
-    filled = 0
-    maintenance = 0
-    unknown = 0
+        filled = 0
+        maintenance = 0
+        unknown = 0
 
-    for row in range(header_row + 1, ws.max_row + 1):
-        description = ws.cell(row, col_map["description"]).value
-        service_no = ws.cell(row, col_map.get("service no", 1)).value
+        for row in range(header_row + 1, ws.max_row + 1):
+            description = ws.cell(row, col_map["description"]).value
+            service_no = ws.cell(row, col_map.get("service no", 1)).value
 
-        if _is_row_empty(description, service_no):
-            continue
+            if _is_row_empty(description, service_no):
+                continue
 
-        row_context = _build_row_context(ws, row, col_map)
+            row_context = _build_row_context(ws, row, col_map)
 
-        desc_text = str(row_context.get("Description", "") or "")
-        if filter_subject and filter_subject not in desc_text.lower():
-            continue
+            desc_text = str(row_context.get("Description", "") or "")
+            if filter_subject and filter_subject not in desc_text.lower():
+                continue
 
-        started_at = time.perf_counter() if debug_stage_times else None
-        resolved = row_resolver(row_context)
-        if debug_stage_times and started_at is not None:
-            elapsed = max(0.0, time.perf_counter() - started_at)
-            resolver_total_seconds += elapsed
-            resolver_calls += 1
-            slowest_rows.append(
-                (
-                    elapsed,
-                    row,
-                    str(row_context.get("Service No", "") or ""),
-                    desc_text,
+            started_at = time.perf_counter() if debug_stage_times else None
+            resolved = row_resolver(row_context)
+            if debug_stage_times and started_at is not None:
+                elapsed = max(0.0, time.perf_counter() - started_at)
+                resolver_total_seconds += elapsed
+                resolver_calls += 1
+                slowest_rows.append(
+                    (
+                        elapsed,
+                        row,
+                        str(row_context.get("Service No", "") or ""),
+                        desc_text,
+                    )
                 )
-            )
-        mark_blue = resolved.pop("_MarkBlue", False)
-        required_missing, reason = _is_unknown(resolved)
-        if required_missing:
-            _mark_row(ws, row, yellow_fill)
-            _write_comment(ws, row, comments_col, reason or MarkingReason.unknown)
-            unknown += 1
-            continue
+            mark_blue = resolved.pop("_MarkBlue", False)
+            required_missing, reason = _is_unknown(resolved)
+            if required_missing:
+                _mark_row(ws, row, yellow_fill)
+                _write_comment(ws, row, comments_col, reason or MarkingReason.unknown)
+                unknown += 1
+                continue
 
-        if mark_blue:
-            _mark_row(ws, row, blue_fill)
-            _write_comment(ws, row, comments_col, MarkingReason.blue)
-        else:
-            _clear_row_if_fill_matches(ws, row, yellow_fill, clear_fill)
+            if mark_blue:
+                _mark_row(ws, row, blue_fill)
+                _write_comment(ws, row, comments_col, MarkingReason.blue)
+            else:
+                _clear_row_if_fill_matches(ws, row, yellow_fill, clear_fill)
 
-        _write_values(ws, row, col_map, resolved)
-        filled += 1
+            _write_values(ws, row, col_map, resolved)
+            filled += 1
 
-    if post_process:
-        post_process(ws, col_map, header_row)
-        resolved_unknowns = _clear_filled_yellow_rows(ws, col_map, header_row, yellow_fill)
+        if post_process:
+            post_process(ws, col_map, header_row)
+            resolved_unknowns = _clear_filled_yellow_rows(ws, col_map, header_row, yellow_fill)
+            if resolved_unknowns:
+                unknown = max(0, unknown - resolved_unknowns)
+
+        _normalize_datetime_cells(ws, col_map, header_row)
+        resolved_unknowns, _blue_applied = _enforce_final_row_fills(
+            ws,
+            col_map,
+            header_row,
+            yellow_fill,
+            blue_fill,
+        )
         if resolved_unknowns:
             unknown = max(0, unknown - resolved_unknowns)
 
-    _normalize_datetime_cells(ws, col_map, header_row)
-    resolved_unknowns, _blue_applied = _enforce_final_row_fills(
-        ws,
-        col_map,
-        header_row,
-        yellow_fill,
-        blue_fill,
-    )
-    if resolved_unknowns:
-        unknown = max(0, unknown - resolved_unknowns)
+        if filter_no_save:
+            logger.log("[INFO] FILTER_NO_SAVE=1; skipping Excel save.")
+        else:
+            safe_path = _resolve_output_path(output_path)
+            try:
+                wb.save(safe_path)
+                logger.log(f"[INFO] Excel saved: {safe_path}")
+            except PermissionError:
+                alt_path = _resolve_output_path(output_path, force_suffix=True)
+                wb.save(alt_path)
+                logger.log(f"[WARNING] Output locked, saved to: {alt_path}")
 
-    if filter_no_save:
-        logger.log("[INFO] FILTER_NO_SAVE=1; skipping Excel save.")
-    else:
-        safe_path = _resolve_output_path(output_path)
-        try:
-            wb.save(safe_path)
-            logger.log(f"[INFO] Excel saved: {safe_path}")
-        except PermissionError:
-            alt_path = _resolve_output_path(output_path, force_suffix=True)
-            wb.save(alt_path)
-            logger.log(f"[WARNING] Output locked, saved to: {alt_path}")
-
-    if debug_stage_times and resolver_calls:
-        slowest_rows.sort(key=lambda item: item[0], reverse=True)
-        logger.log(
-            f"[INFO] Row resolver timing: {resolver_total_seconds:.2f}s total across {resolver_calls} row(s)"
-        )
-        for elapsed, row_idx, service_no, description in slowest_rows[:10]:
+        if debug_stage_times and resolver_calls:
+            slowest_rows.sort(key=lambda item: item[0], reverse=True)
             logger.log(
-                f"[INFO]   slow-row {elapsed:.2f}s | row={row_idx} | service={service_no or '-'} | desc={description[:120]}"
+                f"[INFO] Row resolver timing: {resolver_total_seconds:.2f}s total across {resolver_calls} row(s)"
             )
+            for elapsed, row_idx, service_no, description in slowest_rows[:10]:
+                logger.log(
+                    f"[INFO]   slow-row {elapsed:.2f}s | row={row_idx} | service={service_no or '-'} | desc={description[:120]}"
+                )
 
-    return FillResult(filled, maintenance, unknown)
+        return FillResult(filled, maintenance, unknown)
+    finally:
+        # Ensure workbook is closed to release file handles
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 def _resolve_output_path(path: Path, force_suffix: bool = False) -> Path:
@@ -235,7 +244,9 @@ def _find_header_row(ws, logger):
     best_row = 1
     best_hits = 0
 
-    for row in range(1, min(15, ws.max_row) + 1):
+    # Search up to 50 rows instead of just 15
+    search_limit = min(50, ws.max_row)
+    for row in range(1, search_limit + 1):
         row_values = [
             _normalize_header(ws.cell(row, c).value)
             for c in range(1, ws.max_column + 1)
@@ -359,13 +370,23 @@ def _clear_row_if_fill_matches(ws, row, target_fill, clear_fill):
 
 
 def _fill_matches(cell_fill, target_fill) -> bool:
+    """Compare two cell fills more robustly, handling None and various format differences."""
     if not cell_fill or not target_fill:
         return False
-    if str(getattr(cell_fill, "fill_type", "") or "") != str(getattr(target_fill, "fill_type", "") or ""):
+    try:
+        cell_type = str(getattr(cell_fill, "fill_type", "") or "")
+        target_type = str(getattr(target_fill, "fill_type", "") or "")
+        if cell_type != target_type:
+            return False
+        cell_color = getattr(cell_fill, "start_color", None)
+        target_color = getattr(target_fill, "start_color", None)
+        if not cell_color or not target_color:
+            return False
+        cell_rgb = str(getattr(cell_color, "rgb", "") or "").upper()
+        target_rgb = str(getattr(target_color, "rgb", "") or "").upper()
+        return bool(cell_rgb and target_rgb and cell_rgb == target_rgb)
+    except Exception:
         return False
-    cell_rgb = str(getattr(getattr(cell_fill, "start_color", None), "rgb", "") or "").upper()
-    target_rgb = str(getattr(getattr(target_fill, "start_color", None), "rgb", "") or "").upper()
-    return bool(cell_rgb and target_rgb and cell_rgb == target_rgb)
 
 
 def _clear_filled_yellow_rows(ws, col_map, header_row, yellow_fill):

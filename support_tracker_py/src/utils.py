@@ -24,4 +24,5 @@ def load_subject_exclusions(path: Path):
 
 
 def load_aspose_license(logger):
+    """Aspose license not used in readpst + EML pipeline."""
     logger.log("[INFO] Aspose license not used (readpst + EML pipeline).")
