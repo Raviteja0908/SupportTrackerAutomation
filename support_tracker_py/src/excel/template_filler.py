@@ -1,5 +1,9 @@
 import os
+import re
+import shutil
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -204,13 +208,16 @@ def fill_template(template_path, output_path, row_resolver, logger, post_process
             logger.log("[INFO] FILTER_NO_SAVE=1; skipping Excel save.")
         else:
             safe_path = _resolve_output_path(output_path)
+            saved_path = safe_path
             try:
                 wb.save(safe_path)
                 logger.log(f"[INFO] Excel saved: {safe_path}")
             except PermissionError:
                 alt_path = _resolve_output_path(output_path, force_suffix=True)
                 wb.save(alt_path)
+                saved_path = alt_path
                 logger.log(f"[WARNING] Output locked, saved to: {alt_path}")
+            _restore_template_extensions(template_path, saved_path, ws.title, logger)
 
         if debug_stage_times and resolver_calls:
             slowest_rows.sort(key=lambda item: item[0], reverse=True)
@@ -237,6 +244,169 @@ def _resolve_output_path(path: Path, force_suffix: bool = False) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return path.with_name(path.stem + "_" + stamp + path.suffix)
     return path
+
+
+# Namespaces used by worksheet extensions. They are declared directly on the
+# copied <ext> element so the restored block is self-contained regardless of
+# what the destination worksheet root happens to declare.
+_EXT_KNOWN_NS = {
+    "x14": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
+    "xm": "http://schemas.microsoft.com/office/excel/2006/main",
+    "x14ac": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac",
+    "xr": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+}
+
+
+def _worksheet_path_for_title(zf, title):
+    """Map a sheet display name to its xl/worksheets/*.xml path inside the zip."""
+    try:
+        wb_xml = zf.read("xl/workbook.xml").decode("utf-8")
+    except KeyError:
+        return None
+    m = re.search(
+        r'<sheet[^>]*\bname="' + re.escape(title) + r'"[^>]*\br:id="([^"]+)"', wb_xml
+    )
+    if not m:
+        m = re.search(
+            r'<sheet[^>]*\br:id="([^"]+)"[^>]*\bname="' + re.escape(title) + r'"', wb_xml
+        )
+    if not m:
+        return None
+    rid = m.group(1)
+    try:
+        rels = zf.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    except KeyError:
+        return None
+    target = None
+    for rel in re.findall(r"<Relationship\b[^>]*/?>", rels):
+        idm = re.search(r'\bId="([^"]+)"', rel)
+        if idm and idm.group(1) == rid:
+            tm = re.search(r'\bTarget="([^"]+)"', rel)
+            if tm:
+                target = tm.group(1)
+            break
+    if target is None:
+        return None
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return "xl/" + target.replace("../", "")
+
+
+def _extract_worksheet_extlst(sheet_xml):
+    """Return the worksheet-level <extLst> (the one right before </worksheet>)."""
+    m = re.search(
+        r"<extLst>(?:(?!<extLst>).)*?</extLst>\s*</worksheet>",
+        sheet_xml,
+        flags=re.DOTALL,
+    )
+    if not m:
+        return None
+    block = m.group(0)
+    return block[: block.rindex("</extLst>") + len("</extLst>")]
+
+
+def _ext_uris(extlst_xml):
+    return set(re.findall(r'<ext\b[^>]*\buri="([^"]+)"', extlst_xml))
+
+
+def _split_exts(extlst_xml):
+    return re.findall(r"<ext\b.*?</ext>", extlst_xml, flags=re.DOTALL)
+
+
+def _ext_uri(ext_xml):
+    m = re.search(r'\buri="([^"]+)"', ext_xml)
+    return m.group(1) if m else None
+
+
+def _ensure_ext_namespaces(ext_xml):
+    open_m = re.match(r"<ext\b[^>]*?>", ext_xml, flags=re.DOTALL)
+    if not open_m:
+        return ext_xml
+    open_tag = open_m.group(0)
+    used = set(re.findall(r"</?(\w+):", ext_xml))
+    additions = "".join(
+        f' xmlns:{p}="{_EXT_KNOWN_NS[p]}"'
+        for p in used
+        if p in _EXT_KNOWN_NS and f"xmlns:{p}=" not in open_tag
+    )
+    if not additions:
+        return ext_xml
+    new_open = open_tag[:-1] + additions + ">"
+    return ext_xml.replace(open_tag, new_open, 1)
+
+
+def _preserve_template_extensions(template_path, output_path, sheet_title):
+    """Copy worksheet extensions (x14 data validations etc.) from the template
+    into the saved output, merging by `ext` uri. Returns True if it changed the
+    output file. Raises on unexpected I/O/XML errors (caller handles)."""
+    template_path = Path(template_path)
+    output_path = Path(output_path)
+
+    with zipfile.ZipFile(template_path) as ztpl:
+        tpl_ws = _worksheet_path_for_title(ztpl, sheet_title)
+        if not tpl_ws or tpl_ws not in ztpl.namelist():
+            return False
+        tpl_sheet = ztpl.read(tpl_ws).decode("utf-8")
+    tpl_extlst = _extract_worksheet_extlst(tpl_sheet)
+    if not tpl_extlst:
+        return False  # template has no extensions; nothing to restore
+
+    with zipfile.ZipFile(output_path) as zout:
+        out_ws = _worksheet_path_for_title(zout, sheet_title)
+        if not out_ws or out_ws not in zout.namelist():
+            return False
+        names = zout.namelist()
+        data = {n: zout.read(n) for n in names}
+
+    out_sheet = data[out_ws].decode("utf-8")
+    out_extlst = _extract_worksheet_extlst(out_sheet)
+    existing = _ext_uris(out_extlst) if out_extlst else set()
+
+    add = [
+        _ensure_ext_namespaces(e)
+        for e in _split_exts(tpl_extlst)
+        if _ext_uri(e) and _ext_uri(e) not in existing
+    ]
+    if not add:
+        return False
+
+    if out_extlst is None:
+        new_extlst = "<extLst>" + "".join(add) + "</extLst>"
+        new_sheet = out_sheet.replace("</worksheet>", new_extlst + "</worksheet>", 1)
+    else:
+        merged = out_extlst[: -len("</extLst>")] + "".join(add) + "</extLst>"
+        new_sheet = out_sheet.replace(out_extlst, merged, 1)
+
+    if new_sheet == out_sheet:
+        return False
+
+    # Safety: never write a malformed sheet. If parsing fails, leave output as-is.
+    try:
+        ET.fromstring(new_sheet)
+    except ET.ParseError:
+        return False
+
+    data[out_ws] = new_sheet.encode("utf-8")
+    tmp = output_path.with_name(output_path.name + ".extfix.tmp")
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zw:
+        for n in names:
+            zw.writestr(n, data[n])
+    shutil.move(str(tmp), str(output_path))
+    return True
+
+
+def _restore_template_extensions(template_path, output_path, sheet_title, logger):
+    """Best-effort re-injection of worksheet extensions that openpyxl drops when
+    it re-saves the template (e.g. the x14 data-validation dropdowns that trigger
+    the "Data Validation extension is not supported and will be removed" warning).
+    Any failure is swallowed so the already-saved output is never disturbed."""
+    try:
+        if _preserve_template_extensions(template_path, output_path, sheet_title):
+            if logger:
+                logger.log("[INFO] Restored template data-validation extensions in output.")
+    except Exception as exc:  # noqa: BLE001 - never let this break the save
+        if logger:
+            logger.log(f"[WARNING] Could not restore template extensions: {exc}")
 
 
 def _find_header_row(ws, logger):
