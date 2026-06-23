@@ -18022,9 +18022,12 @@ def main() -> int:
             if not requester or not subject_norm:
                 return None
 
-            current_c = _to_ist(_parse_time_str(row_vals.get("Created Date & Time")))
-            current_a = _to_ist(_parse_time_str(row_vals.get("Actual Response Date & Time")))
-            current_r = _to_ist(_parse_time_str(row_vals.get("Actual Resolved Date & Time")))
+            created_dt = _parse_time_str(row_vals.get("Created Date & Time"))
+            response_dt = _parse_time_str(row_vals.get("Actual Response Date & Time"))
+            resolved_dt = _parse_time_str(row_vals.get("Actual Resolved Date & Time"))
+            current_c = _to_ist(created_dt) if created_dt else None
+            current_a = _to_ist(response_dt) if response_dt else None
+            current_r = _to_ist(resolved_dt) if resolved_dt else None
             reference_ist = current_r or current_a or current_c
 
             base_thread = state.get("thread") or []
