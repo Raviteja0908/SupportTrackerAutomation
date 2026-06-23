@@ -7,7 +7,7 @@ import time
 import math
 from email import policy
 from email.parser import BytesParser
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, parseaddr
 from datetime import datetime, timedelta
 from pathlib import Path
 from openpyxl.styles import PatternFill
@@ -131,11 +131,6 @@ _ESS_DL_LOCAL_PATTERN = re.compile(
     r"enterprise[\s.\-/\\]*services?[\s.\-/\\]*support",
     re.IGNORECASE,
 )
-_ESS_DL_DOMAINS = frozenset({
-    "umusic.com",
-    "inveniolsi.com",
-    "invenio-solutions.com",
-})
 _MAIN_INTERNAL_MARKER_RE = re.compile(r"\+{1,}\s*internal\s*\+{1,}", re.IGNORECASE)
 
 
@@ -149,8 +144,6 @@ def _is_ess_dl_addr(addr: str) -> bool:
     if sep:
         normalised_local = re.sub(r"[\s./\\]+", "-", local).strip("-")
         if f"{normalised_local}@{domain}" in _ESS_DL_ONLY_RECIPIENTS:
-            return True
-        if domain in _ESS_DL_DOMAINS and _ESS_DL_LOCAL_PATTERN.search(local):
             return True
     else:
         if _ESS_DL_LOCAL_PATTERN.search(a):
@@ -191,12 +184,41 @@ def _is_ess_dl_only_reroute(email_record, ess_team) -> bool:
 
     to_recipients = getattr(email_record, "to_recipients", None)
     if to_recipients:
-        other_recipients = {
+        other_recipients = [
             addr for addr in to_recipients
             if addr and addr != sender_email
-        }
-        if other_recipients and all(_is_ess_dl_addr(addr) for addr in other_recipients):
-            return True
+        ]
+        if other_recipients:
+            parsed_emails = []
+            for addr in other_recipients:
+                em = (parseaddr(addr)[1] or "").strip().lower()
+                if em:
+                    parsed_emails.append(em)
+                else:
+                    # If we cannot parse an email address from this recipient,
+                    # treat it as non-DL to avoid false positives.
+                    parsed_emails = None
+                    break
+
+            if parsed_emails is not None:
+                # All recipients produced parseable emails — require every
+                # parsed email to either be an exact known DL or match via
+                # normalized local+domain rules.
+                def is_parsed_dl(email: str) -> bool:
+                    if email in _ESS_DL_ONLY_RECIPIENTS:
+                        return True
+                    local, sep, domain = email.partition("@")
+                    if sep:
+                        normalised_local = re.sub(r"[\s./\\]+", "-", local).strip("-")
+                        if f"{normalised_local}@{domain}" in _ESS_DL_ONLY_RECIPIENTS:
+                            return True
+                    else:
+                        if _ESS_DL_LOCAL_PATTERN.search(email):
+                            return True
+                    return False
+
+                if parsed_emails and all(is_parsed_dl(e) for e in parsed_emails):
+                    return True
 
     if ess_team and _is_ess_sender(email_record, ess_team):
         subject = (getattr(email_record, "subject", "") or "")
@@ -16225,7 +16247,8 @@ def main() -> int:
                     r_ist_now = _to_ist(r_dt_now) if r_dt_now else None
                     if not r_ist_now or r_ist_now < pair_ack:
                         t_r = t_a
-                    resolved_pick_ist = _to_ist(_parse_time_str(t_r)) if t_r else None
+                    r_dt = _parse_time_str(t_r)
+                    resolved_pick_ist = _to_ist(r_dt) if r_dt else None
 
                 if t_c and t_a and t_r:
                     candidate_kind = "hybrid" if (quoted_only and selected_pair_is_hybrid) else "quoted"
@@ -16693,7 +16716,8 @@ def main() -> int:
                         elif locked_live_reply_ist and abs((r_ist_now - locked_live_reply_ist).total_seconds()) <= 60:
                             t_r = _format_time(locked_live_reply_ist)
                         if t_c and t_a and t_r:
-                            cand_r_ist = _to_ist(_parse_time_str(t_r)) if t_r else None
+                            r_dt = _parse_time_str(t_r)
+                            cand_r_ist = _to_ist(r_dt) if r_dt else None
                             if not _allow_guard_rewrite(
                                 row_vals,
                                 list_index,
@@ -16904,7 +16928,8 @@ def main() -> int:
                         elif locked_live_reply_ist and abs((r_ist_now - locked_live_reply_ist).total_seconds()) <= 60:
                             t_r = _format_time(locked_live_reply_ist)
                         if t_c and t_a and t_r:
-                            cand_r_ist = _to_ist(_parse_time_str(t_r)) if t_r else None
+                            r_dt = _parse_time_str(t_r)
+                            cand_r_ist = _to_ist(r_dt) if r_dt else None
                             if not _allow_guard_rewrite(
                                 row_vals,
                                 list_index,
@@ -17180,7 +17205,8 @@ def main() -> int:
                                     elif locked_live_reply_ist and abs((r_ist_now - locked_live_reply_ist).total_seconds()) <= 60:
                                         t_r = _format_time(locked_live_reply_ist)
                                     if t_c and t_a and t_r:
-                                        cand_r_ist = _to_ist(_parse_time_str(t_r)) if t_r else None
+                                        r_dt = _parse_time_str(t_r)
+                                        cand_r_ist = _to_ist(r_dt) if r_dt else None
                                         if not _allow_guard_rewrite(
                                             row_vals,
                                             list_index,
