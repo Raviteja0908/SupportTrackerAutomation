@@ -127,6 +127,36 @@ _ESS_DL_ONLY_RECIPIENTS = (
     "enterprise-services-support@invenio-solutions.com",
 )
 
+_ESS_DL_LOCAL_PATTERN = re.compile(
+    r"enterprise[\s.\-/\\]*services?[\s.\-/\\]*support",
+    re.IGNORECASE,
+)
+_ESS_DL_DOMAINS = frozenset({
+    "umusic.com",
+    "inveniolsi.com",
+    "invenio-solutions.com",
+})
+_MAIN_INTERNAL_MARKER_RE = re.compile(r"\+{1,}\s*internal\s*\+{1,}", re.IGNORECASE)
+
+
+def _is_ess_dl_addr(addr: str) -> bool:
+    a = (addr or "").strip().lower()
+    if not a:
+        return False
+    if a in _ESS_DL_ONLY_RECIPIENTS:
+        return True
+    local, sep, domain = a.partition("@")
+    if sep:
+        normalised_local = re.sub(r"[\s./\\]+", "-", local).strip("-")
+        if f"{normalised_local}@{domain}" in _ESS_DL_ONLY_RECIPIENTS:
+            return True
+        if domain in _ESS_DL_DOMAINS and _ESS_DL_LOCAL_PATTERN.search(local):
+            return True
+    else:
+        if _ESS_DL_LOCAL_PATTERN.search(a):
+            return True
+    return False
+
 
 def _is_ess_dl_only_reroute(email_record, ess_team) -> bool:
     """
@@ -134,31 +164,47 @@ def _is_ess_dl_only_reroute(email_record, ess_team) -> bool:
     all-three-same collapse pool because the sender (an ESS member)
     intentionally rerouted the reply to only the shared ESS DL.
 
-    The To-recipients of this email, once any address belonging to the
-    sender themselves is excluded, must resolve to ONLY one of the known
-    ESS DL addresses (no other recipient present). Cc is intentionally
-    NOT checked, to avoid false positives from someone who simply cc'd
-    the DL while still genuinely replying to the requester.
+    Primary path — To-recipients check (variant-aware):
+      After excluding the sender's own address, every remaining To-recipient
+      must resolve to a known ESS DL address. Separator variants in the
+      address (dots, spaces, slashes instead of hyphens) are normalised
+      before matching so that Exchange-emitted alternate SMTP proxy addresses
+      are caught correctly.
 
-    This function is intentionally conservative: if recipient data is
-    missing or ambiguous, it returns False (does NOT exclude), so
-    existing behavior is preserved whenever there is any doubt.
-    
-    Note: This function checks if the email was sent ONLY to ESS distribution
-    lists. If the email was sent to any other external recipient (requester,
-    customer, etc.), it returns False even if a DL was included in the To list.
+    Fallback path — +INTERNAL+ subject/body marker:
+      When the To-recipients check cannot confirm the reroute (empty
+      to_recipients, or the DL address arrived in an unrecognised format),
+      the presence of a +INTERNAL+ tag in the subject or body combined with
+      the sender being an ESS team member is treated as sufficient evidence
+      of an internal-only reroute. This covers Person A replying over their
+      own final reply and redirecting the To field to the ESS DL only, as
+      well as emails where to_recipients is absent or only partially parsed.
+
+    Cc is intentionally NOT checked to avoid false positives from someone
+    who simply cc'd the DL while still genuinely replying to the requester.
+    Conservative: returns False on any genuine ambiguity.
     """
     if not email_record:
         return False
 
+    sender_email = (getattr(email_record, "sender_email", "") or "").strip().lower()
+
     to_recipients = getattr(email_record, "to_recipients", None)
     if to_recipients:
-        sender_email = (getattr(email_record, "sender_email", "") or "").strip().lower()
         other_recipients = {
             addr for addr in to_recipients
             if addr and addr != sender_email
         }
-        if other_recipients and other_recipients.issubset(set(_ESS_DL_ONLY_RECIPIENTS)):
+        if other_recipients and all(_is_ess_dl_addr(addr) for addr in other_recipients):
+            return True
+
+    if ess_team and _is_ess_sender(email_record, ess_team):
+        subject = (getattr(email_record, "subject", "") or "")
+        body    = (getattr(email_record, "body",    "") or "")
+        if (
+            _MAIN_INTERNAL_MARKER_RE.search(subject)
+            or _MAIN_INTERNAL_MARKER_RE.search(body)
+        ):
             return True
 
     return False
