@@ -199,15 +199,25 @@ def _is_ess_dl_only_reroute_tolerant(email_record, ess_team, allow_internal_mark
                 if em:
                     parsed_emails.append(em)
                 else:
-                    # If we cannot parse an email address from this recipient,
-                    # treat it as non-DL to avoid false positives.
-                    parsed_emails = None
-                    break
+                    # If parseaddr() fails, try normalizing the raw address
+                    # This handles plain email format (no angle brackets)
+                    raw_addr = (addr or "").strip().lower()
+                    if raw_addr:
+                        normalized = re.sub(r"[\s./\\]+", "-", raw_addr).strip("-")
+                        if normalized:
+                            parsed_emails.append(normalized)
+                        else:
+                            parsed_emails = None
+                            break
+                    else:
+                        parsed_emails = None
+                        break
 
             if parsed_emails is not None:
-                # All recipients produced parseable emails — require every
-                # parsed email to either be an exact known DL or match via
-                # normalized local+domain rules.
+                # All recipients either parsed via parseaddr() or normalized
+                # from raw format — require every parsed/normalized email to
+                # either be an exact known DL or match via normalized
+                # local+domain rules.
                 def is_parsed_dl(email: str) -> bool:
                     if email in _ESS_DL_ONLY_RECIPIENTS:
                         return True
@@ -1133,7 +1143,7 @@ def main() -> int:
         return out
 
     def _sig_num_tokens(text: str) -> set:
-        """Return significant numeric tokens for disambiguation (exclude only 4-digit years)."""
+        """Return significant numeric tokens for disambiguation (exclude years)."""
         key = text or ""
         cached = _sig_num_tokens_cache.get(key)
         if cached is not None:
@@ -1147,10 +1157,8 @@ def main() -> int:
                     iv = int(n)
                 except Exception:
                     continue
-                # Only exclude 4-digit numbers that look like actual years
-                if len(n) == 4 and 1900 <= iv <= 2099:
+                if 1900 <= iv <= 2099:
                     continue
-                # Keep 3-digit and 5-digit numbers, they're unlikely to be dates
                 out.add(n)
         _sig_num_tokens_cache[key] = out
         return out
