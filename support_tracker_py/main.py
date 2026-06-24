@@ -127,6 +127,10 @@ _ESS_DL_ONLY_RECIPIENTS = (
     "enterprise-services-support@invenio-solutions.com",
 )
 
+# Toggle to choose DL detection behaviour:
+# - If True (default), use tolerant/parsing-aware detection (new)
+# - If False, use legacy strict subset check (old behavior)
+
 _ESS_DL_LOCAL_PATTERN = re.compile(
     r"enterprise[\s.\-/\\]*services?[\s.\-/\\]*support",
     re.IGNORECASE,
@@ -151,7 +155,7 @@ def _is_ess_dl_addr(addr: str) -> bool:
     return False
 
 
-def _is_ess_dl_only_reroute(email_record, ess_team) -> bool:
+def _is_ess_dl_only_reroute_tolerant(email_record, ess_team, allow_internal_marker: bool = False) -> bool:
     """
     Returns True when an email should be EXCLUDED from the ESS-over-ESS
     all-three-same collapse pool because the sender (an ESS member)
@@ -220,16 +224,163 @@ def _is_ess_dl_only_reroute(email_record, ess_team) -> bool:
                 if parsed_emails and all(is_parsed_dl(e) for e in parsed_emails):
                     return True
 
-    if ess_team and _is_ess_sender(email_record, ess_team):
-        subject = (getattr(email_record, "subject", "") or "")
-        body    = (getattr(email_record, "body",    "") or "")
-        if (
-            _MAIN_INTERNAL_MARKER_RE.search(subject)
-            or _MAIN_INTERNAL_MARKER_RE.search(body)
-        ):
-            return True
+    # Note: the +INTERNAL+ marker is advisory and is NOT treated as a
+    # standalone trigger for DL-only reroute. A DL-only reroute requires
+    # that the sender placed the ESS DL(s) into the To field (no other
+    # non-DL recipients). The marker may be inspected by callers via
+    # `_get_ess_dl_dl_detection_flags` but does not by itself cause a
+    # tolerant detection match.
 
     return False
+
+
+def _is_ess_dl_only_reroute_legacy(email_record, ess_team) -> bool:
+    """
+    Legacy behaviour: conservative subset check — after excluding the sender
+    address, the remaining To recipients must be a subset of known DLs.
+    """
+    if not email_record:
+        return False
+    to_recipients = getattr(email_record, "to_recipients", None)
+    if to_recipients:
+        sender_email = (getattr(email_record, "sender_email", "") or "").strip().lower()
+        other_recipients = {
+            addr for addr in to_recipients
+            if addr and addr != sender_email
+        }
+        if other_recipients and other_recipients.issubset(set(_ESS_DL_ONLY_RECIPIENTS)):
+            return True
+    return False
+
+
+def _is_ess_dl_only_reroute(email_record, ess_team, allow_internal_marker: bool = False) -> bool:
+    """
+    Conservative combined behaviour:
+    - If legacy subset check identifies a DL-only reroute, return True.
+    - Otherwise, apply the tolerant detection only as a fallback when it
+      provides strong parseable evidence (all To recipients parse to emails
+      which normalise to known DLs) or when recipients are inconclusive and
+      an internal subject/body marker is present and sender is ESS.
+    This preserves the original behaviour while allowing the new logic to
+    catch cases the legacy check would miss without disturbing existing
+    working cases.
+    """
+    # Prefer legacy behaviour when it applies.
+    try:
+        if _is_ess_dl_only_reroute_legacy(email_record, ess_team):
+            return True
+    except Exception:
+        pass
+
+    # Fallback: tolerant detection, but only when it gives strong parsed-email evidence.
+    try:
+        if not _is_ess_dl_only_reroute_tolerant(email_record, ess_team, allow_internal_marker=allow_internal_marker):
+            return False
+
+        # Confirm that the To recipients (excluding sender) parse to emails
+        # and each parsed address normalises/matches a known DL. Only in
+        # that case do we accept the tolerant detection as DL-only.
+        to_recipients = getattr(email_record, "to_recipients", None)
+        if not to_recipients:
+            return False
+
+        parsed_emails = []
+        sender_email = (getattr(email_record, "sender_email", "") or "").strip().lower()
+        for addr in to_recipients:
+            if not addr or addr == sender_email:
+                continue
+            em = (parseaddr(addr)[1] or "").strip().lower()
+            if not em:
+                parsed_emails = None
+                break
+            parsed_emails.append(em)
+
+        if parsed_emails is None or not parsed_emails:
+            return False
+
+        def is_parsed_dl(email: str) -> bool:
+            if email in _ESS_DL_ONLY_RECIPIENTS:
+                return True
+            local, sep, domain = email.partition("@")
+            if sep:
+                normalised_local = re.sub(r"[\s./\\]+", "-", local).strip("-")
+                if f"{normalised_local}@{domain}" in _ESS_DL_ONLY_RECIPIENTS:
+                    return True
+            return False
+
+        if all(is_parsed_dl(e) for e in parsed_emails):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _get_ess_dl_dl_detection_flags(email_record, ess_team) -> dict:
+    """
+    Always-run detection that returns detailed flags without changing
+    behaviour. Returns a dict with keys:
+      - 'legacy' : True if legacy subset check matched
+      - 'tolerant_parsed' : True if tolerant parsed-TO recipients matched
+      - 'internal_marker' : True if +INTERNAL+ marker was present and sender is ESS
+
+    Callers can use these flags to decide whether to apply internal-marker
+    based behaviour in specific columns while leaving other columns
+    unaffected.
+    """
+    flags = {"legacy": False, "tolerant_parsed": False, "internal_marker": False}
+    try:
+        flags["legacy"] = _is_ess_dl_only_reroute_legacy(email_record, ess_team)
+    except Exception:
+        flags["legacy"] = False
+
+    # Evaluate tolerant-parse path but disallow internal fallback while
+    # checking parsed-match specifically.
+    try:
+        # Reuse tolerant logic but force allow_internal_marker=True to reveal
+        # internal_marker presence, then check parsed-only by re-running
+        # parsing portion here.
+        if not email_record:
+            return flags
+
+        sender_email = (getattr(email_record, "sender_email", "") or "").strip().lower()
+        to_recipients = getattr(email_record, "to_recipients", None)
+        if to_recipients:
+            other_recipients = [addr for addr in to_recipients if addr and addr != sender_email]
+            if other_recipients:
+                parsed_emails = []
+                for addr in other_recipients:
+                    em = (parseaddr(addr)[1] or "").strip().lower()
+                    if em:
+                        parsed_emails.append(em)
+                    else:
+                        parsed_emails = None
+                        break
+                if parsed_emails is not None:
+                    def is_parsed_dl(email: str) -> bool:
+                        if email in _ESS_DL_ONLY_RECIPIENTS:
+                            return True
+                        local, sep, domain = email.partition("@")
+                        if sep:
+                            normalised_local = re.sub(r"[\s./\\]+", "-", local).strip("-")
+                            if f"{normalised_local}@{domain}" in _ESS_DL_ONLY_RECIPIENTS:
+                                return True
+                        return False
+
+                    if parsed_emails and all(is_parsed_dl(e) for e in parsed_emails):
+                        flags["tolerant_parsed"] = True
+
+        # Internal marker presence
+        try:
+            if ess_team and _is_ess_sender(email_record, ess_team):
+                subject = (getattr(email_record, "subject", "") or "")
+                body = (getattr(email_record, "body", "") or "")
+                if _MAIN_INTERNAL_MARKER_RE.search(subject) or _MAIN_INTERNAL_MARKER_RE.search(body):
+                    flags["internal_marker"] = True
+        except Exception:
+            flags["internal_marker"] = False
+    except Exception:
+        pass
+    return flags
 
 
 def _has_source_locked_same_time(notes_text: str) -> bool:
@@ -5500,7 +5651,7 @@ def main() -> int:
                         continue
                     # CRITICAL: Apply DL-only exclusion to ALL pools for incident_business,
                     # not just ESS pool, since reply_pool is preferred in pool selection
-                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                         continue
                     if use_ess_pool:
                         if not _ess_sender(e):
@@ -5541,7 +5692,7 @@ def main() -> int:
                     if not e_ist:
                         continue
                     # Apply DL-only exclusion to incident_business
-                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                         continue
                     if not _group_req_match(e):
                         continue
@@ -5574,7 +5725,7 @@ def main() -> int:
                     if not e_ist:
                         continue
                     # Apply DL-only exclusion to incident_business
-                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                         continue
                     if not _group_req_match(e):
                         continue
@@ -5612,7 +5763,7 @@ def main() -> int:
                     flags = _shared_reply_flags(email_record=e)
                     if _system_like_sender(e) or flags["ignore_reply"]:
                         continue
-                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                         continue
                     if row_tokens:
                         s_norm = normalize_subject(getattr(e, "subject", "") or "")
@@ -5651,7 +5802,7 @@ def main() -> int:
                         if not e_ist:
                             continue
                         # Apply DL-only exclusion to incident_business
-                        if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                        if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                             continue
                         if abs((e_ist - resolved_ist).total_seconds()) > 300:
                             continue
@@ -6313,7 +6464,7 @@ def main() -> int:
                 if _ess_sender(e):
                     if _system_like_sender(e) or flags["ignore_reply"]:
                         continue
-                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                         continue
                     ess_pool.append(e)
                     if _group_req_match(e):
@@ -6859,7 +7010,7 @@ def main() -> int:
                         continue
                     if not _is_real_reply_candidate(e):
                         continue
-                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                         continue
                     if not _row_subject_match_email(e, subject_norm_value, row_tokens, row_id_tokens):
                         continue
@@ -6920,7 +7071,7 @@ def main() -> int:
                         continue
                     if not _is_real_reply_candidate(e):
                         continue
-                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                         continue
                     if not _row_subject_match_email(e, subject_norm_value, row_tokens, row_id_tokens):
                         continue
@@ -13703,7 +13854,7 @@ def main() -> int:
                 return None
             reply_is_dl_only_reroute = (
                 workbook_kind == "incident_business"
-                and _is_ess_dl_only_reroute(reply_msg, ess_team)
+                and _is_ess_dl_only_reroute(reply_msg, ess_team, False)
             )
 
             quoted_blocks = _get_quoted_blocks_with_subject_cached(reply_msg)
@@ -13827,7 +13978,7 @@ def main() -> int:
                             continue
                         if not _ess_sender(e):
                             continue
-                        if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                        if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                             continue
                         if not _row_subject_match_email_quoted(e, subject_norm_value, row_tokens, row_id_tokens_set):
                             continue
@@ -13903,7 +14054,7 @@ def main() -> int:
                         continue
                     if not _ess_sender(e):
                         continue
-                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                         continue
                     if not _row_subject_match_email_quoted(e, subject_norm_value, row_tokens, row_id_tokens_set):
                         continue
@@ -14011,7 +14162,7 @@ def main() -> int:
                                         continue
                                     if not _ess_sender(e):
                                         continue
-                                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team):
+                                    if workbook_kind == "incident_business" and _is_ess_dl_only_reroute(e, ess_team, True):
                                         continue
                                     if not _row_subject_match_email_quoted(e, subject_norm_value, row_tokens, row_id_tokens):
                                         continue
