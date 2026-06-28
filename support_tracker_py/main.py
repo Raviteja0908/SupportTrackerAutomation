@@ -234,12 +234,21 @@ def _is_ess_dl_only_reroute_tolerant(email_record, ess_team, allow_internal_mark
                 if parsed_emails and all(is_parsed_dl(e) for e in parsed_emails):
                     return True
 
-    # Note: the +INTERNAL+ marker is advisory and is NOT treated as a
-    # standalone trigger for DL-only reroute. A DL-only reroute requires
-    # that the sender placed the ESS DL(s) into the To field (no other
-    # non-DL recipients). The marker may be inspected by callers via
-    # `_get_ess_dl_dl_detection_flags` but does not by itself cause a
-    # tolerant detection match.
+    # Fallback: when To-recipients are absent or unverifiable, treat a
+    # +INTERNAL+ marker in subject/body as sufficient evidence of an
+    # internal-only reroute, but only when the caller explicitly opts in
+    # (allow_internal_marker=True) and the sender is a known ESS member.
+    if allow_internal_marker and ess_team:
+        try:
+            sender_em = (getattr(email_record, "sender_email", "") or "").strip().lower()
+            is_ess = sender_em in {(a or "").strip().lower() for a in ess_team}
+            if is_ess:
+                subj = (getattr(email_record, "subject", "") or "")
+                body = (getattr(email_record, "body", "") or "")
+                if _MAIN_INTERNAL_MARKER_RE.search(subj) or _MAIN_INTERNAL_MARKER_RE.search(body):
+                    return True
+        except Exception:
+            pass
 
     return False
 

@@ -1918,8 +1918,9 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
                         created_time = parsed_from_ack
                         created_src = "PARSED_FROM_ACK_BODY"
                         created_dt = _to_ist(created_time)
-                        # Recompute note based on new delta
+                        # Recompute response_time and note based on new delta
                         if ack_dt - created_dt <= timedelta(minutes=16):
+                            response_time = _format_time(effective_ack.sent_time)
                             notes = "OK"
                         else:
                             notes = "Ack delayed (>16 min)"
@@ -2053,7 +2054,7 @@ def resolve_times_with_debug(thread, requester_name, ess_team, subject_norm: str
             if parsed_any:
                 created_time = parsed_any
             else:
-                if not has_ack_phrase and not has_internal_marker:
+                if not has_internal_marker:
                     if len(ess_emails) >= 2:
                         created_t = _format_time(ess_emails[0].sent_time)
                         non_ack_ess = [e for e in ess_emails if not _is_ack_like_reply(e)]
