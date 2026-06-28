@@ -126,6 +126,7 @@ _ESS_DL_ONLY_RECIPIENTS = (
     "enterprise-services-support@inveniolsi.com",
     "enterprise-services-support@invenio-solutions.com",
 )
+_INTERNAL_MARKER_RE = re.compile(r"\+{1,}\s*internal\s*\+{1,}", re.IGNORECASE)
 
 # Toggle to choose DL detection behaviour:
 # - If True (default), use tolerant/parsing-aware detection (new)
@@ -274,64 +275,48 @@ def _is_ess_dl_only_reroute_legacy(email_record, ess_team) -> bool:
 
 def _is_ess_dl_only_reroute(email_record, ess_team, allow_internal_marker: bool = False) -> bool:
     """
-    Conservative combined behaviour:
-    - If legacy subset check identifies a DL-only reroute, return True.
-    - Otherwise, apply the tolerant detection only as a fallback when it
-      provides strong parseable evidence (all To recipients parse to emails
-      which normalise to known DLs) or when recipients are inconclusive and
-      an internal subject/body marker is present and sender is ESS.
-    This preserves the original behaviour while allowing the new logic to
-    catch cases the legacy check would miss without disturbing existing
-    working cases.
+    Returns True when an email should be EXCLUDED from the ESS-over-ESS
+    all-three-same collapse pool because the sender (an ESS member)
+    intentionally rerouted the reply to only the shared ESS DL.
+
+    The To-recipients of this email, once any address belonging to the
+    sender themselves is excluded, must resolve to ONLY one of the known
+    ESS DL addresses (no other recipient present). Cc is intentionally
+    NOT checked, to avoid false positives from someone who simply cc'd
+    the DL while still genuinely replying to the requester.
+
+    This function is intentionally conservative: if recipient data is
+    missing or ambiguous, it returns False (does NOT exclude), so
+    existing behavior is preserved whenever there is any doubt.
+
+    Fallback: when Exchange reroutes an email via DL, the To: header is
+    sometimes stripped entirely (to_recipients becomes an empty tuple).
+    In that case we use the +INTERNAL+ subject/body marker as a proxy —
+    if present, the email is treated as a DL-only reroute.
     """
-    # Prefer legacy behaviour when it applies.
-    try:
-        if _is_ess_dl_only_reroute_legacy(email_record, ess_team):
-            return True
-    except Exception:
-        pass
+    if not email_record:
+        return False
 
-    # Fallback: tolerant detection, but only when it gives strong parsed-email evidence.
-    try:
-        if not _is_ess_dl_only_reroute_tolerant(email_record, ess_team, allow_internal_marker=allow_internal_marker):
-            return False
-
-        # Confirm that the To recipients (excluding sender) parse to emails
-        # and each parsed address normalises/matches a known DL. Only in
-        # that case do we accept the tolerant detection as DL-only.
-        to_recipients = getattr(email_record, "to_recipients", None)
-        if not to_recipients:
-            return False
-
-        parsed_emails = []
+    to_recipients = getattr(email_record, "to_recipients", None)
+    if to_recipients:
+        # Normal path: explicit To list — check it contains only ESS DL addresses.
         sender_email = (getattr(email_record, "sender_email", "") or "").strip().lower()
-        for addr in to_recipients:
-            if not addr or addr == sender_email:
-                continue
-            em = (parseaddr(addr)[1] or "").strip().lower()
-            if not em:
-                parsed_emails = None
-                break
-            parsed_emails.append(em)
-
-        if parsed_emails is None or not parsed_emails:
-            return False
-
-        def is_parsed_dl(email: str) -> bool:
-            if email in _ESS_DL_ONLY_RECIPIENTS:
-                return True
-            local, sep, domain = email.partition("@")
-            if sep:
-                normalised_local = re.sub(r"[\s./\\]+", "-", local).strip("-")
-                if f"{normalised_local}@{domain}" in _ESS_DL_ONLY_RECIPIENTS:
-                    return True
-            return False
-
-        if all(is_parsed_dl(e) for e in parsed_emails):
+        other_recipients = {
+            addr for addr in to_recipients
+            if addr and addr != sender_email
+        }
+        if other_recipients and other_recipients.issubset(set(_ESS_DL_ONLY_RECIPIENTS)):
             return True
-        return False
-    except Exception:
-        return False
+    elif to_recipients is not None:
+        # Exchange-rerouted path: to_recipients is an empty tuple, not None.
+        # The To: header was stripped during rerouting. Use the +INTERNAL+
+        # marker as the designed fallback (see original docstring intent).
+        subj = (getattr(email_record, "subject", "") or "")
+        body = (getattr(email_record, "body", "") or "")
+        if _INTERNAL_MARKER_RE.search(subj) or _INTERNAL_MARKER_RE.search(body):
+            return True
+
+    return False
 
 
 def _get_ess_dl_dl_detection_flags(email_record, ess_team) -> dict:
