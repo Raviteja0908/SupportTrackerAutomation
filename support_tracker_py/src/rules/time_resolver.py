@@ -337,17 +337,13 @@ def _is_explicit_ack_signal(text: str) -> bool:
     t = _normalize_for_phrase_match(text)
     if not t:
         return False
-    # Non-ack phrases take absolute precedence — a body containing
-    # "thank you for the information" or "please provide an update" is
-    # NEVER an ACK even if it also has "will" somewhere.
-    if _contains_any_phrase(t, NON_ACK_PHRASES):
-        return False
+    # Explicit ACK phrases always win — NON_ACK veto does NOT apply to this path.
     if _contains_any_phrase(t, ACK_PHRASES) or _contains_any_phrase(t, PROMISE_ACK_PHRASES):
         return True
-    # Courtesy+will path: only fires for SHORT bodies that START with a
-    # courtesy word (e.g. "OK, will check", "Sure, will do", "Noted, will
-    # handle"). Substring match is intentionally removed — it matched
-    # courtesy words buried mid-paragraph, causing false ACK detection.
+    # NON_ACK veto guards only the courtesy+will path below this line.
+    if _contains_any_phrase(t, NON_ACK_PHRASES):
+        return False
+    # Courtesy+will path: only short bodies that START with a courtesy word qualify.
     if len(t) > 200:
         return False
     has_courtesy = any(t.startswith(prefix) for prefix in ACK_COURTESY_PREFIXES)

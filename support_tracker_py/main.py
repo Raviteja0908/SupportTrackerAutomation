@@ -279,44 +279,10 @@ def _is_ess_dl_only_reroute(email_record, ess_team, allow_internal_marker: bool 
     all-three-same collapse pool because the sender (an ESS member)
     intentionally rerouted the reply to only the shared ESS DL.
 
-    The To-recipients of this email, once any address belonging to the
-    sender themselves is excluded, must resolve to ONLY one of the known
-    ESS DL addresses (no other recipient present). Cc is intentionally
-    NOT checked, to avoid false positives from someone who simply cc'd
-    the DL while still genuinely replying to the requester.
-
-    This function is intentionally conservative: if recipient data is
-    missing or ambiguous, it returns False (does NOT exclude), so
-    existing behavior is preserved whenever there is any doubt.
-
-    Fallback: when Exchange reroutes an email via DL, the To: header is
-    sometimes stripped entirely (to_recipients becomes an empty tuple).
-    In that case we use the +INTERNAL+ subject/body marker as a proxy —
-    if present, the email is treated as a DL-only reroute.
+    Delegates to the tolerant detection path which handles Exchange proxy
+    address variants and the +INTERNAL+ marker fallback.
     """
-    if not email_record:
-        return False
-
-    to_recipients = getattr(email_record, "to_recipients", None)
-    if to_recipients:
-        # Normal path: explicit To list — check it contains only ESS DL addresses.
-        sender_email = (getattr(email_record, "sender_email", "") or "").strip().lower()
-        other_recipients = {
-            addr for addr in to_recipients
-            if addr and addr != sender_email
-        }
-        if other_recipients and other_recipients.issubset(set(_ESS_DL_ONLY_RECIPIENTS)):
-            return True
-    elif to_recipients is not None:
-        # Exchange-rerouted path: to_recipients is an empty tuple, not None.
-        # The To: header was stripped during rerouting. Use the +INTERNAL+
-        # marker as the designed fallback (see original docstring intent).
-        subj = (getattr(email_record, "subject", "") or "")
-        body = (getattr(email_record, "body", "") or "")
-        if _INTERNAL_MARKER_RE.search(subj) or _INTERNAL_MARKER_RE.search(body):
-            return True
-
-    return False
+    return _is_ess_dl_only_reroute_tolerant(email_record, ess_team, allow_internal_marker)
 
 
 def _get_ess_dl_dl_detection_flags(email_record, ess_team) -> dict:
