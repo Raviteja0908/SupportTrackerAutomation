@@ -1826,6 +1826,8 @@ def main() -> int:
                 d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
                 if y < 100:
                     y = 2000 + y
+                elif y < 1000 or y > 2100:
+                    return None  # malformed/non-date token (e.g. IP or version string) — drop it
                 return datetime(y, m, d).date()
         except Exception:
             return None

@@ -1297,11 +1297,28 @@ function Export-FolderWindow {
                         $rt = $dtInfo[0]
                         if (-not $rt) { continue }
                     }
-                    $copy = $item.Copy()
-                    $moved = $copy.Move($destFolder)
-                    $count++
-                    $processed++
-                    if (($processed % $progressEvery) -eq 0) {
+                    
+                    # Retry loop for Copy/Move operations
+                    $copyMoveSuccess = $false
+                    for ($attempt = 1; $attempt -le 3; $attempt++) {
+                        try {
+                            $copy = $item.Copy()
+                            $moved = $copy.Move($destFolder)
+                            $copyMoveSuccess = $true
+                            $count++
+                            $processed++
+                            break
+                        } catch {
+                            if ($attempt -lt 3) {
+                                $backoffMs = 500 * $attempt
+                                Start-Sleep -Milliseconds $backoffMs
+                            } else {
+                                throw  # Re-throw on final attempt
+                            }
+                        }
+                    }
+                    
+                    if ($copyMoveSuccess -and (($processed % $progressEvery) -eq 0)) {
                         Write-Log "progress" ("processed={0}; exported={1}; current={2}" -f $processed, $count, $rt)
                     }
                 } catch {
@@ -1309,6 +1326,7 @@ function Export-FolderWindow {
                     if ($sampleErrors.Count -lt 5) {
                         $sampleErrors.Add($_.Exception.Message) | Out-Null
                     }
+                    Add-Content -Path "$destRoot\export_errors.log" -Value ("{0} | {1} | {2}" -f (Get-Date), $relativePath, $_.Exception.Message)
                     continue
                 } finally {
                     Release-ComObjectQuietly $moved
@@ -1355,11 +1373,28 @@ function Export-FolderWindow {
                     $rt = $dtInfo[0]
                     if (-not $rt) { continue }
                 }
-                $copy = $item.Copy()
-                $moved = $copy.Move($destFolder)
-                $count++
-                $processed++
-                if (($processed % $progressEvery) -eq 0) {
+                
+                # Retry loop for Copy/Move operations
+                $copyMoveSuccess = $false
+                for ($attempt = 1; $attempt -le 3; $attempt++) {
+                    try {
+                        $copy = $item.Copy()
+                        $moved = $copy.Move($destFolder)
+                        $copyMoveSuccess = $true
+                        $count++
+                        $processed++
+                        break
+                    } catch {
+                        if ($attempt -lt 3) {
+                            $backoffMs = 500 * $attempt
+                            Start-Sleep -Milliseconds $backoffMs
+                        } else {
+                            throw  # Re-throw on final attempt
+                        }
+                    }
+                }
+                
+                if ($copyMoveSuccess -and (($processed % $progressEvery) -eq 0)) {
                     Write-Log "progress" ("processed={0}; exported={1}; current={2}" -f $processed, $count, $rt)
                 }
             } catch {
@@ -1367,6 +1402,7 @@ function Export-FolderWindow {
                 if ($sampleErrors.Count -lt 5) {
                     $sampleErrors.Add($_.Exception.Message) | Out-Null
                 }
+                Add-Content -Path "$destRoot\export_errors.log" -Value ("{0} | {1} | {2}" -f (Get-Date), $relativePath, $_.Exception.Message)
                 continue
             } finally {
                 Release-ComObjectQuietly $moved
